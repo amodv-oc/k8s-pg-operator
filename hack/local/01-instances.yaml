@@ -1,0 +1,146 @@
+# One PostgresInstance per server. Cluster-scoped: registered once by the
+# platform team, referenced by name from application namespaces.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pg-operator
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg14-superuser
+  namespace: pg-operator
+type: Opaque
+stringData:
+  username: pgadmin
+  password: adminpw
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: pg14
+spec:
+  host: pg14.pg-instances.svc.cluster.local
+  port: 5432
+  credentialsSecretRef:
+    name: pg14-superuser
+    namespace: pg-operator
+  # In-cluster plaintext: these servers have no TLS configured.
+  sslMode: disable
+  retentionPolicy: RETAIN
+  minServerVersion: 14
+  allowedNamespaces:
+    - team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg15-superuser
+  namespace: pg-operator
+type: Opaque
+stringData:
+  username: pgadmin
+  password: adminpw
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: pg15
+spec:
+  host: pg15.pg-instances.svc.cluster.local
+  port: 5432
+  credentialsSecretRef:
+    name: pg15-superuser
+    namespace: pg-operator
+  # In-cluster plaintext: these servers have no TLS configured.
+  sslMode: disable
+  retentionPolicy: RETAIN
+  minServerVersion: 14
+  allowedNamespaces:
+    - team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg16-superuser
+  namespace: pg-operator
+type: Opaque
+stringData:
+  username: pgadmin
+  password: adminpw
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: pg16
+spec:
+  host: pg16.pg-instances.svc.cluster.local
+  port: 5432
+  credentialsSecretRef:
+    name: pg16-superuser
+    namespace: pg-operator
+  # In-cluster plaintext: these servers have no TLS configured.
+  sslMode: disable
+  retentionPolicy: RETAIN
+  minServerVersion: 14
+  allowedNamespaces:
+    - team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg17-superuser
+  namespace: pg-operator
+type: Opaque
+stringData:
+  username: pgadmin
+  password: adminpw
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: pg17
+spec:
+  host: pg17.pg-instances.svc.cluster.local
+  port: 5432
+  credentialsSecretRef:
+    name: pg17-superuser
+    namespace: pg-operator
+  # In-cluster plaintext: these servers have no TLS configured.
+  sslMode: disable
+  retentionPolicy: RETAIN
+  minServerVersion: 14
+  allowedNamespaces:
+    - team-a
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg18-superuser
+  namespace: pg-operator
+type: Opaque
+stringData:
+  username: pgadmin
+  password: adminpw
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: pg18
+spec:
+  host: pg18.pg-instances.svc.cluster.local
+  port: 5432
+  credentialsSecretRef:
+    name: pg18-superuser
+    namespace: pg-operator
+  # In-cluster plaintext: these servers have no TLS configured.
+  sslMode: disable
+  retentionPolicy: RETAIN
+  minServerVersion: 14
+  allowedNamespaces:
+    - team-a

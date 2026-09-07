@@ -1,0 +1,87 @@
+# A PostgresDB owns a database, its schemas and extensions, and the three
+# NOLOGIN group roles that back the access levels:
+#
+#   orders_owner   full DDL on the database and every managed schema
+#   orders_rw      SELECT/INSERT/UPDATE/DELETE, sequence use, EXECUTE
+#   orders_ro      SELECT only
+#
+# Access is not declared here. A PostgresUser asks for it.
+#
+# Reconciliation is a full convergence pass: adding a schema to this list later
+# creates it and wires up all three group roles, including default privileges,
+# so existing users can use it immediately with no per-user change.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+
+  # Defaults to metadata.name with non-identifier characters replaced by
+  # underscores. Immutable once set.
+  databaseName: orders
+
+  # Omitted, this inherits the instance's policy (RETAIN).
+  retentionPolicy: RETAIN
+
+  # `public` is always managed, listed or not. Add to this list at any time.
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+
+  # On RDS an extension must be permitted by rds.allowed_extensions, and
+  # preloaded via shared_preload_libraries where the extension requires it.
+  extensions:
+    - name: pg_stat_statements
+      schema: public
+    - name: citext
+      schema: public
+
+  # Applied with ALTER DATABASE ... SET. Removing an entry RESETs it.
+  parameters:
+    search_path: '"$user", public'
+    log_min_duration_statement: "500"
+
+  connectionLimit: 100
+  comment: order service primary database
+---
+# A staging database on the DROP-policy instance. Deleting this resource really
+# drops the database and its group roles, and removing a schema from the list
+# really drops the schema with CASCADE.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders
+  namespace: team-a-staging
+spec:
+  instanceRef:
+    name: staging-rds
+  retentionPolicy: DROP
+  schemas:
+    - name: public
+    - name: audit
+---
+# Overriding the generated role names, for adopting a database that already has
+# its own role convention.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: legacy-billing
+  namespace: team-b
+spec:
+  instanceRef:
+    name: prod-rds
+  databaseName: billing
+  roles:
+    owner: billing_admin
+    readWrite: billing_app
+    readOnly: billing_reader
+  schemas:
+    - name: public
+  # This database predates the operator and has schemas it does not manage.
+  # Those appear in status.unmanagedSchemas and are never modified or dropped.
+  revokePublicConnect: false

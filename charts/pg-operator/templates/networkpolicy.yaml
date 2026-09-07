@@ -1,0 +1,52 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "pg-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "pg-operator.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    {{- if .Values.api.enabled }}
+    - ports:
+        - port: http
+          protocol: TCP
+      {{- with .Values.networkPolicy.apiIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.metrics.enabled }}
+    - ports:
+        - port: metrics
+          protocol: TCP
+      {{- with .Values.networkPolicy.metricsIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+    # kubelet probes originate from the node, which no selector can express.
+    - ports:
+        - port: health
+          protocol: TCP
+  egress:
+    # Kubernetes API and DNS.
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    {{- with .Values.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- else }}
+    # Default: unrestricted egress, because the PostgreSQL endpoints the
+    # operator must reach are outside the cluster and not known at install
+    # time. Set networkPolicy.egress to pin them to your RDS CIDRs.
+    - {}
+    {{- end }}
+{{- end }}

@@ -1,0 +1,312 @@
+# Five PostgreSQL servers in-cluster, each bootstrapped to look like RDS:
+# the managing role is a member of rds_superuser with CREATEDB and CREATEROLE,
+# but is NOT a superuser. Storage is ephemeral - these exist to be reconciled
+# against, not to keep data.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pg-instances
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rds-bootstrap
+  namespace: pg-instances
+data:
+  10-rds-like.sql: |
+    -- Mirrors charts' documented RDS master user: rds_superuser member,
+    -- CREATEDB + CREATEROLE, no superuser, no REPLICATION, no BYPASSRLS.
+    CREATE ROLE rds_superuser NOLOGIN;
+    CREATE ROLE pgadmin LOGIN PASSWORD 'adminpw' CREATEDB CREATEROLE;
+    GRANT rds_superuser TO pgadmin;
+
+    -- RDS lets its master user set logging GUCs that are superuser-only on a
+    -- stock server. PostgreSQL 15 added GRANT ... ON PARAMETER, which is the
+    -- closest stock equivalent; on 14 there is no such mechanism, so that
+    -- server exercises the operator's "parameter refused" path instead.
+    DO $$
+    BEGIN
+      IF current_setting('server_version_num')::int >= 150000 THEN
+        EXECUTE 'GRANT SET ON PARAMETER log_min_duration_statement TO pgadmin';
+      END IF;
+    END $$;
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg14
+  namespace: pg-instances
+spec:
+  selector:
+    app: pg14
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg14
+  namespace: pg-instances
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg14
+  template:
+    metadata:
+      labels:
+        app: pg14
+        pg-major: "14"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:14-alpine
+          args: ["-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpw
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: rds-bootstrap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg15
+  namespace: pg-instances
+spec:
+  selector:
+    app: pg15
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg15
+  namespace: pg-instances
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg15
+  template:
+    metadata:
+      labels:
+        app: pg15
+        pg-major: "15"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:15-alpine
+          args: ["-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpw
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: rds-bootstrap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg16
+  namespace: pg-instances
+spec:
+  selector:
+    app: pg16
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg16
+  namespace: pg-instances
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg16
+  template:
+    metadata:
+      labels:
+        app: pg16
+        pg-major: "16"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          args: ["-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpw
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: rds-bootstrap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg17
+  namespace: pg-instances
+spec:
+  selector:
+    app: pg17
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg17
+  namespace: pg-instances
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg17
+  template:
+    metadata:
+      labels:
+        app: pg17
+        pg-major: "17"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          args: ["-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpw
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: rds-bootstrap
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg18
+  namespace: pg-instances
+spec:
+  selector:
+    app: pg18
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg18
+  namespace: pg-instances
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg18
+  template:
+    metadata:
+      labels:
+        app: pg18
+        pg-major: "18"
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:18-alpine
+          args: ["-c", "max_connections=200"]
+          env:
+            - name: POSTGRES_PASSWORD
+              value: rootpw
+            - name: POSTGRES_DB
+              value: postgres
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /docker-entrypoint-initdb.d
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "postgres"]
+            initialDelaySeconds: 3
+            periodSeconds: 3
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 512Mi }
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: rds-bootstrap

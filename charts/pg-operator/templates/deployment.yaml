@@ -1,0 +1,197 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pg-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+  {{- with .Values.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    # The reconciler holds a peering lock and issues DDL; a rolling update
+    # would briefly run two active operators against the same instance.
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "pg-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "pg-operator.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        checksum/config: {{ include "pg-operator.env" . | sha256sum }}
+        {{- if and .Values.metrics.enabled (not .Values.metrics.serviceMonitor.enabled) }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "pg-operator.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      containers:
+        # --- reconciler -----------------------------------------------------
+        - name: operator
+          image: {{ include "pg-operator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - kopf
+            - run
+            - --module=pg_operator.operator
+            - --liveness=http://0.0.0.0:{{ .Values.operator.healthPort }}/healthz
+            {{- if .Values.watchNamespaces }}
+            {{- range .Values.watchNamespaces }}
+            - --namespace={{ . }}
+            {{- end }}
+            {{- else }}
+            - --all-namespaces
+            {{- end }}
+            {{- if .Values.peering.enabled }}
+            - --peering={{ .Values.peering.name | default (include "pg-operator.fullname" .) }}
+            {{- else }}
+            - --standalone
+            {{- end }}
+            {{- if eq .Values.logging.level "DEBUG" }}
+            - --verbose
+            {{- end }}
+          env:
+            {{- include "pg-operator.env" . | nindent 12 }}
+            - name: PG_OPERATOR_METRICS_ENABLED
+              value: {{ .Values.metrics.enabled | quote }}
+            - name: PG_OPERATOR_METRICS_PORT
+              value: {{ .Values.metrics.port | quote }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.operator.healthPort }}
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.operator.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # Writable scratch for CA bundles materialised from Secrets, since
+            # libpq needs sslrootcert as a file path.
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+
+        # --- state API ------------------------------------------------------
+        {{- if .Values.api.enabled }}
+        - name: api
+          image: {{ include "pg-operator.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - pg-operator-api
+          env:
+            {{- include "pg-operator.env" . | nindent 12 }}
+            - name: PG_OPERATOR_API_PORT
+              value: {{ .Values.api.port | quote }}
+            - name: PG_OPERATOR_API_CACHE_TTL
+              value: {{ .Values.api.cacheTtl | quote }}
+            {{- with .Values.api.rootPath }}
+            - name: PG_OPERATOR_API_ROOT_PATH
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.api.corsOrigins }}
+            - name: PG_OPERATOR_API_CORS_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            # The API does not reconcile, so it never opens a metrics server.
+            - name: PG_OPERATOR_METRICS_ENABLED
+              value: "false"
+          ports:
+            - name: http
+              containerPort: {{ .Values.api.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            timeoutSeconds: 5
+          readinessProbe:
+            # /readyz confirms the Kubernetes API answers and the CRDs exist.
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- with .Values.api.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+        {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.tmpSizeLimit }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

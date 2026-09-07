@@ -1,0 +1,64 @@
+# A PostgresInstance is cluster-scoped: the platform team registers the server
+# once, and application teams reference it by name from their own namespaces.
+#
+# Deleting this resource never touches the server. It only releases the
+# operator's connections.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: prod-rds
+spec:
+  host: prod.abc123def.ap-southeast-2.rds.amazonaws.com
+  port: 5432
+
+  credentialsSecretRef:
+    name: prod-rds-superuser
+    namespace: pg-operator
+
+  # verify-full is the only mode that actually authenticates the server. It
+  # needs the RDS CA bundle, which AWS publishes per region:
+  #   curl -o rds-ca.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+  #   kubectl -n pg-operator create secret generic rds-ca-bundle --from-file=ca.pem=rds-ca.pem
+  sslMode: verify-full
+  sslRootCertSecretRef:
+    name: rds-ca-bundle
+    namespace: pg-operator
+    key: ca.pem
+
+  # Inherited by every PostgresDB and PostgresUser on this instance that does
+  # not set its own. RETAIN is the default: deleting a resource leaves the real
+  # database or role in place.
+  retentionPolicy: RETAIN
+
+  # Refuse to act against an unexpectedly old server.
+  minServerVersion: 14
+
+  # Namespaces allowed to reference this instance. Omit for no restriction.
+  allowedNamespaces:
+    - team-a
+    - team-b
+
+  # Instance-wide PushSecret default. Any PostgresUser without its own
+  # pushSecret block mirrors its credentials to this store.
+  pushSecret:
+    secretStoreRefs:
+      - name: aws-secretsmanager
+        kind: ClusterSecretStore
+    remoteRefKey: rds/prod/{{ .namespace }}/{{ .name }}
+    deletionPolicy: None
+---
+# A second instance sharing one server across environments. rolePrefix keeps the
+# generated group role names from colliding with the instance above.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: staging-rds
+spec:
+  host: staging.abc123def.ap-southeast-2.rds.amazonaws.com
+  credentialsSecretRef:
+    name: staging-rds-superuser
+    namespace: pg-operator
+  sslMode: require
+  rolePrefix: stg_
+  # Staging is disposable: deleting a PostgresDB here really drops the database.
+  retentionPolicy: DROP

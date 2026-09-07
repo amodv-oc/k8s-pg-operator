@@ -1,0 +1,160 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pg-operator.fullname" . }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+rules:
+  # --- own custom resources -------------------------------------------------
+  - apiGroups: [postgres.opsplatform.io]
+    resources:
+      - postgresinstances
+      - postgresdbs
+      - postgresusers
+    verbs: [get, list, watch, patch, update]
+  - apiGroups: [postgres.opsplatform.io]
+    resources:
+      - postgresinstances/status
+      - postgresdbs/status
+      - postgresusers/status
+    verbs: [get, patch, update]
+  # Finalizers gate the retention policy, so they must be writable.
+  - apiGroups: [postgres.opsplatform.io]
+    resources:
+      - postgresinstances/finalizers
+      - postgresdbs/finalizers
+      - postgresusers/finalizers
+    verbs: [update, patch]
+
+  # --- secrets, cluster-wide ------------------------------------------------
+  # Instance superuser credentials are read from wherever they live, and
+  # generated user credentials are written into the consuming team's namespace.
+  # Kubernetes has no way to narrow this to a label selector, so the scope is
+  # cluster-wide; see values.yaml `rbac.secretsScope` to restrict it to a fixed
+  # namespace list instead.
+  {{- if not .Values.rbac.namespacedSecrets }}
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  {{- end }}
+
+  # --- events ---------------------------------------------------------------
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+
+  # --- kopf peering (leader election between operator replicas) -------------
+  - apiGroups: [kopf.dev]
+    resources: [clusterkopfpeerings]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [kopf.dev]
+    resources: [kopfpeerings]
+    verbs: [get, list, watch, patch]
+
+  # --- CRD discovery --------------------------------------------------------
+  # kopf reads the CRDs it watches to resolve scope and subresources.
+  - apiGroups: [apiextensions.k8s.io]
+    resources: [customresourcedefinitions]
+    verbs: [get, list, watch]
+
+  # --- namespace discovery --------------------------------------------------
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch]
+
+  {{- if .Values.pushSecret.enabled }}
+  # --- external-secrets PushSecret ------------------------------------------
+  - apiGroups: [external-secrets.io]
+    resources: [pushsecrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [external-secrets.io]
+    resources: [pushsecrets/status]
+    verbs: [get]
+  # Read-only, so a misconfigured store reference can be reported clearly.
+  - apiGroups: [external-secrets.io]
+    resources: [secretstores, clustersecretstores]
+    verbs: [get, list, watch]
+  {{- end }}
+  {{- with .Values.rbac.extraRules }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "pg-operator.fullname" . }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "pg-operator.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pg-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.rbac.namespacedSecrets }}
+{{- range $ns := .Values.rbac.secretNamespaces }}
+---
+# Secret access narrowed to {{ $ns }} instead of a cluster-wide grant.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "pg-operator.fullname" $ }}-secrets
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pg-operator.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, list, watch, create, update, patch, delete]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "pg-operator.fullname" $ }}-secrets
+  namespace: {{ $ns }}
+  labels:
+    {{- include "pg-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "pg-operator.fullname" $ }}-secrets
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "pg-operator.serviceAccountName" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}
+{{- if .Values.rbac.createViewerRole }}
+---
+# Aggregated read-only role, so cluster viewers can see the operator's resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pg-operator.fullname" . }}-viewer
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: [postgres.opsplatform.io]
+    resources: [postgresinstances, postgresdbs, postgresusers]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pg-operator.fullname" . }}-editor
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+rules:
+  - apiGroups: [postgres.opsplatform.io]
+    resources: [postgresdbs, postgresusers]
+    verbs: [get, list, watch, create, update, patch, delete]
+{{- end }}
+{{- end }}

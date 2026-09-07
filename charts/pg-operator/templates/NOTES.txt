@@ -1,0 +1,92 @@
+pg-operator {{ .Chart.AppVersion }} installed as {{ .Release.Name }} in {{ .Release.Namespace }}.
+
+Watching: {{ if .Values.watchNamespaces }}{{ join ", " .Values.watchNamespaces }}{{ else }}all namespaces{{ end }}
+Reconcile interval: {{ .Values.reconcile.interval }}s (full convergence pass, corrects drift)
+Default retention: RETAIN (set spec.retentionPolicy: DROP to delete real objects)
+PushSecret: {{ if .Values.pushSecret.enabled }}{{ .Values.pushSecret.apiVersion }}{{ else }}disabled{{ end }}
+
+1. Check the operator came up:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "pg-operator.fullname" . }}
+     kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "pg-operator.fullname" . }} -c operator
+
+2. Create the superuser credentials Secret. On RDS this is the master user
+   (a member of rds_superuser holding CREATEDB and CREATEROLE):
+
+     kubectl -n {{ .Release.Namespace }} create secret generic prod-rds-superuser \
+       --from-literal=username=postgres \
+       --from-literal=password='<master password>'
+
+3. Register the instance (cluster-scoped):
+
+     cat <<'YAML' | kubectl apply -f -
+     apiVersion: postgres.opsplatform.io/v1alpha1
+     kind: PostgresInstance
+     metadata:
+       name: prod-rds
+     spec:
+       host: prod.abc123.{{ "ap-southeast-2" }}.rds.amazonaws.com
+       credentialsSecretRef:
+         name: prod-rds-superuser
+         namespace: {{ .Release.Namespace }}
+       sslMode: require
+     YAML
+
+     kubectl get postgresinstance prod-rds
+
+   Phase must reach Ready before databases or users will reconcile.
+
+4. Create a database and a user:
+
+     cat <<'YAML' | kubectl apply -f -
+     apiVersion: postgres.opsplatform.io/v1alpha1
+     kind: PostgresDB
+     metadata:
+       name: orders
+       namespace: default
+     spec:
+       instanceRef: { name: prod-rds }
+       schemas:
+         - name: public
+         - name: audit
+     ---
+     apiVersion: postgres.opsplatform.io/v1alpha1
+     kind: PostgresUser
+     metadata:
+       name: orders-api
+       namespace: default
+     spec:
+       instanceRef: { name: prod-rds }
+       access:
+         - dbRef: { name: orders }
+           role: RW
+     YAML
+
+   Credentials land in the Secret orders-api-pg-credentials:
+
+     kubectl get secret orders-api-pg-credentials -o jsonpath='{.data.uri}' | base64 -d
+
+{{ if .Values.api.enabled }}
+5. Reach the state API:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pg-operator.fullname" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+
+   Then open http://localhost:{{ .Values.api.service.port }}/docs
+   Aggregate view: http://localhost:{{ .Values.api.service.port }}/api/v1/overview
+{{- if .Values.api.ingress.enabled }}
+   Ingress: {{ range .Values.api.ingress.hosts }}https://{{ .host }}{{ end }}
+{{- end }}
+{{- end }}
+
+{{ if not .Values.pushSecret.enabled }}
+Note: PushSecret support is disabled. Enable pushSecret.enabled to mirror
+generated credentials to an external store via external-secrets.
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+{{- if not .Values.peering.enabled }}
+
+WARNING: replicaCount is {{ .Values.replicaCount }} but peering is disabled. Two active
+reconcilers will issue conflicting DDL against the same instance. Set
+peering.enabled=true or replicaCount=1.
+{{- end }}
+{{- end }}

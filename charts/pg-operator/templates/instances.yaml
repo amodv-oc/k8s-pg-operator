@@ -1,0 +1,23 @@
+{{- /*
+Optional: declare PostgresInstance resources from chart values, so a platform
+team can ship instances with the operator rather than applying them separately.
+Credentials are always referenced, never templated into the chart.
+*/ -}}
+{{- range $name, $instance := .Values.instances }}
+{{- if $instance.enabled | default true }}
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "pg-operator.labels" $ | nindent 4 }}
+  annotations:
+    # The CRDs are installed by this chart, so the instance must wait for them.
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/resource-policy: keep
+spec:
+  {{- omit $instance "enabled" | toYaml | nindent 2 }}
+{{- end }}
+{{- end }}

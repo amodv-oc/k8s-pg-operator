@@ -1,0 +1,136 @@
+# A PostgresUser is a LOGIN role plus the group memberships that give it
+# access. It never holds object privileges directly, so changing RW to RO is
+# two membership statements and no object-level work.
+#
+# The operator generates a password, writes it to a Secret in this namespace,
+# and (optionally) declares a PushSecret so external-secrets mirrors it out.
+
+# --- read-write service account -------------------------------------------
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  access:
+    - dbRef:
+        name: orders
+      role: RW
+  # Credentials land in Secret orders-api-pg-credentials with keys
+  # username, password, host, port, database, sslmode, uri, jdbcUri.
+  generatedSecret:
+    labels:
+      app.kubernetes.io/part-of: orders
+---
+# --- migration / owner account --------------------------------------------
+# OWNER access also sets `role` per-database on this login role, so tables it
+# creates are owned by orders_owner rather than orders_migrator. Without that,
+# the owner group's DEFAULT PRIVILEGES would not apply and the RW and RO roles
+# could not see newly migrated tables.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  access:
+    - dbRef:
+        name: orders
+      role: OWNER
+  connectionLimit: 4
+---
+# --- read-only analytics account, across two databases --------------------
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  access:
+    - dbRef:
+        name: orders
+      role: RO
+    - dbRef:
+        name: legacy-billing
+        namespace: team-b     # a database owned by another team
+      role: RO
+  # The connection string points at this database; the user can still reach
+  # every database it has access to.
+  generatedSecret:
+    defaultDatabase: orders
+  parameters:
+    statement_timeout: "30000"
+---
+# --- credentials mirrored to AWS Secrets Manager --------------------------
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-worker
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  access:
+    - dbRef:
+        name: orders
+      role: RW
+  pushSecret:
+    secretStoreRefs:
+      - name: aws-secretsmanager
+        kind: ClusterSecretStore
+    remoteRefKey: rds/prod/team-a/orders-worker
+    # Only push what the consumer needs.
+    keys: [username, password, host, port, database]
+    updatePolicy: Replace
+    # Leave the remote value alone if the PushSecret goes away.
+    deletionPolicy: None
+---
+# --- bring your own password ----------------------------------------------
+# For a credential an external system already owns. The operator reads this
+# Secret and applies the value with ALTER ROLE; it never writes to it.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-legacy
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  access:
+    - dbRef:
+        name: orders
+      role: RW
+  passwordSecretRef:
+    name: orders-legacy-existing
+    key: password
+  generatedSecret:
+    keys:
+      password: PGPASSWORD
+      username: PGUSER
+      host: PGHOST
+      database: PGDATABASE
+---
+# --- disposable account with an expiry ------------------------------------
+# DROP retention: deleting this resource terminates its sessions, clears its
+# privileges, drops the role, and removes the Secret and PushSecret.
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: incident-readonly
+  namespace: team-a
+spec:
+  instanceRef:
+    name: prod-rds
+  retentionPolicy: DROP
+  access:
+    - dbRef:
+        name: orders
+      role: RO
+  validUntil: "2026-12-31T23:59:59Z"
+  connectionLimit: 2

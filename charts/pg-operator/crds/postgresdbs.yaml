@@ -1,0 +1,306 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresdbs.postgres.opsplatform.io
+  annotations:
+    controller-gen.kubebuilder.io/version: "hand-written"
+    api-approved.kubernetes.io: "unapproved, internal operator CRD"
+spec:
+  group: postgres.opsplatform.io
+  scope: Namespaced
+  names:
+    kind: PostgresDB
+    listKind: PostgresDBList
+    plural: postgresdbs
+    singular: postgresdb
+    shortNames: [pgdb]
+    categories: [postgres, pg-operator]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Instance
+          type: string
+          jsonPath: .spec.instanceRef.name
+        - name: Database
+          type: string
+          jsonPath: .status.databaseName
+        - name: Retention
+          type: string
+          jsonPath: .status.retentionPolicy
+        - name: Schemas
+          type: integer
+          jsonPath: .status.schemaCount
+        - name: Extensions
+          type: integer
+          jsonPath: .status.extensionCount
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: |
+            A database on a PostgresInstance, together with its schemas,
+            extensions and the three NOLOGIN group roles that back the OWNER,
+            RW and RO access levels.
+
+            Reconciliation is a full convergence pass. Adding a schema or an
+            extension later creates it and wires up all three group roles,
+            including default privileges, so existing users pick up access
+            without any per-user change.
+
+            Access is not declared here. A PostgresUser lists the databases it
+            needs and at what level.
+          required: [spec]
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [instanceRef]
+              properties:
+                instanceRef:
+                  type: object
+                  required: [name]
+                  description: The cluster-scoped PostgresInstance to create this database on.
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                databaseName:
+                  type: string
+                  maxLength: 63
+                  pattern: '^[a-z_][a-z0-9_$]*$'
+                  description: >-
+                    Defaults to metadata.name with non-identifier characters
+                    replaced by underscores.
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: >-
+                        databaseName is immutable. Changing it would orphan the
+                        existing database; create a new PostgresDB instead.
+                retentionPolicy:
+                  type: string
+                  enum: [RETAIN, DROP]
+                  description: |
+                    What happens on delete, and to schemas or extensions removed
+                    from this spec. Defaults to the instance's policy, itself
+                    RETAIN by default.
+
+                    RETAIN: the database, its roles and any removed schema stay;
+                    orphans are reported on status.
+                    DROP: the database and its group roles are dropped on
+                    delete, and a removed schema is dropped with CASCADE.
+                schemas:
+                  type: array
+                  description: >-
+                    Schemas to create and grant on. The public schema is always
+                    managed whether or not it is listed.
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      comment:
+                        type: string
+                        maxLength: 1024
+                  x-kubernetes-list-map-keys: [name]
+                  x-kubernetes-list-type: map
+                extensions:
+                  type: array
+                  description: >-
+                    Extensions to install. On RDS an extension must be
+                    permitted by rds.allowed_extensions (and preloaded, where
+                    required) before it can be created.
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      schema:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      version:
+                        type: string
+                        maxLength: 64
+                      cascade:
+                        type: boolean
+                        default: false
+                  x-kubernetes-list-map-keys: [name]
+                  x-kubernetes-list-type: map
+                roles:
+                  type: object
+                  description: >-
+                    Override the generated group role names. Defaults are
+                    <database>_owner, <database>_rw and <database>_ro, with the
+                    instance's rolePrefix applied.
+                  properties:
+                    owner:
+                      type: string
+                      maxLength: 63
+                      pattern: '^[a-z_][a-z0-9_$]*$'
+                    readWrite:
+                      type: string
+                      maxLength: 63
+                      pattern: '^[a-z_][a-z0-9_$]*$'
+                    readOnly:
+                      type: string
+                      maxLength: 63
+                      pattern: '^[a-z_][a-z0-9_$]*$'
+                encoding:
+                  type: string
+                  default: UTF8
+                  maxLength: 32
+                  description: Fixed at creation; PostgreSQL cannot alter it afterwards.
+                lcCollate:
+                  type: string
+                  maxLength: 64
+                  description: Fixed at creation.
+                lcCtype:
+                  type: string
+                  maxLength: 64
+                  description: Fixed at creation.
+                template:
+                  type: string
+                  default: template0
+                  maxLength: 63
+                  pattern: '^[a-z_][a-z0-9_$]*$'
+                connectionLimit:
+                  type: integer
+                  minimum: -1
+                  default: -1
+                  description: -1 means unlimited.
+                parameters:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: >-
+                    Applied with ALTER DATABASE ... SET. Settings removed from
+                    this map are RESET on the next reconcile.
+                comment:
+                  type: string
+                  maxLength: 1024
+                revokePublicConnect:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Revoke CONNECT and TEMPORARY from PUBLIC so only the three
+                    group roles can attach.
+                revokePublicSchemaCreate:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Revoke CREATE from PUBLIC on each managed schema. On
+                    PostgreSQL 15 and later the public schema is already
+                    restricted.
+                grantExecuteToReadOnly:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Grant EXECUTE on routines to the read-only role. PUBLIC
+                    holds EXECUTE by default, so disabling this alone does not
+                    prevent execution.
+                setRoleForOwners:
+                  type: boolean
+                  default: true
+                  description: >-
+                    Set `role` per-database on each OWNER login role so objects
+                    they create are owned by the owner group. Without it, a
+                    migration run by a login role creates tables the RW and RO
+                    roles cannot see.
+                paused:
+                  type: boolean
+                  default: false
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                observedGeneration: { type: integer }
+                phase: { type: string }
+                instance: { type: string }
+                endpoint: { type: string }
+                databaseName: { type: string }
+                retentionPolicy: { type: string }
+                lastReconciledAt: { type: string }
+                schemaCount: { type: integer }
+                extensionCount: { type: integer }
+                roles:
+                  type: object
+                  properties:
+                    owner: { type: string }
+                    readWrite: { type: string }
+                    readOnly: { type: string }
+                managedSchemas:
+                  type: array
+                  items: { type: string }
+                  description: Schemas the operator manages, used to detect orphans.
+                managedExtensions:
+                  type: array
+                  items: { type: string }
+                observedSchemas:
+                  type: array
+                  items: { type: string }
+                observedExtensions:
+                  type: array
+                  items: { type: string }
+                orphanedSchemas:
+                  type: array
+                  items: { type: string }
+                  description: >-
+                    Previously managed schemas no longer declared in the spec
+                    and retained by policy.
+                orphanedExtensions:
+                  type: array
+                  items: { type: string }
+                unmanagedSchemas:
+                  type: array
+                  items: { type: string }
+                  description: >-
+                    Schemas present in the database that the operator did not
+                    create. Never modified or dropped.
+                unownedSchemas:
+                  type: array
+                  items: { type: string }
+                  description: >-
+                    Declared schemas whose ownership the managing role could not
+                    take, so grants on them do not apply. Before PostgreSQL 15
+                    the public schema belongs to the bootstrap superuser.
+                deniedParameters:
+                  type: array
+                  items: { type: string }
+                  description: >-
+                    Declared parameters PostgreSQL refused to set. Many GUCs are
+                    superuser-only; on RDS the master user can set them only
+                    where rds_superuser has been granted that right. The rest of
+                    the database still converges.
+                schemaGrants:
+                  type: object
+                  additionalProperties:
+                    type: array
+                    items: { type: string }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string }
+                      observedGeneration: { type: integer }

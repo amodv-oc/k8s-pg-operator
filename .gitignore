@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+
+# Editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Helm
+charts/*/charts/
+*.tgz
+
+# Local overrides
+values.local.yaml
+kubeconfig
+*.pem
+!charts/**/*.pem

@@ -1,0 +1,42 @@
+apiVersion: v2
+name: pg-operator
+description: >-
+  Kubernetes operator that manages databases, roles and grants on external
+  PostgreSQL instances such as Amazon RDS, driven by PostgresInstance,
+  PostgresDB and PostgresUser custom resources.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - postgresql
+  - postgres
+  - rds
+  - operator
+  - database
+  - external-secrets
+home: https://github.com/your-org/pg-operator
+sources:
+  - https://github.com/your-org/pg-operator
+maintainers:
+  - name: Platform Engineering
+annotations:
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/operator: "true"
+  artifacthub.io/operatorCapabilities: Seamless Upgrades
+  artifacthub.io/crds: |
+    - kind: PostgresInstance
+      version: v1alpha1
+      name: postgresinstances.postgres.opsplatform.io
+      displayName: Postgres Instance
+      description: An external PostgreSQL server the operator manages objects on.
+    - kind: PostgresDB
+      version: v1alpha1
+      name: postgresdbs.postgres.opsplatform.io
+      displayName: Postgres Database
+      description: A database with its schemas, extensions and OWNER/RW/RO group roles.
+    - kind: PostgresUser
+      version: v1alpha1
+      name: postgresusers.postgres.opsplatform.io
+      displayName: Postgres User
+      description: A login role, its grants and its generated credentials Secret.

@@ -1,0 +1,10 @@
+{{- if .Values.peering.enabled }}
+# kopf peering makes only one replica active at a time. Required if replicaCount
+# is raised above 1: two active reconcilers would issue conflicting DDL.
+apiVersion: kopf.dev/v1
+kind: ClusterKopfPeering
+metadata:
+  name: {{ .Values.peering.name | default (include "pg-operator.fullname" .) }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+{{- end }}

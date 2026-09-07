@@ -1,0 +1,245 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresinstances.postgres.opsplatform.io
+  annotations:
+    controller-gen.kubebuilder.io/version: "hand-written"
+    api-approved.kubernetes.io: "unapproved, internal operator CRD"
+spec:
+  group: postgres.opsplatform.io
+  scope: Cluster
+  names:
+    kind: PostgresInstance
+    listKind: PostgresInstanceList
+    plural: postgresinstances
+    singular: postgresinstance
+    shortNames: [pgi, pginstance]
+    categories: [postgres, pg-operator]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Host
+          type: string
+          jsonPath: .spec.host
+        - name: Version
+          type: string
+          jsonPath: .status.serverVersion
+        - name: Retention
+          type: string
+          jsonPath: .spec.retentionPolicy
+        - name: DBs
+          type: integer
+          jsonPath: .status.databases
+        - name: Users
+          type: integer
+          jsonPath: .status.users
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: |
+            A PostgreSQL server the operator manages objects on, typically an
+            external RDS instance. Cluster-scoped: platform teams own instances
+            while application teams create namespaced PostgresDB and
+            PostgresUser resources that reference them by name.
+
+            Deleting a PostgresInstance never touches the server. It only
+            releases the operator's connections.
+          required: [spec]
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [host, credentialsSecretRef]
+              properties:
+                host:
+                  type: string
+                  minLength: 1
+                  description: Hostname or address of the server, e.g. the RDS endpoint.
+                port:
+                  type: integer
+                  minimum: 1
+                  maximum: 65535
+                  default: 5432
+                credentialsSecretRef:
+                  type: object
+                  required: [name]
+                  description: |
+                    Secret holding the credentials used to manage everything
+                    else on this instance. On RDS this is the master user: a
+                    member of rds_superuser with CREATEDB and CREATEROLE.
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      maxLength: 253
+                      description: >-
+                        Defaults to the operator's own namespace. The operator
+                        can read Secrets in any namespace.
+                    usernameKey:
+                      type: string
+                      default: username
+                    passwordKey:
+                      type: string
+                      default: password
+                maintenanceDatabase:
+                  type: string
+                  default: postgres
+                  maxLength: 63
+                  pattern: '^[a-z_][a-z0-9_$]*$'
+                  description: >-
+                    Database used for cluster-wide work (CREATE DATABASE, role
+                    management). Never modified.
+                sslMode:
+                  type: string
+                  enum: [disable, allow, prefer, require, verify-ca, verify-full]
+                  default: require
+                sslRootCertSecretRef:
+                  type: object
+                  required: [name]
+                  description: >-
+                    CA bundle for sslMode verify-ca / verify-full. Required for
+                    those modes; ignored otherwise.
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      maxLength: 253
+                    key:
+                      type: string
+                      default: ca.pem
+                connectTimeoutSeconds:
+                  type: integer
+                  minimum: 1
+                  maximum: 300
+                  default: 10
+                retentionPolicy:
+                  type: string
+                  enum: [RETAIN, DROP]
+                  default: RETAIN
+                  description: >-
+                    Default policy inherited by PostgresDB and PostgresUser
+                    resources on this instance that do not set their own.
+                rolePrefix:
+                  type: string
+                  maxLength: 20
+                  default: ""
+                  pattern: '^([a-z_][a-z0-9_]*)?$'
+                  description: >-
+                    Prefix applied to every generated group role name, so
+                    several environments can share one instance without role
+                    name collisions.
+                minServerVersion:
+                  type: integer
+                  minimum: 11
+                  description: >-
+                    Refuse to reconcile if the server's major version is below
+                    this.
+                allowedNamespaces:
+                  type: array
+                  items:
+                    type: string
+                    maxLength: 253
+                  description: >-
+                    Namespaces permitted to reference this instance. Empty means
+                    all namespaces.
+                pushSecret:
+                  type: object
+                  description: >-
+                    Instance-wide PushSecret default for users that do not
+                    define their own.
+                  required: [secretStoreRefs]
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    secretStoreRefs:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            maxLength: 253
+                          kind:
+                            type: string
+                            enum: [SecretStore, ClusterSecretStore]
+                            default: ClusterSecretStore
+                    remoteRefKey:
+                      type: string
+                      description: >-
+                        Remote path template. Supports {{ .namespace }},
+                        {{ .name }} and {{ .username }}.
+                    updatePolicy:
+                      type: string
+                      enum: [Replace, IfNotExists]
+                      default: Replace
+                    deletionPolicy:
+                      type: string
+                      enum: [Delete, None]
+                      default: None
+                    refreshInterval:
+                      type: string
+                    keys:
+                      type: array
+                      items: { type: string }
+                    labels:
+                      type: object
+                      additionalProperties: { type: string }
+                    annotations:
+                      type: object
+                      additionalProperties: { type: string }
+                paused:
+                  type: boolean
+                  default: false
+                  description: Suspend reconciliation without deleting the resource.
+              x-kubernetes-validations:
+                - rule: "!(self.sslMode in ['verify-ca','verify-full']) || has(self.sslRootCertSecretRef)"
+                  message: "sslMode verify-ca and verify-full require sslRootCertSecretRef"
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                observedGeneration: { type: integer }
+                phase: { type: string }
+                endpoint: { type: string }
+                credentialsSecret: { type: string }
+                managingRole: { type: string }
+                serverVersion: { type: string }
+                serverVersionText: { type: string }
+                privileges: { type: string }
+                sslMode: { type: string }
+                retentionPolicy: { type: string }
+                pushSecretsAvailable: { type: boolean }
+                databases: { type: integer }
+                users: { type: integer }
+                lastConnectedAt: { type: string }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string }
+                      observedGeneration: { type: integer }

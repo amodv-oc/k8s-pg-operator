@@ -1,0 +1,201 @@
+# Default values for pg-operator.
+
+# -- Container image. The same image runs both the reconciler and the API.
+image:
+  repository: ghcr.io/your-org/pg-operator
+  # Defaults to .Chart.AppVersion.
+  tag: ""
+  # Pin by digest in production; takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# -- Only one reconciler may be active at a time; see peering below before
+# raising this above 1.
+replicaCount: 1
+revisionHistoryLimit: 3
+terminationGracePeriodSeconds: 30
+
+# -- Namespaces to watch for PostgresDB and PostgresUser. Empty watches all.
+# PostgresInstance is cluster-scoped and always watched cluster-wide.
+watchNamespaces: []
+
+commonLabels: {}
+annotations: {}
+podLabels: {}
+podAnnotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  # e.g. eks.amazonaws.com/role-arn for IRSA, if a SecretStore needs it.
+  annotations: {}
+
+rbac:
+  create: true
+  # -- Secret access is cluster-wide by default: instance credentials may live
+  # anywhere and generated credentials are written into consuming namespaces.
+  # Set this true and list namespaces below to narrow it to Roles instead.
+  namespacedSecrets: false
+  secretNamespaces: []
+  # -- Aggregate PostgresDB/PostgresUser access into the built-in view and edit
+  # cluster roles, so normal RBAC covers the CRDs.
+  createViewerRole: true
+  extraRules: []
+
+# -- kopf peering. Required for more than one replica: it elects a single
+# active reconciler so two operators cannot issue conflicting DDL.
+peering:
+  enabled: false
+  name: ""
+
+reconcile:
+  # -- Full convergence pass interval, in seconds. This is what corrects drift
+  # applied directly to the database and re-asserts grants.
+  interval: 300
+  # -- Quiet period after a change before a timer fires, in seconds.
+  idle: 30
+  # -- Backoff after a temporary failure, in seconds.
+  retryBackoff: 30
+
+postgres:
+  connectTimeout: 10
+  # -- Ceiling on any single statement, so a reconcile cannot wedge on a lock.
+  statementTimeoutMs: 30000
+  poolMaxSize: 4
+  poolMaxIdle: 120
+
+credentials:
+  # -- Length of generated passwords. Overridable per PostgresUser.
+  passwordLength: 32
+
+pushSecret:
+  # -- Emit external-secrets.io PushSecret resources for generated credentials.
+  enabled: true
+  # -- external-secrets.io/v1 for external-secrets >= 0.14; use
+  # external-secrets.io/v1alpha1 for older installations.
+  apiVersion: external-secrets.io/v1
+
+# -- FastAPI state API. Runs as a second container in the operator pod and
+# reads state from the Kubernetes API, so it holds no state of its own.
+api:
+  enabled: true
+  port: 8000
+  # -- Response cache TTL in seconds; absorbs dashboard polling.
+  cacheTtl: 5
+  # -- Set when served under a path prefix behind a proxy.
+  rootPath: ""
+  # -- Allowed CORS origins for the future React frontend.
+  corsOrigins: []
+  service:
+    type: ClusterIP
+    port: 8000
+    annotations: {}
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: pg-operator.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+
+operator:
+  healthPort: 8080
+  resources:
+    requests:
+      cpu: 100m
+      memory: 192Mi
+    limits:
+      memory: 512Mi
+
+metrics:
+  enabled: true
+  port: 9090
+  serviceMonitor:
+    enabled: false
+    namespace: ""
+    labels: {}
+    interval: 30s
+    scrapeTimeout: 10s
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: ""
+  maxUnavailable: 1
+
+networkPolicy:
+  enabled: false
+  # Who may reach the state API.
+  apiIngressFrom: []
+  # Who may scrape metrics.
+  metricsIngressFrom: []
+  # -- Egress rules. Left empty this allows all egress, because the RDS
+  # endpoints the operator must reach are not known at install time. Pin them:
+  #   egress:
+  #     - to:
+  #         - ipBlock: { cidr: 10.0.0.0/16 }
+  #       ports:
+  #         - { port: 5432, protocol: TCP }
+  egress: []
+
+logging:
+  level: INFO
+  # json or console
+  format: json
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: [ALL]
+
+# -- In-memory scratch for CA bundles read from Secrets, since libpq needs
+# sslrootcert as a file path.
+tmpSizeLimit: 16Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+extraEnv: []
+extraVolumes: []
+extraVolumeMounts: []
+
+# -- Optionally declare PostgresInstance resources from the chart. Keys become
+# resource names; values are the spec verbatim. Credentials are referenced, not
+# templated in.
+#
+#   instances:
+#     prod-rds:
+#       host: prod.abc123.ap-southeast-2.rds.amazonaws.com
+#       credentialsSecretRef:
+#         name: prod-rds-superuser
+#         namespace: pg-operator
+#       sslMode: verify-full
+#       sslRootCertSecretRef:
+#         name: rds-ca-bundle
+#         namespace: pg-operator
+#       retentionPolicy: RETAIN
+instances: {}

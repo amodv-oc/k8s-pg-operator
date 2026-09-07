@@ -1,0 +1,224 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "pg-operator values",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["image", "reconcile", "pushSecret", "api", "operator"],
+  "properties": {
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "digest": {
+          "type": "string",
+          "pattern": "^(sha256:[a-f0-9]{64})?$",
+          "description": "Pin by digest in production. Takes precedence over tag."
+        },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Only one reconciler may be active; raise above 1 only with peering enabled."
+    },
+    "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
+    "watchNamespaces": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Empty watches all namespaces. PostgresInstance is cluster-scoped and always watched cluster-wide."
+    },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "imagePullSecrets": { "type": "array" },
+    "commonLabels": { "type": "object" },
+    "annotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "podAnnotations": { "type": "object" },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": { "type": "object" }
+      }
+    },
+    "rbac": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "namespacedSecrets": {
+          "type": "boolean",
+          "description": "Narrow Secret access to secretNamespaces via Roles instead of a cluster-wide grant."
+        },
+        "secretNamespaces": { "type": "array", "items": { "type": "string" } },
+        "createViewerRole": { "type": "boolean" },
+        "extraRules": { "type": "array" }
+      }
+    },
+    "peering": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "name": { "type": "string" }
+      }
+    },
+    "reconcile": {
+      "type": "object",
+      "required": ["interval", "idle", "retryBackoff"],
+      "properties": {
+        "interval": {
+          "type": "integer",
+          "minimum": 10,
+          "description": "Full convergence pass interval in seconds; this is what corrects drift."
+        },
+        "idle": { "type": "integer", "minimum": 1 },
+        "retryBackoff": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "postgres": {
+      "type": "object",
+      "properties": {
+        "connectTimeout": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "statementTimeoutMs": { "type": "integer", "minimum": 1000 },
+        "poolMaxSize": { "type": "integer", "minimum": 1 },
+        "poolMaxIdle": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "credentials": {
+      "type": "object",
+      "properties": {
+        "passwordLength": { "type": "integer", "minimum": 16, "maximum": 128 }
+      }
+    },
+    "pushSecret": {
+      "type": "object",
+      "required": ["enabled", "apiVersion"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "apiVersion": {
+          "type": "string",
+          "enum": ["external-secrets.io/v1", "external-secrets.io/v1beta1", "external-secrets.io/v1alpha1"],
+          "description": "external-secrets.io/v1 for external-secrets >= 0.14."
+        }
+      }
+    },
+    "api": {
+      "type": "object",
+      "required": ["enabled", "port"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "cacheTtl": { "type": "integer", "minimum": 0 },
+        "rootPath": { "type": "string" },
+        "corsOrigins": { "type": "array", "items": { "type": "string" } },
+        "service": {
+          "type": "object",
+          "properties": {
+            "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+            "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+            "annotations": { "type": "object" }
+          }
+        },
+        "ingress": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "className": { "type": "string" },
+            "annotations": { "type": "object" },
+            "hosts": { "type": "array" },
+            "tls": { "type": "array" }
+          }
+        },
+        "resources": { "type": "object" }
+      }
+    },
+    "operator": {
+      "type": "object",
+      "required": ["healthPort"],
+      "properties": {
+        "healthPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "resources": { "type": "object" }
+      }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "serviceMonitor": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "namespace": { "type": "string" },
+            "labels": { "type": "object" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" }
+          }
+        }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["string", "integer"] },
+        "maxUnavailable": { "type": ["string", "integer"] }
+      }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "apiIngressFrom": { "type": "array" },
+        "metricsIngressFrom": { "type": "array" },
+        "egress": {
+          "type": "array",
+          "description": "Empty allows all egress; the PostgreSQL endpoints are outside the cluster."
+        }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "level": { "enum": ["DEBUG", "INFO", "WARNING", "ERROR"] },
+        "format": { "enum": ["json", "console"] }
+      }
+    },
+    "podSecurityContext": { "type": "object" },
+    "containerSecurityContext": { "type": "object" },
+    "tmpSizeLimit": { "type": "string" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "type": "array" },
+    "extraEnv": { "type": "array" },
+    "extraVolumes": { "type": "array" },
+    "extraVolumeMounts": { "type": "array" },
+    "priorityClassName": { "type": "string" },
+    "instances": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["host", "credentialsSecretRef"],
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "host": { "type": "string", "minLength": 1 },
+          "credentialsSecretRef": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string" },
+              "namespace": { "type": "string" },
+              "usernameKey": { "type": "string" },
+              "passwordKey": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

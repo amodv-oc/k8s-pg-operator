@@ -1,0 +1,387 @@
+# The same database and user shapes applied against every server version, so
+# any behavioural difference between 14 and 18 shows up as a status difference.
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-14
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg14
+  databaseName: orders
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+  # Both are trusted extensions, so a non-superuser can install them.
+  extensions:
+    - name: citext
+      schema: public
+    - name: pgcrypto
+      schema: public
+  parameters:
+    search_path: '"$user", public, audit'
+    log_min_duration_statement: "500"
+  connectionLimit: 50
+  comment: order service primary database
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api-14
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg14
+  username: orders_api
+  access:
+    - dbRef:
+        name: orders-14
+      role: RW
+  generatedSecret:
+    name: orders-api-14-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator-14
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg14
+  username: orders_migrator
+  access:
+    - dbRef:
+        name: orders-14
+      role: OWNER
+  connectionLimit: 4
+  generatedSecret:
+    name: orders-migrator-14-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics-14
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg14
+  username: analytics
+  access:
+    - dbRef:
+        name: orders-14
+      role: RO
+  parameters:
+    statement_timeout: "30000"
+  generatedSecret:
+    name: analytics-14-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-15
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg15
+  databaseName: orders
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+  # Both are trusted extensions, so a non-superuser can install them.
+  extensions:
+    - name: citext
+      schema: public
+    - name: pgcrypto
+      schema: public
+  parameters:
+    search_path: '"$user", public, audit'
+    log_min_duration_statement: "500"
+  connectionLimit: 50
+  comment: order service primary database
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api-15
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg15
+  username: orders_api
+  access:
+    - dbRef:
+        name: orders-15
+      role: RW
+  generatedSecret:
+    name: orders-api-15-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator-15
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg15
+  username: orders_migrator
+  access:
+    - dbRef:
+        name: orders-15
+      role: OWNER
+  connectionLimit: 4
+  generatedSecret:
+    name: orders-migrator-15-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics-15
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg15
+  username: analytics
+  access:
+    - dbRef:
+        name: orders-15
+      role: RO
+  parameters:
+    statement_timeout: "30000"
+  generatedSecret:
+    name: analytics-15-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-16
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg16
+  databaseName: orders
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+  # Both are trusted extensions, so a non-superuser can install them.
+  extensions:
+    - name: citext
+      schema: public
+    - name: pgcrypto
+      schema: public
+  parameters:
+    search_path: '"$user", public, audit'
+    log_min_duration_statement: "500"
+  connectionLimit: 50
+  comment: order service primary database
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api-16
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg16
+  username: orders_api
+  access:
+    - dbRef:
+        name: orders-16
+      role: RW
+  generatedSecret:
+    name: orders-api-16-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator-16
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg16
+  username: orders_migrator
+  access:
+    - dbRef:
+        name: orders-16
+      role: OWNER
+  connectionLimit: 4
+  generatedSecret:
+    name: orders-migrator-16-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics-16
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg16
+  username: analytics
+  access:
+    - dbRef:
+        name: orders-16
+      role: RO
+  parameters:
+    statement_timeout: "30000"
+  generatedSecret:
+    name: analytics-16-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-17
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg17
+  databaseName: orders
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+  # Both are trusted extensions, so a non-superuser can install them.
+  extensions:
+    - name: citext
+      schema: public
+    - name: pgcrypto
+      schema: public
+  parameters:
+    search_path: '"$user", public, audit'
+    log_min_duration_statement: "500"
+  connectionLimit: 50
+  comment: order service primary database
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api-17
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg17
+  username: orders_api
+  access:
+    - dbRef:
+        name: orders-17
+      role: RW
+  generatedSecret:
+    name: orders-api-17-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator-17
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg17
+  username: orders_migrator
+  access:
+    - dbRef:
+        name: orders-17
+      role: OWNER
+  connectionLimit: 4
+  generatedSecret:
+    name: orders-migrator-17-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics-17
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg17
+  username: analytics
+  access:
+    - dbRef:
+        name: orders-17
+      role: RO
+  parameters:
+    statement_timeout: "30000"
+  generatedSecret:
+    name: analytics-17-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-18
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg18
+  databaseName: orders
+  schemas:
+    - name: public
+    - name: audit
+      comment: append-only audit trail
+    - name: reporting
+  # Both are trusted extensions, so a non-superuser can install them.
+  extensions:
+    - name: citext
+      schema: public
+    - name: pgcrypto
+      schema: public
+  parameters:
+    search_path: '"$user", public, audit'
+    log_min_duration_statement: "500"
+  connectionLimit: 50
+  comment: order service primary database
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-api-18
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg18
+  username: orders_api
+  access:
+    - dbRef:
+        name: orders-18
+      role: RW
+  generatedSecret:
+    name: orders-api-18-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: orders-migrator-18
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg18
+  username: orders_migrator
+  access:
+    - dbRef:
+        name: orders-18
+      role: OWNER
+  connectionLimit: 4
+  generatedSecret:
+    name: orders-migrator-18-creds
+---
+apiVersion: postgres.opsplatform.io/v1alpha1
+kind: PostgresUser
+metadata:
+  name: analytics-18
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg18
+  username: analytics
+  access:
+    - dbRef:
+        name: orders-18
+      role: RO
+  parameters:
+    statement_timeout: "30000"
+  generatedSecret:
+    name: analytics-18-creds

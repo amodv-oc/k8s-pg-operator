@@ -1,0 +1,321 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresusers.postgres.opsplatform.io
+  annotations:
+    controller-gen.kubebuilder.io/version: "hand-written"
+    api-approved.kubernetes.io: "unapproved, internal operator CRD"
+spec:
+  group: postgres.opsplatform.io
+  scope: Namespaced
+  names:
+    kind: PostgresUser
+    listKind: PostgresUserList
+    plural: postgresusers
+    singular: postgresuser
+    shortNames: [pguser]
+    categories: [postgres, pg-operator]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Instance
+          type: string
+          jsonPath: .spec.instanceRef.name
+        - name: Username
+          type: string
+          jsonPath: .status.username
+        - name: Grants
+          type: integer
+          jsonPath: .status.grantCount
+        - name: Secret
+          type: string
+          jsonPath: .status.secretRef.name
+        - name: Retention
+          type: string
+          jsonPath: .status.retentionPolicy
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: |
+            A LOGIN role on a PostgresInstance and the access it holds.
+
+            Each spec.access entry grants membership of one of the referenced
+            PostgresDB's group roles. The user never receives object privileges
+            directly, so changing RW to RO is a membership change and a new
+            schema needs no per-user action.
+
+            The operator generates a password and writes it to a Secret in this
+            namespace, or adopts an existing one via passwordSecretRef. A
+            PushSecret can mirror that Secret to an external store.
+          required: [spec]
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [instanceRef]
+              properties:
+                instanceRef:
+                  type: object
+                  required: [name]
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                username:
+                  type: string
+                  maxLength: 63
+                  pattern: '^[a-z_][a-z0-9_$]*$'
+                  description: >-
+                    Defaults to metadata.name with non-identifier characters
+                    replaced by underscores. Must not start with pg_.
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: >-
+                        username is immutable. Changing it would orphan the
+                        existing role; create a new PostgresUser instead.
+                    - rule: "!self.startsWith('pg_')"
+                      message: "usernames cannot use the reserved pg_ prefix"
+                retentionPolicy:
+                  type: string
+                  enum: [RETAIN, DROP]
+                  description: |
+                    What happens on delete. Defaults to the instance's policy,
+                    itself RETAIN by default.
+
+                    RETAIN: the role and its credentials Secret stay, so
+                    anything still using them keeps working.
+                    DROP: sessions are terminated, privileges cleared, the role
+                    dropped, and the Secret and PushSecret removed.
+                access:
+                  type: array
+                  description: >-
+                    Databases this user can reach and at what level. One entry
+                    per database.
+                  items:
+                    type: object
+                    required: [dbRef, role]
+                    properties:
+                      dbRef:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            maxLength: 253
+                          namespace:
+                            type: string
+                            maxLength: 253
+                            description: Defaults to this resource's namespace.
+                      role:
+                        type: string
+                        enum: [OWNER, RW, RO]
+                        description: |
+                          OWNER: full DDL, via the database's owner group.
+                          RW: SELECT/INSERT/UPDATE/DELETE and sequence use.
+                          RO: SELECT only.
+                attributes:
+                  type: object
+                  description: Login-role attributes. All default off.
+                  properties:
+                    createDB: { type: boolean, default: false }
+                    createRole: { type: boolean, default: false }
+                    replication: { type: boolean, default: false }
+                    bypassRLS: { type: boolean, default: false }
+                    inherit:
+                      type: boolean
+                      default: true
+                      description: >-
+                        Must stay true for group membership to convey
+                        privileges without an explicit SET ROLE.
+                connectionLimit:
+                  type: integer
+                  minimum: -1
+                  default: -1
+                validUntil:
+                  type: string
+                  description: >-
+                    Password expiry as a timestamp PostgreSQL accepts, e.g.
+                    2027-01-01T00:00:00Z. Omit for no expiry.
+                parameters:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: >-
+                    Applied with ALTER ROLE ... SET. Settings removed from this
+                    map are RESET on the next reconcile.
+                login:
+                  type: boolean
+                  default: true
+                passwordSecretRef:
+                  type: object
+                  required: [name]
+                  description: >-
+                    Adopt an existing password instead of generating one. The
+                    operator reads this Secret and applies the value with ALTER
+                    ROLE; it never writes to it.
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                    namespace:
+                      type: string
+                      maxLength: 253
+                    key:
+                      type: string
+                      default: password
+                passwordLength:
+                  type: integer
+                  minimum: 16
+                  maximum: 128
+                  default: 32
+                  description: Length of the generated password. Ignored with passwordSecretRef.
+                generatedSecret:
+                  type: object
+                  description: Shape of the Secret the operator writes.
+                  properties:
+                    name:
+                      type: string
+                      maxLength: 253
+                      description: Defaults to <metadata.name>-pg-credentials.
+                    namespace:
+                      type: string
+                      maxLength: 253
+                      description: Defaults to this resource's namespace.
+                    keys:
+                      type: object
+                      additionalProperties: { type: string }
+                      description: >-
+                        Rename the written keys, e.g. {password: PGPASSWORD}.
+                        Defaults are username, password, host, port, database,
+                        sslmode, uri and jdbcUri.
+                    includeUri:
+                      type: boolean
+                      default: true
+                    defaultDatabase:
+                      type: string
+                      maxLength: 63
+                      description: >-
+                        Database used in the connection string. Defaults to the
+                        first entry in access.
+                    labels:
+                      type: object
+                      additionalProperties: { type: string }
+                    annotations:
+                      type: object
+                      additionalProperties: { type: string }
+                pushSecret:
+                  type: object
+                  required: [secretStoreRefs]
+                  description: >-
+                    Mirror the credentials Secret to an external store via
+                    external-secrets. Overrides any instance-wide default.
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: true
+                    secretStoreRefs:
+                      type: array
+                      minItems: 1
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            maxLength: 253
+                          kind:
+                            type: string
+                            enum: [SecretStore, ClusterSecretStore]
+                            default: ClusterSecretStore
+                    remoteRefKey:
+                      type: string
+                      description: >-
+                        Remote path. Supports {{ .namespace }}, {{ .name }} and
+                        {{ .username }}. Defaults to <namespace>/<name>.
+                    updatePolicy:
+                      type: string
+                      enum: [Replace, IfNotExists]
+                      default: Replace
+                    deletionPolicy:
+                      type: string
+                      enum: [Delete, None]
+                      default: None
+                      description: >-
+                        Whether external-secrets removes the remote value when
+                        the PushSecret goes away.
+                    refreshInterval:
+                      type: string
+                    keys:
+                      type: array
+                      items: { type: string }
+                      description: Restrict which Secret keys are pushed. Empty means all.
+                    labels:
+                      type: object
+                      additionalProperties: { type: string }
+                    annotations:
+                      type: object
+                      additionalProperties: { type: string }
+                paused:
+                  type: boolean
+                  default: false
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                observedGeneration: { type: integer }
+                phase: { type: string }
+                instance: { type: string }
+                endpoint: { type: string }
+                username: { type: string }
+                retentionPolicy: { type: string }
+                lastReconciledAt: { type: string }
+                grantCount: { type: integer }
+                grants:
+                  type: array
+                  description: >-
+                    Memberships the operator granted. Only these are eligible
+                    for revocation, so a membership added out-of-band is left
+                    alone.
+                  items:
+                    type: object
+                    properties:
+                      database: { type: string }
+                      role: { type: string }
+                      groupRole: { type: string }
+                      dbRef: { type: string }
+                secretRef:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+                secretKeys:
+                  type: array
+                  items: { type: string }
+                pushSecretRef:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    namespace: { type: string }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string }
+                      observedGeneration: { type: integer }
