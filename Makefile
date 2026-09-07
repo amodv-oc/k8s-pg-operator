@@ -120,6 +120,76 @@ run: ## Run the operator against the current kubecontext
 run-api: ## Run the state API against the current kubecontext
 	PG_OPERATOR_LOG_FORMAT=console uv run pg-operator-api
 
+# --------------------------------------------------------------------------
+# local cluster (OrbStack or any local kubecontext) - see hack/local/README.md
+# --------------------------------------------------------------------------
+
+LOCAL_DIR   := hack/local
+LOCAL_PGS   := 14 15 16 17 18
+
+.PHONY: local-up
+local-up: build ## Build, start PostgreSQL 14-18 in-cluster, install the operator
+	kubectl apply -f $(LOCAL_DIR)/00-servers.yaml
+	@for v in $(LOCAL_PGS); do \
+	  kubectl rollout status -n pg-instances deploy/pg$$v --timeout=180s; \
+	done
+	kubectl apply -f $(CHART)/crds/
+	kubectl apply -f $(LOCAL_DIR)/01-instances.yaml
+	helm upgrade --install $(NAMESPACE) $(CHART) --namespace $(NAMESPACE) \
+	  --set image.repository=$(IMAGE) --set image.tag=$(TAG) \
+	  --set image.pullPolicy=IfNotPresent \
+	  --set logging.format=console \
+	  --set reconcile.interval=60 --set reconcile.idle=5 \
+	  --wait --timeout 3m
+	kubectl apply -f $(LOCAL_DIR)/02-workload.yaml
+	@echo
+	@echo "applied; run 'make local-status' once the timers have fired"
+
+.PHONY: local-reload
+local-reload: build ## Rebuild the image and restart the operator only
+	kubectl apply -f $(CHART)/crds/
+	kubectl rollout restart -n $(NAMESPACE) deploy/$(NAMESPACE)
+	kubectl rollout status -n $(NAMESPACE) deploy/$(NAMESPACE) --timeout=180s
+
+.PHONY: local-status
+local-status: ## Phases for every managed resource
+	@kubectl get postgresinstances
+	@echo
+	@kubectl get postgresdbs -n team-a
+	@echo
+	@kubectl get postgresusers -n team-a
+
+.PHONY: local-verify
+local-verify: ## Connect as each generated user and assert its privileges
+	@for v in $(LOCAL_PGS); do $(LOCAL_DIR)/verify.sh $$v || exit 1; done
+
+.PHONY: local-test
+local-test: ## Run the full pytest suite against each server in turn
+	@for v in $(LOCAL_PGS); do \
+	  kubectl port-forward -n pg-instances svc/pg$$v 15432:5432 >/dev/null 2>&1 & \
+	  pf=$$!; \
+	  until nc -z localhost 15432 2>/dev/null; do sleep 1; done; \
+	  printf "PostgreSQL %-3s " $$v; \
+	  PGOP_TEST_DSN="host=localhost port=15432 user=pgadmin password=adminpw dbname=postgres sslmode=disable" \
+	    uv run pytest -q 2>&1 | tail -1; \
+	  kill $$pf 2>/dev/null; wait $$pf 2>/dev/null; \
+	done
+
+.PHONY: local-logs
+local-logs: ## Follow the operator log
+	kubectl logs -n $(NAMESPACE) deploy/$(NAMESPACE) -c operator -f
+
+.PHONY: local-api
+local-api: ## Port-forward the state API to localhost:8000
+	kubectl port-forward -n $(NAMESPACE) svc/$(NAMESPACE)-api 8000:8000
+
+.PHONY: local-down
+local-down: ## Remove the operator, the servers and their namespaces
+	-helm uninstall $(NAMESPACE) --namespace $(NAMESPACE)
+	-kubectl delete -f $(LOCAL_DIR)/02-workload.yaml --ignore-not-found
+	-kubectl delete -f $(LOCAL_DIR)/01-instances.yaml --ignore-not-found
+	-kubectl delete -f $(LOCAL_DIR)/00-servers.yaml --ignore-not-found
+
 .PHONY: clean
 clean: ## Remove build and cache artefacts
 	rm -rf .pytest_cache .ruff_cache .mypy_cache htmlcov .coverage dist build

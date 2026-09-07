@@ -453,11 +453,27 @@ is recognisable. `lastTransitionTime` only moves when the status actually flips.
 | --- | --- |
 | `Ready` | Last reconcile succeeded |
 | `Reachable` | The server answered |
-| `Synced` | Spec fully applied. `False` for immutable drift or a pending dependency |
-| `Drifted` | Live state diverges in a way policy forbids fixing (retained orphans) |
+| `Synced` | Spec fully applied. `False` when something in the spec cannot be satisfied |
+| `Drifted` | Live state diverges from the spec and this pass did not converge it |
 
 `status.phase` collapses these into one printer column: `Ready`, `Drifted`,
 `Unreachable`, `Failed`, `Paused`, `Pending`.
+
+`Drifted` covers two different situations, and its `reason` says which:
+
+| Reason | Divergence the operator... | Clears `Synced`? |
+| --- | --- | --- |
+| `RetainedOrphans` | *will not* fix — `retentionPolicy: RETAIN` forbids dropping | No |
+| `SchemaNotOwned` | *cannot* fix — the managing role cannot take the schema | Yes |
+| `ParameterDenied` | *cannot* fix — the managing role may not set the parameter | Yes |
+| `ImmutableFieldDrift` | *cannot* fix — PostgreSQL has no `ALTER` for the field | Yes |
+| `MultipleIssues` | more than one of the above; every cause is in the message | Yes |
+
+A cause that the operator cannot fix does not abort the pass. Schemas,
+extensions, grants and roles still converge, and the specific thing that failed
+is named on `status.unownedSchemas` or `status.deniedParameters` with a remedy.
+A single unsettable parameter blocking every other object in the database would
+be a worse failure than the one being reported.
 
 ### Failure behaviour
 
@@ -550,7 +566,10 @@ helm lint charts/pg-operator       # chart
 
 The integration suite runs against a real PostgreSQL server as a **non-superuser**,
 mirroring RDS. It is where the privilege model is actually proved — and it is
-how four RDS-specific bugs in this operator were found.
+how most of the RDS-specific bugs in this operator were found. It is verified
+against PostgreSQL 14, 15, 16, 17 and 18, which take different code paths:
+per-grant `INHERIT`/`SET` options arrive in 16, `pg_database_owner` ownership of
+`public` in 15, and `GRANT ... ON PARAMETER` in 15.
 
 ```bash
 docker run -d --name pgop-test -e POSTGRES_PASSWORD=testpw -p 15432:5432 postgres:16-alpine
@@ -569,7 +588,27 @@ Without `PGOP_TEST_DSN` the integration tests skip and the unit tests still run.
 against real PostgreSQL with a faked Kubernetes API, so it covers ordering,
 status and retention decisions rather than SQL primitives alone.
 
-### Running locally
+### The local cluster harness
+
+`hack/local/` runs the operator in a local Kubernetes cluster against five real
+servers — PostgreSQL 14 through 18 — each bootstrapped with an RDS-like
+non-superuser managing role. Tested on OrbStack, whose image store is shared
+with Docker so no registry is needed.
+
+```bash
+make local-up        # build the image, start the servers, install the operator
+make local-status    # phases for all three kinds
+make local-verify    # connect as each generated user and assert its privileges
+make local-test      # the full pytest suite against each server in turn
+make local-down
+```
+
+Applying an identical workload to every version is the point: a behavioural
+difference between 14 and 18 shows up as a status difference between otherwise
+identical resources. PostgreSQL 14 is *expected* to report `Drifted` there — see
+`hack/local/README.md` for why, and why a real RDS 14 instance does not.
+
+### Running against a kubecontext directly
 
 ```bash
 export PG_OPERATOR_NAMESPACE=pg-operator

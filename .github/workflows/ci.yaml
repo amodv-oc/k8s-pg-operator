@@ -34,7 +34,7 @@ jobs:
       matrix:
         # 14 predates the PostgreSQL 16 role-grant changes; 15 locks down the
         # public schema; 16 and 17 need explicit INHERIT/SET on role grants.
-        postgres: ["14", "15", "16", "17"]
+        postgres: ["14", "15", "16", "17", "18"]
     services:
       postgres:
         image: postgres:${{ matrix.postgres }}-alpine

@@ -329,7 +329,12 @@ async def test_a_retained_orphan_keeps_being_reported(ctx, cleanup, unique) -> N
     assert third["orphanedSchemas"] == []
     assert "audit" not in third["observedSchemas"]
     assert "audit" not in third["managedSchemas"]
-    assert third["phase"] == "Ready"
+    # No orphan drift remains. The phase itself is not asserted: before
+    # PostgreSQL 15 this database is Drifted anyway, because `public` belongs to
+    # the bootstrap superuser and its ownership cannot be taken.
+    drift = next(c for c in third["conditions"] if c["type"] == "Drifted")
+    assert drift["reason"] != "RetainedOrphans"
+    assert "audit" not in drift["message"]
 
 
 async def test_removed_schema_is_dropped_under_drop_policy(ctx, cleanup, unique) -> None:
