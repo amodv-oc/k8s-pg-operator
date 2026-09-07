@@ -114,8 +114,8 @@ def test_managed_labels_identify_the_owner_across_namespaces() -> None:
         extra={"team": "payments"},
     )
     assert labels[LABEL_MANAGED_BY] == LABEL_MANAGED_BY_VALUE
-    assert labels["postgres.opsplatform.io/owner-kind"] == "PostgresUser"
-    assert labels["postgres.opsplatform.io/owner-name"] == "orders-api"
-    assert labels["postgres.opsplatform.io/owner-namespace"] == "team-a"
-    assert labels["postgres.opsplatform.io/instance"] == "prod-rds"
+    assert labels["postgres.ourcommunity.com.au/owner-kind"] == "PostgresUser"
+    assert labels["postgres.ourcommunity.com.au/owner-name"] == "orders-api"
+    assert labels["postgres.ourcommunity.com.au/owner-namespace"] == "team-a"
+    assert labels["postgres.ourcommunity.com.au/instance"] == "prod-rds"
     assert labels["team"] == "payments"

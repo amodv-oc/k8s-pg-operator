@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Final
 
-API_GROUP: Final = "postgres.opsplatform.io"
+API_GROUP: Final = "postgres.ourcommunity.com.au"
 API_VERSION: Final = "v1alpha1"
 
 KIND_INSTANCE: Final = "PostgresInstance"

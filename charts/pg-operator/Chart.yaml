@@ -27,16 +27,16 @@ annotations:
   artifacthub.io/crds: |
     - kind: PostgresInstance
       version: v1alpha1
-      name: postgresinstances.postgres.opsplatform.io
+      name: postgresinstances.postgres.ourcommunity.com.au
       displayName: Postgres Instance
       description: An external PostgreSQL server the operator manages objects on.
     - kind: PostgresDB
       version: v1alpha1
-      name: postgresdbs.postgres.opsplatform.io
+      name: postgresdbs.postgres.ourcommunity.com.au
       displayName: Postgres Database
       description: A database with its schemas, extensions and OWNER/RW/RO group roles.
     - kind: PostgresUser
       version: v1alpha1
-      name: postgresusers.postgres.opsplatform.io
+      name: postgresusers.postgres.ourcommunity.com.au
       displayName: Postgres User
       description: A login role, its grants and its generated credentials Secret.

@@ -3,7 +3,7 @@
 #
 # Deleting this resource never touches the server. It only releases the
 # operator's connections.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: prod-rds
@@ -49,7 +49,7 @@ spec:
 ---
 # A second instance sharing one server across environments. rolePrefix keeps the
 # generated group role names from colliding with the instance above.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: staging-rds

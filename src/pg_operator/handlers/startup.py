@@ -26,10 +26,10 @@ async def configure(settings: kopf.OperatorSettings, **_: object) -> None:
     # Progress and diff-base live in annotations rather than status, so the
     # status subresource stays entirely ours to shape.
     settings.persistence.progress_storage = kopf.AnnotationsProgressStorage(
-        prefix="postgres.opsplatform.io"
+        prefix="postgres.ourcommunity.com.au"
     )
     settings.persistence.diffbase_storage = kopf.AnnotationsDiffBaseStorage(
-        prefix="postgres.opsplatform.io", key="last-handled-configuration"
+        prefix="postgres.ourcommunity.com.au", key="last-handled-configuration"
     )
 
     # Reconciles talk to an external database; serialising per-resource work

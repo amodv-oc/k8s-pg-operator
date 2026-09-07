@@ -7,20 +7,20 @@ metadata:
     {{- include "pg-operator.labels" . | nindent 4 }}
 rules:
   # --- own custom resources -------------------------------------------------
-  - apiGroups: [postgres.opsplatform.io]
+  - apiGroups: [postgres.ourcommunity.com.au]
     resources:
       - postgresinstances
       - postgresdbs
       - postgresusers
     verbs: [get, list, watch, patch, update]
-  - apiGroups: [postgres.opsplatform.io]
+  - apiGroups: [postgres.ourcommunity.com.au]
     resources:
       - postgresinstances/status
       - postgresdbs/status
       - postgresusers/status
     verbs: [get, patch, update]
   # Finalizers gate the retention policy, so they must be writable.
-  - apiGroups: [postgres.opsplatform.io]
+  - apiGroups: [postgres.ourcommunity.com.au]
     resources:
       - postgresinstances/finalizers
       - postgresdbs/finalizers
@@ -141,7 +141,7 @@ metadata:
     {{- include "pg-operator.labels" . | nindent 4 }}
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
-  - apiGroups: [postgres.opsplatform.io]
+  - apiGroups: [postgres.ourcommunity.com.au]
     resources: [postgresinstances, postgresdbs, postgresusers]
     verbs: [get, list, watch]
 ---
@@ -153,7 +153,7 @@ metadata:
     {{- include "pg-operator.labels" . | nindent 4 }}
     rbac.authorization.k8s.io/aggregate-to-edit: "true"
 rules:
-  - apiGroups: [postgres.opsplatform.io]
+  - apiGroups: [postgres.ourcommunity.com.au]
     resources: [postgresdbs, postgresusers]
     verbs: [get, list, watch, create, update, patch, delete]
 {{- end }}

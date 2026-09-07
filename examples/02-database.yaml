@@ -10,7 +10,7 @@
 # Reconciliation is a full convergence pass: adding a schema to this list later
 # creates it and wires up all three group roles, including default privileges,
 # so existing users can use it immediately with no per-user change.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB
 metadata:
   name: orders
@@ -52,7 +52,7 @@ spec:
 # A staging database on the DROP-policy instance. Deleting this resource really
 # drops the database and its group roles, and removing a schema from the list
 # really drops the schema with CASCADE.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB
 metadata:
   name: orders
@@ -67,7 +67,7 @@ spec:
 ---
 # Overriding the generated role names, for adopting a database that already has
 # its own role convention.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB
 metadata:
   name: legacy-billing

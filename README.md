@@ -292,7 +292,7 @@ kubectl -n pg-operator create secret generic prod-rds-superuser \
 
 # 2. Register the server (cluster-scoped).
 kubectl apply -f - <<'YAML'
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: prod-rds
@@ -310,14 +310,14 @@ kubectl get postgresinstance prod-rds
 
 # 3. A database and a user.
 kubectl apply -f - <<'YAML'
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB
 metadata: {name: orders, namespace: team-a}
 spec:
   instanceRef: {name: prod-rds}
   schemas: [{name: public}, {name: audit}]
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata: {name: orders-api, namespace: team-a}
 spec:

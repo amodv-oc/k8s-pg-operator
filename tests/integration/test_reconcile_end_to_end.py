@@ -56,7 +56,7 @@ def k8s(endpoint: Endpoint) -> FakeK8sClient:
     )
     client.custom.add(
         {
-            "apiVersion": "postgres.opsplatform.io/v1alpha1",
+            "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
             "kind": "PostgresInstance",
             "metadata": {"name": INSTANCE, "generation": 1},
             "spec": {
@@ -86,7 +86,7 @@ async def ctx(k8s: FakeK8sClient, settings: Settings):
 
 def db_resource(name: str, **spec: Any) -> dict[str, Any]:
     return {
-        "apiVersion": "postgres.opsplatform.io/v1alpha1",
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
         "kind": "PostgresDB",
         "metadata": {"name": name, "namespace": NS, "generation": 1, "uid": "db-uid"},
         "spec": {"instanceRef": {"name": INSTANCE}, **spec},
@@ -95,7 +95,7 @@ def db_resource(name: str, **spec: Any) -> dict[str, Any]:
 
 def user_resource(name: str, **spec: Any) -> dict[str, Any]:
     return {
-        "apiVersion": "postgres.opsplatform.io/v1alpha1",
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
         "kind": "PostgresUser",
         "metadata": {"name": name, "namespace": NS, "generation": 1, "uid": "user-uid"},
         "spec": {"instanceRef": {"name": INSTANCE}, **spec},

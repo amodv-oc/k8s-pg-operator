@@ -20,7 +20,7 @@ stringData:
   username: pgadmin
   password: adminpw
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: pg14
@@ -47,7 +47,7 @@ stringData:
   username: pgadmin
   password: adminpw
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: pg15
@@ -74,7 +74,7 @@ stringData:
   username: pgadmin
   password: adminpw
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: pg16
@@ -101,7 +101,7 @@ stringData:
   username: pgadmin
   password: adminpw
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: pg17
@@ -128,7 +128,7 @@ stringData:
   username: pgadmin
   password: adminpw
 ---
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
 metadata:
   name: pg18

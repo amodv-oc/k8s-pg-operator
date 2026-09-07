@@ -19,7 +19,7 @@ from pg_operator.config import Settings
 
 def instance_obj(name: str, phase: str = "Ready", **status: Any) -> dict[str, Any]:
     return {
-        "apiVersion": "postgres.opsplatform.io/v1alpha1",
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
         "kind": "PostgresInstance",
         "metadata": {"name": name, "generation": 2, "creationTimestamp": "2026-01-01T00:00:00Z"},
         "spec": {
@@ -50,7 +50,7 @@ def database_obj(
     name: str, namespace: str = "team-a", phase: str = "Ready", **status: Any
 ) -> dict[str, Any]:
     return {
-        "apiVersion": "postgres.opsplatform.io/v1alpha1",
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
         "kind": "PostgresDB",
         "metadata": {"name": name, "namespace": namespace, "generation": 1},
         "spec": {"instanceRef": {"name": "prod-rds"}, "schemas": [{"name": "audit"}]},
@@ -83,7 +83,7 @@ def user_obj(
     **spec: Any,
 ) -> dict[str, Any]:
     return {
-        "apiVersion": "postgres.opsplatform.io/v1alpha1",
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
         "kind": "PostgresUser",
         "metadata": {"name": name, "namespace": namespace, "generation": 1},
         "spec": {"instanceRef": {"name": "prod-rds"}, **spec},

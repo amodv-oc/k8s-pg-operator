@@ -6,7 +6,7 @@
 # and (optionally) declares a PushSecret so external-secrets mirrors it out.
 
 # --- read-write service account -------------------------------------------
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: orders-api
@@ -29,7 +29,7 @@ spec:
 # creates are owned by orders_owner rather than orders_migrator. Without that,
 # the owner group's DEFAULT PRIVILEGES would not apply and the RW and RO roles
 # could not see newly migrated tables.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: orders-migrator
@@ -44,7 +44,7 @@ spec:
   connectionLimit: 4
 ---
 # --- read-only analytics account, across two databases --------------------
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: analytics
@@ -68,7 +68,7 @@ spec:
     statement_timeout: "30000"
 ---
 # --- credentials mirrored to AWS Secrets Manager --------------------------
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: orders-worker
@@ -94,7 +94,7 @@ spec:
 # --- bring your own password ----------------------------------------------
 # For a credential an external system already owns. The operator reads this
 # Secret and applies the value with ALTER ROLE; it never writes to it.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: orders-legacy
@@ -119,7 +119,7 @@ spec:
 # --- disposable account with an expiry ------------------------------------
 # DROP retention: deleting this resource terminates its sessions, clears its
 # privileges, drops the role, and removes the Secret and PushSecret.
-apiVersion: postgres.opsplatform.io/v1alpha1
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresUser
 metadata:
   name: incident-readonly
