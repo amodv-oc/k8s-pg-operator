@@ -12,7 +12,7 @@ from ..constants import (
     PLURAL_INSTANCE,
     PLURAL_USER,
 )
-from ..errors import ReferenceNotFound
+from ..errors import InstanceNotFound, ReferenceNotFound
 from .client import K8sClient, is_not_found, merge_patch
 
 log = logging.getLogger(__name__)
@@ -26,7 +26,7 @@ async def get_instance(k8s: K8sClient, name: str) -> dict[str, Any]:
         )
     except Exception as exc:
         if is_not_found(exc):
-            raise ReferenceNotFound(
+            raise InstanceNotFound(
                 f"PostgresInstance {name!r} not found (it is cluster-scoped, "
                 "so no namespace applies)"
             ) from exc

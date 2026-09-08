@@ -899,3 +899,173 @@ async def test_database_teardown_terminates_open_sessions(
     assert f"dropped database {name}" in message
     async with pools.connection(endpoint) as conn:
         assert await pgdb.get_database(conn, name) is None
+
+
+# --- audit follow-ups --------------------------------------------------------
+
+
+async def test_credentials_secret_labels_name_the_postgresuser(
+    ctx, k8s, provisioned_db, cleanup
+) -> None:
+    """The owner labels must lead back to the resource, not to the role.
+
+    They are what makes a Secret written into another namespace traceable, and
+    what a label selector over generated Secrets matches on; the PostgreSQL
+    role name and the Secret's own namespace serve neither purpose.
+    """
+    _database, db_obj, _ = provisioned_db
+    _, tracked_roles = cleanup
+    obj = user_resource(
+        "label-check",
+        access=[{"dbRef": {"name": db_obj["metadata"]["name"]}, "role": "RO"}],
+        generatedSecret={"namespace": "elsewhere"},
+    )
+    k8s.custom.add(obj, PLURAL_USER)
+    tracked_roles.append("label_check")
+    await run_user(ctx, obj)
+
+    secret = k8s.core.secrets[("elsewhere", "label-check-pg-credentials")]
+    labels = secret.metadata.labels
+    assert labels["postgres.ourcommunity.com.au/owner-kind"] == "PostgresUser"
+    assert labels["postgres.ourcommunity.com.au/owner-name"] == "label-check"
+    assert labels["postgres.ourcommunity.com.au/owner-namespace"] == NS
+    assert labels["postgres.ourcommunity.com.au/instance"] == INSTANCE
+
+
+async def test_owner_login_roles_get_default_privileges_when_set_role_is_off(
+    ctx, k8s, cleanup, unique, pools, endpoint, settings
+) -> None:
+    """setRoleForOwners: false must not silently break the RW/RO model.
+
+    Without SET role, a table an owner creates belongs to their login role and
+    the owner group's DEFAULT PRIVILEGES never fire. The documented behaviour is
+    that default privileges are then declared for each owner-group member.
+    """
+    databases, roles = cleanup
+    name = f"e2e_nosr_{unique}"
+    databases.append(name)
+    roles.extend([f"{name}_owner", f"{name}_rw", f"{name}_ro", "migrator"])
+
+    db_obj = db_resource(name, setRoleForOwners=False, schemas=[{"name": "app"}])
+    k8s.custom.add(db_obj, PLURAL_DATABASE)
+    await run_db(ctx, db_obj)
+
+    user_obj = user_resource("migrator", access=[{"dbRef": {"name": name}, "role": "OWNER"}])
+    k8s.custom.add(user_obj, PLURAL_USER)
+    await run_user(ctx, user_obj)
+    async with pools.connection(endpoint) as conn:
+        # No per-database role setting was made for this member.
+        assert "role" not in await pgroles.get_role_parameters(conn, "migrator", name)
+
+    # The next database pass sees the new owner-group member.
+    result, _ = await reconcile_database(ctx, db_obj)
+    assert result.unmanageable_creators == []
+
+    secret = k8s.core.get(NS, "migrator-pg-credentials")
+    assert secret is not None
+    as_migrator = Endpoint(
+        instance="migrator",
+        host=secret["host"],
+        port=int(secret["port"]),
+        username="migrator",
+        password=secret["password"],
+        maintenance_database=name,
+        ssl_mode="disable",
+    )
+    registry = PoolRegistry(settings)
+    try:
+        async with registry.connection(as_migrator, name) as conn:
+            await execute(conn, sql.SQL("CREATE TABLE app.ledger (id int)"))
+    finally:
+        await registry.close_all()
+
+    async with pools.connection(endpoint, name) as conn:
+        owner = await fetch_scalar(
+            conn,
+            sql.SQL(
+                "SELECT r.rolname FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner "
+                "WHERE c.relname = 'ledger'"
+            ),
+        )
+        rw_insert = await fetch_scalar(
+            conn,
+            sql.SQL("SELECT has_table_privilege(%s, 'app.ledger', 'INSERT')"),
+            (f"{name}_rw",),
+        )
+        ro_select = await fetch_scalar(
+            conn,
+            sql.SQL("SELECT has_table_privilege(%s, 'app.ledger', 'SELECT')"),
+            (f"{name}_ro",),
+        )
+    assert owner == "migrator", "with setRoleForOwners off the login role owns the table"
+    assert rw_insert is True
+    assert ro_select is True
+
+
+async def test_retain_teardown_completes_while_the_server_is_unreachable(
+    ctx, k8s, provisioned_db, cleanup, endpoint
+) -> None:
+    """A RETAIN delete touches nothing on the server, so it must not wait for it.
+
+    Otherwise deleting a resource whose server is down - or whose credentials
+    Secret was removed first - wedges on the finalizer for no reason.
+    """
+    database, db_obj, _ = provisioned_db
+    _, tracked_roles = cleanup
+    user_obj = user_resource(
+        "offline-user", access=[{"dbRef": {"name": db_obj["metadata"]["name"]}, "role": "RO"}]
+    )
+    k8s.custom.add(user_obj, PLURAL_USER)
+    tracked_roles.append("offline_user")
+    await run_user(ctx, user_obj)
+
+    instance = await k8s.custom.get_cluster_custom_object(
+        group="", version="", plural=PLURAL_INSTANCE, name=INSTANCE
+    )
+    original_port = instance["spec"]["port"]
+    instance["spec"]["port"] = 1  # nothing listening
+    await k8s.core.delete_namespaced_secret("rds-superuser", OPERATOR_NS)
+    ctx.invalidate(INSTANCE)
+    try:
+        assert f"retained database {database}" in await teardown_database(ctx, db_obj)
+        assert "retained role offline_user" in await teardown_user(ctx, user_obj)
+
+        # Whereas a DROP teardown genuinely needs the server and must retry,
+        # not release the finalizer.
+        from pg_operator.errors import ReferenceNotFound
+
+        user_obj["spec"]["retentionPolicy"] = "DROP"
+        with pytest.raises(ReferenceNotFound, match="Secret"):
+            await teardown_user(ctx, user_obj)
+    finally:
+        instance["spec"]["port"] = original_port
+        k8s.core.seed(
+            OPERATOR_NS,
+            "rds-superuser",
+            {"username": endpoint.username, "password": endpoint.password},
+        )
+
+
+async def test_connection_failure_names_the_real_cause(ctx, k8s) -> None:
+    """The pool only says it timed out; the status must say why.
+
+    libpq's error - here a database that does not exist, in production more
+    often a bad password or a rejected certificate - is otherwise visible only
+    in the pool's own warning log.
+    """
+    from pg_operator.errors import ConnectionFailure
+
+    instance_obj = await k8s.custom.get_cluster_custom_object(
+        group="", version="", plural=PLURAL_INSTANCE, name=INSTANCE
+    )
+    instance_obj["spec"]["connectTimeoutSeconds"] = 2
+    ctx.invalidate(INSTANCE)
+    try:
+        instance = await ctx.resolve_instance(INSTANCE)
+        with pytest.raises(ConnectionFailure, match="does not exist") as excinfo:
+            async with ctx.connect(instance, "e2e_no_such_database"):
+                pass
+        assert "e2e_no_such_database" in str(excinfo.value)
+    finally:
+        del instance_obj["spec"]["connectTimeoutSeconds"]
+        await ctx.pools.close_database(INSTANCE, "e2e_no_such_database")

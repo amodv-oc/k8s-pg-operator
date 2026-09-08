@@ -125,7 +125,6 @@ async def reconcile_instance(
         "databases": databases,
         "users": users,
         "lastConnectedAt": st.now(),
-        "phase": "Ready" if not warnings else "Degraded",
     }
     if push_secrets_available is not None:
         instance_status["pushSecretsAvailable"] = push_secrets_available

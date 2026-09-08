@@ -20,6 +20,17 @@ class ReferenceNotFound(ConfigurationError):
     """A referenced Kubernetes object does not exist."""
 
 
+class InstanceNotFound(ReferenceNotFound):
+    """The PostgresInstance a resource points at does not exist.
+
+    Kept apart from a missing Secret or PostgresDB because a finalizer treats
+    the two differently: with the instance gone there is nothing left to clean
+    up and the delete should complete, whereas a Secret that has gone missing
+    is a temporary condition to retry - dropping the finalizer there would leave
+    a DROP-policy role live on the server with nothing tracking it.
+    """
+
+
 class ConnectionFailure(OperatorError):
     """The target PostgreSQL instance could not be reached or authenticated."""
 
