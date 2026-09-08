@@ -755,9 +755,20 @@ exactly what the chart resolves to when `image.tag` is empty and `appVersion`
 is `0.1.0`. Keep `Chart.yaml`'s `version` and `appVersion` in step with the git
 tag and the chart's defaults stay correct with no override.
 
-Builds are single-platform (`linux/amd64`, the runner's own). For arm64 nodes,
-add `platforms: linux/amd64,linux/arm64` to the two push steps — the test steps
-above them stay single-platform, since a `load` build can only produce one.
+Both images are published for `linux/amd64` and `linux/arm64`, so the same tag
+runs on Graviton and Intel nodes alike. The `image` job is a matrix over two
+native runners — `ubuntu-latest` and `ubuntu-24.04-arm` — rather than one
+runner emulating the other under QEMU: a `uv sync` and a `vite` build cost far
+more emulated than a second runner costs, and building natively means the
+assertions above run against the arm64 image too, not only the amd64 one.
+
+Each runner pushes an untagged, single-arch image with `push-by-digest` and
+reports its digest as an artifact. A final `image-manifest` job joins the pair
+into one tagged manifest list with `docker buildx imagetools create`, then
+asserts that both architectures resolve under the tag. Tags are applied only
+there, so a tag never points at a half-published pair: if either architecture
+fails to build, no tag moves at all. To add a platform, extend the matrix with
+its runner — nothing else in the job is architecture-specific.
 
 A GHCR package inherits the repository's visibility the first time it is
 published. If the repository is private, so are the packages, and the cluster

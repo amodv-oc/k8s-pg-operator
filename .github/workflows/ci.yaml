@@ -137,7 +137,19 @@ jobs:
           files: charts/pg-operator/crds
 
   image:
-    runs-on: ubuntu-latest
+    # One native runner per architecture rather than one runner emulating the
+    # other: a uv sync and a vite build under QEMU cost far more than the
+    # extra job, and building natively means the smoke tests below actually
+    # exercise the arm64 image instead of only the amd64 one.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       packages: write
@@ -145,34 +157,20 @@ jobs:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
 
-      - name: Tags and labels for the operator image
+      - name: Labels for the operator image
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=pg-operator
             org.opencontainers.image.description=Kubernetes operator for external PostgreSQL (RDS) instances
 
-      - name: Tags and labels for the dashboard image
+      - name: Labels for the dashboard image
         id: meta-ui
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=long
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=pg-operator-ui
             org.opencontainers.image.description=Dashboard for the pg-operator state API
@@ -181,11 +179,12 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: .
+          platforms: linux/${{ matrix.arch }}
           push: false
           load: true
           tags: pg-operator:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=operator-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=operator-${{ matrix.arch }}
       - name: Both entrypoints resolve as non-root
         run: |
           docker run --rm --user 65532:65532 pg-operator:ci \
@@ -195,11 +194,12 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: ui
+          platforms: linux/${{ matrix.arch }}
           push: false
           load: true
           tags: pg-operator-ui:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=ui-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ui-${{ matrix.arch }}
 
       - name: The dashboard serves read-only as uid 65532
         run: |
@@ -234,6 +234,9 @@ jobs:
           docker rm -f api
 
       # --- publish ----
+      # Each runner pushes an untagged, single-arch image and reports its
+      # digest; image-manifest joins the two into one tagged manifest list, so
+      # a tag never points at a half-published pair.
       - name: Log in to ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
@@ -243,35 +246,167 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push the operator image
+        id: push
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=operator-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=operator-${{ matrix.arch }}
 
       - name: Push the dashboard image
+        id: push-ui
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: ui
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-ui.outputs.tags }}
+          platforms: linux/${{ matrix.arch }}
           labels: ${{ steps.meta-ui.outputs.labels }}
-          annotations: ${{ steps.meta-ui.outputs.annotations }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=ui-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=ui-${{ matrix.arch }}
+
+      - name: Record the digests
+        if: github.event_name != 'pull_request'
+        env:
+          OPERATOR_DIGEST: ${{ steps.push.outputs.digest }}
+          UI_DIGEST: ${{ steps.push-ui.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests/operator" "${RUNNER_TEMP}/digests/ui"
+          touch "${RUNNER_TEMP}/digests/operator/${OPERATOR_DIGEST#sha256:}"
+          touch "${RUNNER_TEMP}/digests/ui/${UI_DIGEST#sha256:}"
+
+      - name: Upload the digests
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests
+          if-no-files-found: error
+          retention-days: 1
+
+  image-manifest:
+    needs: image
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      # The tags live on the manifest list, so its annotations do too: the
+      # default (manifest) would put them on the per-arch children instead.
+      DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+    steps:
+      - name: Collect the per-architecture digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: digests-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Tags and annotations for the operator image
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=pg-operator
+            org.opencontainers.image.description=Kubernetes operator for external PostgreSQL (RDS) instances
+
+      - name: Tags and annotations for the dashboard image
+        id: meta-ui
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=pg-operator-ui
+            org.opencontainers.image.description=Dashboard for the pg-operator state API
+
+      - name: Log in to ${{ env.REGISTRY }}
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the operator manifest list
+        working-directory: ${{ runner.temp }}/digests/operator
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta.outputs.annotations }}
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then args+=(--tag "$tag"); fi
+          done <<< "$TAGS"
+          while IFS= read -r annotation; do
+            if [ -n "$annotation" ]; then args+=(--annotation "$annotation"); fi
+          done <<< "$ANNOTATIONS"
+          for digest in *; do args+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Push the dashboard manifest list
+        working-directory: ${{ runner.temp }}/digests/ui
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
+          TAGS: ${{ steps.meta-ui.outputs.tags }}
+          ANNOTATIONS: ${{ steps.meta-ui.outputs.annotations }}
+        run: |
+          args=()
+          while IFS= read -r tag; do
+            if [ -n "$tag" ]; then args+=(--tag "$tag"); fi
+          done <<< "$TAGS"
+          while IFS= read -r annotation; do
+            if [ -n "$annotation" ]; then args+=(--annotation "$annotation"); fi
+          done <<< "$ANNOTATIONS"
+          for digest in *; do args+=("${IMAGE}@sha256:${digest}"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Both tags resolve on amd64 and arm64
+        env:
+          OPERATOR: ${{ steps.meta.outputs.version }}
+          UI: ${{ steps.meta-ui.outputs.version }}
+        run: |
+          for image in \
+            "${REGISTRY}/${IMAGE_NAME}:${OPERATOR}" \
+            "${REGISTRY}/${UI_IMAGE_NAME}:${UI}"; do
+            platforms=$(docker buildx imagetools inspect --raw "$image" \
+              | jq -r '.manifests[]
+                       | select(.platform.os == "linux")
+                       | select(.platform.architecture != "unknown")
+                       | .platform.architecture' | sort -u)
+            echo "$image: $(tr '\n' ' ' <<< "$platforms")"
+            grep -qx amd64 <<< "$platforms"
+            grep -qx arm64 <<< "$platforms"
+          done
 
       - name: Summarise what was published
-        if: github.event_name != 'pull_request'
         env:
           OPERATOR_TAGS: ${{ steps.meta.outputs.tags }}
           UI_TAGS: ${{ steps.meta-ui.outputs.tags }}
         run: |
           {
             echo "### Images published to ${REGISTRY}"
+            echo
+            echo "linux/amd64, linux/arm64"
             echo
             echo '```'
             printf '%s\n' "$OPERATOR_TAGS" "$UI_TAGS"
