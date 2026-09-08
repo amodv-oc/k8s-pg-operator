@@ -73,7 +73,7 @@ pushSecret:
   enabled: true
   # -- external-secrets.io/v1 for external-secrets >= 0.14; use
   # external-secrets.io/v1alpha1 for older installations.
-  apiVersion: external-secrets.io/v1
+  apiVersion: external-secrets.io/v1alpha1
 
 # -- FastAPI state API.
 api:
