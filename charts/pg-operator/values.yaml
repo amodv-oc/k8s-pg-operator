@@ -2,10 +2,9 @@
 
 # -- Container image. The same image runs both the reconciler and the API.
 image:
-  repository: ghcr.io/your-org/pg-operator
+  repository: ghcr.io/amodv-oc/k8s-pg-operator
   # Defaults to .Chart.AppVersion.
   tag: ""
-  # Pin by digest in production; takes precedence over tag.
   digest: ""
   pullPolicy: IfNotPresent
 
@@ -63,32 +62,25 @@ reconcile:
 
 postgres:
   connectTimeout: 10
-  # -- Ceiling on any single statement, so a reconcile cannot wedge on a lock.
   statementTimeoutMs: 30000
   poolMaxSize: 4
   poolMaxIdle: 120
 
 credentials:
-  # -- Length of generated passwords. Overridable per PostgresUser.
   passwordLength: 32
 
 pushSecret:
-  # -- Emit external-secrets.io PushSecret resources for generated credentials.
   enabled: true
   # -- external-secrets.io/v1 for external-secrets >= 0.14; use
   # external-secrets.io/v1alpha1 for older installations.
   apiVersion: external-secrets.io/v1
 
-# -- FastAPI state API. Runs as a second container in the operator pod and
-# reads state from the Kubernetes API, so it holds no state of its own.
+# -- FastAPI state API.
 api:
   enabled: true
   port: 8000
-  # -- Response cache TTL in seconds; absorbs dashboard polling.
   cacheTtl: 5
-  # -- Set when served under a path prefix behind a proxy.
   rootPath: ""
-  # -- Allowed CORS origins for the future React frontend.
   corsOrigins: []
   service:
     type: ClusterIP
@@ -111,27 +103,18 @@ api:
     limits:
       memory: 256Mi
 
-# -- React dashboard for the state API. Runs as a third container in the
-# operator pod: nginx serves the bundle and proxies the API on loopback, so the
-# browser is same-origin and api.corsOrigins can stay empty. Requires
-# api.enabled.
+# -- React dashboard for the state API.
 ui:
   enabled: true
   image:
-    repository: ghcr.io/your-org/pg-operator-ui
-    # Defaults to .Chart.AppVersion.
+    repository: ghcr.io/amodv-oc/k8s-pg-operator-ui
     tag: ""
-    # Pin by digest in production; takes precedence over tag.
     digest: ""
     pullPolicy: IfNotPresent
   port: 8081
-  # -- Rendered into /config.json and read by the app before it renders.
   config:
     # -- Shown in the header, so two tabs on two clusters are distinguishable.
     clusterLabel: ""
-    # -- Poll interval in milliseconds. The API caches responses for
-    # api.cacheTtl seconds, so polling above that costs a round trip and no
-    # Kubernetes API call at all.
     refreshIntervalMs: 10000
   service:
     port: 8081
@@ -143,7 +126,7 @@ ui:
     className: ""
     annotations: {}
     hosts:
-      - host: pg-operator.example.com
+      - host: pg-operator.np.smartygrants.com.au
         paths:
           - path: /
             pathType: Prefix

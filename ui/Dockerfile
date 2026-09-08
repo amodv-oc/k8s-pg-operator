@@ -24,7 +24,7 @@ FROM nginx:1.29-alpine AS runtime
 LABEL org.opencontainers.image.title="pg-operator-ui" \
       org.opencontainers.image.description="Dashboard for the pg-operator state API" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.source="https://github.com/your-org/pg-operator"
+      org.opencontainers.image.source="https://github.com/amodv-oc/k8s-pg-operator"
 
 # The base image's entrypoint scripts template files into /etc/nginx, which
 # readOnlyRootFilesystem forbids. nginx.conf below is complete, so they are

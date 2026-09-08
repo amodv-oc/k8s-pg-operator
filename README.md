@@ -254,16 +254,26 @@ upgrade or delete them. Apply CRD changes explicitly:
 kubectl apply -f charts/pg-operator/crds/
 ```
 
+Both images are published to GitHub Container Registry by CI and are the chart's
+defaults, so a plain `helm install` needs no image configuration:
+
+```
+ghcr.io/amodv-oc/k8s-pg-operator      the reconciler and the state API
+ghcr.io/amodv-oc/k8s-pg-operator-ui   the dashboard
+```
+
 Values worth reviewing:
 
 | Value | Default | Notes |
 | --- | --- | --- |
-| `image.repository` | `ghcr.io/your-org/pg-operator` | Set this |
+| `image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator` | Published by CI; override for your own registry |
+| `ui.image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator-ui` | The dashboard image, same pipeline |
 | `watchNamespaces` | `[]` (all) | `PostgresInstance` is always watched cluster-wide |
 | `reconcile.interval` | `300` | Full convergence pass, in seconds |
 | `pushSecret.apiVersion` | `external-secrets.io/v1` | Use `v1alpha1` below external-secrets 0.14 |
 | `rbac.namespacedSecrets` | `false` | See below |
 | `api.enabled` | `true` | The state API container |
+| `ui.enabled` | `true` | The dashboard container; requires `api.enabled` |
 | `replicaCount` / `peering.enabled` | `1` / `false` | Raise replicas only with peering on |
 | `networkPolicy.egress` | `[]` (allow all) | Pin to your RDS CIDRs |
 
@@ -722,7 +732,36 @@ docker build -t pg-operator:dev .
 
 Multi-stage, `python:3.14-slim`, uv-installed, non-root (65532), read-only root
 filesystem. `psycopg[binary]` bundles libpq, so no PostgreSQL client packages
-are needed.
+are needed. `make build-all` builds both images; `make ui-image-check` runs the
+dashboard's under the pod's own constraints.
+
+### Publishing
+
+The `image` job in `.github/workflows/ci.yaml` builds both images, runs every
+assertion against them, and only then pushes to `ghcr.io/<owner>/<repo>` and
+`ghcr.io/<owner>/<repo>-ui`. It authenticates with the workflow's own
+`GITHUB_TOKEN`, so there is no secret to configure. Nothing is pushed for a
+pull request: a fork's token has no `packages: write`, and an unreviewed branch
+should not be able to publish.
+
+| Trigger | Tags pushed |
+| --- | --- |
+| push to `main` | `main`, `sha-<full sha>`, `latest` |
+| tag `v1.2.3` | `1.2.3`, `1.2`, `sha-<full sha>` |
+| pull request | none — built and tested only |
+
+A `v*` tag drops its `v`, so tagging `v0.1.0` publishes `:0.1.0` — which is
+exactly what the chart resolves to when `image.tag` is empty and `appVersion`
+is `0.1.0`. Keep `Chart.yaml`'s `version` and `appVersion` in step with the git
+tag and the chart's defaults stay correct with no override.
+
+Builds are single-platform (`linux/amd64`, the runner's own). For arm64 nodes,
+add `platforms: linux/amd64,linux/arm64` to the two push steps — the test steps
+above them stay single-platform, since a `load` build can only produce one.
+
+A GHCR package inherits the repository's visibility the first time it is
+published. If the repository is private, so are the packages, and the cluster
+needs a pull Secret — see the chart README.
 
 ## Design decisions
 

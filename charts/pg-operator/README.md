@@ -31,7 +31,7 @@ This is intentional: an accidental CRD deletion would take every
 
 | Resource | Condition |
 | --- | --- |
-| `Deployment` | Always. Two containers: `operator` and `api` |
+| `Deployment` | Always. Containers: `operator`, plus `api` and `ui` when enabled |
 | `ServiceAccount` | `serviceAccount.create` |
 | `ClusterRole` / `ClusterRoleBinding` | `rbac.create` |
 | `ClusterRole` (`-viewer`, `-editor`) | `rbac.createViewerRole`; aggregate into the built-in `view` / `edit` roles |
@@ -39,7 +39,9 @@ This is intentional: an accidental CRD deletion would take every
 | `Service` (`-api`) | `api.enabled` |
 | `Service` (`-metrics`) | `metrics.enabled` |
 | `ServiceMonitor` | `metrics.serviceMonitor.enabled` |
-| `Ingress` | `api.ingress.enabled` |
+| `ConfigMap` (`-ui`) | `ui.enabled`; the dashboard's `config.json` |
+| `Ingress` (`-api`) | `api.ingress.enabled` |
+| `Ingress` (`-ui`) | `ui.ingress.enabled`; mutually exclusive with the above |
 | `PodDisruptionBudget` | `podDisruptionBudget.enabled` |
 | `NetworkPolicy` | `networkPolicy.enabled` |
 | `ClusterKopfPeering` | `peering.enabled` |
@@ -51,11 +53,30 @@ This is intentional: an accidental CRD deletion would take every
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `image.repository` | `ghcr.io/your-org/pg-operator` | **Set this.** |
+| `image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator` | Published by CI on every push to `main` and every `v*` tag |
 | `image.tag` | `""` | Defaults to `.Chart.AppVersion` |
 | `image.digest` | `""` | Pin by digest in production; takes precedence over `tag` |
 | `image.pullPolicy` | `IfNotPresent` | |
-| `imagePullSecrets` | `[]` | |
+| `ui.image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator-ui` | Same pipeline, same tags |
+| `ui.image.tag` / `.digest` / `.pullPolicy` | `""` / `""` / `IfNotPresent` | As above |
+| `imagePullSecrets` | `[]` | Needed only if the packages are private — see below |
+
+Both images are published to GHCR by the `image` job in `.github/workflows/ci.yaml`,
+tagged with the branch, the long commit SHA, `latest` on `main`, and the semver
+tags on a `v*` release. A GHCR package inherits the repository's visibility on
+first publish, so if the repository is private the packages are too and the
+pull needs a Secret:
+
+```sh
+kubectl -n pg-operator create secret docker-registry ghcr \
+  --docker-server=ghcr.io --docker-username="$GITHUB_USER" \
+  --docker-password="$GITHUB_TOKEN"        # a PAT with read:packages
+```
+
+```yaml
+imagePullSecrets:
+  - name: ghcr
+```
 
 ### Scope and scheduling
 
@@ -138,6 +159,27 @@ rbac:
 
 The API is read-only and never returns credential values.
 
+### Dashboard
+
+| Key | Default | Description |
+| --- | --- | --- |
+| `ui.enabled` | `true` | Runs as a third container in the operator pod. **Requires `api.enabled`** — the chart refuses to render otherwise |
+| `ui.port` | `8081` | nginx serves the bundle here and proxies `/api/v1`, `/readyz`, `/healthz` and `/docs` to `127.0.0.1:8000` |
+| `ui.config.clusterLabel` | `""` | Shown in the header, so two tabs on two clusters are distinguishable |
+| `ui.config.refreshIntervalMs` | `10000` | Poll interval; below `api.cacheTtl` it buys nothing |
+| `ui.service.port` | `8081` | A second port on the same `-api` Service |
+| `ui.ingress.*` | disabled | Serves the dashboard **and** the API through its proxy, so one ingress is enough. Enabling it together with `api.ingress` fails to render: both claim `/` |
+| `ui.resources` | 10m / 32Mi request | |
+| `ui.tmpSizeLimit` | `16Mi` | nginx's pid file and proxy buffers; separate from the operator's `/tmp` |
+
+Because the proxy target is loopback inside the same pod the browser is
+same-origin: `api.corsOrigins` stays empty and no NetworkPolicy egress rule is
+needed. The dashboard mounts no service-account token.
+
+It inherits the API's exposure model — read-only, and it never returns a
+credential value, but it enumerates database, role and Secret names, and
+neither it nor the API authenticates. Gate it at the ingress.
+
 ### Observability
 
 | Key | Default | Description |
@@ -161,7 +203,7 @@ pod instead.
 | `tmpSizeLimit` | `16Mi` | In-memory scratch for CA bundles read from Secrets — libpq needs `sslrootcert` as a file path |
 | `podDisruptionBudget.*` | disabled | |
 | `networkPolicy.enabled` | `false` | |
-| `networkPolicy.apiIngressFrom` / `.metricsIngressFrom` | `[]` | Who may reach the API / metrics |
+| `networkPolicy.apiIngressFrom` / `.uiIngressFrom` / `.metricsIngressFrom` | `[]` | Who may reach the API / dashboard / metrics |
 | `networkPolicy.egress` | `[]` | **Empty allows all egress**, because the RDS endpoints are outside the cluster and unknown at install time |
 
 Pin egress to your database CIDRs in production:

@@ -15,9 +15,9 @@ keywords:
   - operator
   - database
   - external-secrets
-home: https://github.com/your-org/pg-operator
+home: https://github.com/amodv-oc/k8s-pg-operator
 sources:
-  - https://github.com/your-org/pg-operator
+  - https://github.com/amodv-oc/k8s-pg-operator
 maintainers:
   - name: Platform Engineering
 annotations:

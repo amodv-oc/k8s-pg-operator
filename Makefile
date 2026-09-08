@@ -106,6 +106,9 @@ chart-render: ## Print the rendered chart
 build: ## Build the container image
 	docker build -t $(IMAGE):$(TAG) .
 
+.PHONY: build-all
+build-all: build ui-image ## Build both images
+
 .PHONY: image-check
 image-check: build ## Confirm both entrypoints resolve in the image
 	docker run --rm --user 65532:65532 $(IMAGE):$(TAG) \

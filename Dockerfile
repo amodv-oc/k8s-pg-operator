@@ -33,7 +33,7 @@ FROM python:3.14-slim AS runtime
 LABEL org.opencontainers.image.title="pg-operator" \
       org.opencontainers.image.description="Kubernetes operator for external PostgreSQL (RDS) instances" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.source="https://github.com/your-org/pg-operator"
+      org.opencontainers.image.source="https://github.com/amodv-oc/k8s-pg-operator"
 
 # psycopg[binary] bundles libpq, so no PostgreSQL client libraries are needed.
 # ca-certificates is required for TLS to both the Kubernetes API and RDS.
