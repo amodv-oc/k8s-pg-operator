@@ -111,6 +111,54 @@ api:
     limits:
       memory: 256Mi
 
+# -- React dashboard for the state API. Runs as a third container in the
+# operator pod: nginx serves the bundle and proxies the API on loopback, so the
+# browser is same-origin and api.corsOrigins can stay empty. Requires
+# api.enabled.
+ui:
+  enabled: true
+  image:
+    repository: ghcr.io/your-org/pg-operator-ui
+    # Defaults to .Chart.AppVersion.
+    tag: ""
+    # Pin by digest in production; takes precedence over tag.
+    digest: ""
+    pullPolicy: IfNotPresent
+  port: 8081
+  # -- Rendered into /config.json and read by the app before it renders.
+  config:
+    # -- Shown in the header, so two tabs on two clusters are distinguishable.
+    clusterLabel: ""
+    # -- Poll interval in milliseconds. The API caches responses for
+    # api.cacheTtl seconds, so polling above that costs a round trip and no
+    # Kubernetes API call at all.
+    refreshIntervalMs: 10000
+  service:
+    port: 8081
+  # -- Ingress for the dashboard. nginx proxies the API paths itself, so this
+  # one ingress serves the UI *and* /api/v1, /docs and /openapi.json. Do not
+  # enable this together with api.ingress on the same host: both claim "/".
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    hosts:
+      - host: pg-operator.example.com
+        paths:
+          - path: /
+            pathType: Prefix
+    tls: []
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 128Mi
+  # -- In-memory scratch for nginx's pid file and proxy buffers. Kept separate
+  # from the operator's /tmp so a proxied response cannot exhaust the space the
+  # operator uses to materialise CA bundles.
+  tmpSizeLimit: 16Mi
+
 operator:
   healthPort: 8080
   resources:
@@ -139,6 +187,8 @@ networkPolicy:
   enabled: false
   # Who may reach the state API.
   apiIngressFrom: []
+  # Who may reach the dashboard.
+  uiIngressFrom: []
   # Who may scrape metrics.
   metricsIngressFrom: []
   # -- Egress rules. Left empty this allows all egress, because the RDS

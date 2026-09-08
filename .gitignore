@@ -7,6 +7,11 @@ dist/
 .venv/
 venv/
 
+# Dashboard
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
 # Tooling caches
 .ruff_cache/
 .mypy_cache/

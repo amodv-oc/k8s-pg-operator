@@ -1,3 +1,4 @@
+{{- include "pg-operator.ui.validate" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,6 +29,11 @@ spec:
         {{- end }}
       annotations:
         checksum/config: {{ include "pg-operator.env" . | sha256sum }}
+        {{- if .Values.ui.enabled }}
+        # Rolls the pod when the dashboard's runtime config changes, since the
+        # ConfigMap is read once at page load and mounted read-only.
+        checksum/ui-config: {{ toYaml .Values.ui.config | sha256sum }}
+        {{- end }}
         {{- if and .Values.metrics.enabled (not .Values.metrics.serviceMonitor.enabled) }}
         prometheus.io/scrape: "true"
         prometheus.io/port: {{ .Values.metrics.port | quote }}
@@ -171,11 +177,66 @@ spec:
             - name: tmp
               mountPath: /tmp
         {{- end }}
+
+        # --- dashboard ------------------------------------------------------
+        {{- if .Values.ui.enabled }}
+        - name: ui
+          image: {{ include "pg-operator.ui.image" . }}
+          imagePullPolicy: {{ .Values.ui.image.pullPolicy }}
+          ports:
+            - name: ui
+              containerPort: {{ .Values.ui.port }}
+              protocol: TCP
+          # Both probes hit nginx's own endpoint, not a proxied one: this
+          # container's health is whether it can serve the bundle. Whether the
+          # API behind it is reachable is the api container's probe to fail,
+          # and the dashboard reports it in the UI either way.
+          livenessProbe:
+            httpGet:
+              path: /nginx-healthz
+              port: ui
+            initialDelaySeconds: 5
+            periodSeconds: 20
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /nginx-healthz
+              port: ui
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            timeoutSeconds: 3
+          {{- with .Values.ui.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # nginx's pid file and proxy buffers. Its own volume, so a proxied
+            # response cannot exhaust the operator's CA-bundle scratch space.
+            - name: ui-tmp
+              mountPath: /tmp
+            # Shadows the default config.json baked into the image.
+            - name: ui-config
+              mountPath: /etc/pg-operator-ui
+              readOnly: true
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.tmpSizeLimit }}
+        {{- if .Values.ui.enabled }}
+        - name: ui-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.ui.tmpSizeLimit }}
+        - name: ui-config
+          configMap:
+            name: {{ include "pg-operator.fullname" . }}-ui
+        {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

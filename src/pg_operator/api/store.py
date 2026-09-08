@@ -212,6 +212,7 @@ def _instance_summary(obj: dict[str, Any]) -> InstanceSummary:
         phase=_phase(status),
         endpoint=status.get("endpoint") or _endpoint_from_spec(spec),
         server_version=status.get("serverVersion"),
+        server_version_text=status.get("serverVersionText"),
         managing_role=status.get("managingRole"),
         privileges=status.get("privileges"),
         ssl_mode=status.get("sslMode") or spec.get("sslMode"),
@@ -261,6 +262,7 @@ def _database_summary(obj: dict[str, Any]) -> DatabaseSummary:
             str(key): _strings(value)
             for key, value in (status.get("schemaGrants") or {}).items()
         },
+        denied_parameters=_strings(status.get("deniedParameters")),
         paused=bool(spec.get("paused")),
         last_reconciled_at=status.get("lastReconciledAt"),
         observed_generation=status.get("observedGeneration"),

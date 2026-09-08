@@ -1,0 +1,42 @@
+/* Surfaces. Mantine derives its dark-scheme background from dark[7]; naming
+   the light one explicitly gives the page the same slate-50 ground Tailwind
+   dashboards sit on, instead of pure white. */
+:root {
+  --pgop-page-bg: var(--mantine-color-slate-0);
+  --pgop-surface: var(--mantine-color-white);
+  --pgop-border: var(--mantine-color-slate-2);
+}
+
+[data-mantine-color-scheme='dark'] {
+  --pgop-page-bg: var(--mantine-color-dark-8);
+  --pgop-surface: var(--mantine-color-dark-6);
+  --pgop-border: var(--mantine-color-dark-4);
+}
+
+body {
+  background-color: var(--pgop-page-bg);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Tailwind's `tabular-nums` for anything that lines up in a column. */
+.pgop-numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Long identifiers — endpoints, role names, SQL fragments in a message — must
+   wrap inside a table cell rather than widening the table. */
+.pgop-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* A phase tile is a button; it must not look like one until hovered. */
+.pgop-tile {
+  cursor: pointer;
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease;
+}
+
+.pgop-tile:hover {
+  border-color: var(--mantine-primary-color-filled);
+}

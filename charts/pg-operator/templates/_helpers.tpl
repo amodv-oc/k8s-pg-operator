@@ -60,6 +60,26 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 {{- end -}}
 
+{{- define "pg-operator.ui.image" -}}
+{{- $tag := .Values.ui.image.tag | default .Chart.AppVersion -}}
+{{- if .Values.ui.image.digest -}}
+{{- printf "%s@%s" .Values.ui.image.repository .Values.ui.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.ui.image.repository $tag -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The dashboard is a static bundle plus a proxy to the API on loopback; without
+the API container in the pod there is nothing for it to proxy to. Failing at
+render time beats shipping a pod that serves nothing but 502s.
+*/}}
+{{- define "pg-operator.ui.validate" -}}
+{{- if and .Values.ui.enabled (not .Values.api.enabled) -}}
+{{- fail "ui.enabled requires api.enabled: the dashboard proxies the state API on 127.0.0.1 in the same pod" -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Environment shared by the operator and API containers, so both read the same
 configuration from one place.

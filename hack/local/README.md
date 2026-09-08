@@ -16,14 +16,27 @@ Storage is ephemeral. These servers exist to be reconciled against.
 ## Run it
 
 ```sh
-make local-up        # build the image, start the servers, install the operator
+make local-up        # build both images, start the servers, install the operator
 make local-status    # phases for all three kinds
 make local-verify    # functional OWNER/RW/RO checks on all five versions
+make local-ui        # port-forward the dashboard to localhost:8081
 make local-down      # remove everything
 ```
 
 `make local-test` runs the whole pytest suite against each server in turn, by
 port-forwarding it to `localhost:15432`.
+
+The pod runs three containers — `operator`, `api` and `ui`. One port-forward
+reaches the dashboard *and* the API's `/docs`, because the dashboard's nginx
+proxies the API on loopback:
+
+```sh
+make local-ui        # http://localhost:8081/  and  http://localhost:8081/docs
+```
+
+`ui.config.clusterLabel` is set to `orbstack` here so a tab on this cluster is
+distinguishable from one on a real cluster, and the poll interval is dropped to
+5s to match the shortened reconcile interval.
 
 ## What each file does
 
@@ -51,6 +64,31 @@ Four of the five databases reach `Ready`. **PostgreSQL 14 is expected to be
   instance converges cleanly here.
 
 Both are reported with remedies and neither blocks the rest of the database.
+`orders-14` is therefore the most useful page in the dashboard: it is the one
+resource off the happy path, so it exercises the `Drifted` reason, the
+`unowned` schema state and the denied-parameter callout all at once.
+
+### Exercising the retention path
+
+Removing a schema from a spec under `RETAIN` should keep it on the server and
+report it. Check the server, not the status — status is written on a reconcile
+and cached by the API for a few seconds, so reading it immediately after a
+change can show the previous pass:
+
+```sh
+kubectl -n team-a patch postgresdb orders-16 --type=json \
+  -p='[{"op":"remove","path":"/spec/schemas/2"}]'
+
+kubectl -n pg-instances exec deploy/pg16 -- \
+  psql -U pgadmin -d orders -c '\dn'      # reporting is still there
+
+kubectl -n team-a get postgresdb orders-16 -o \
+  jsonpath='{.status.orphanedSchemas}{"\n"}'   # ["reporting"]
+```
+
+`Drifted` becomes `True` with reason `RetainedOrphans` while `Synced` stays
+`True`: a retained orphan is a deliberate outcome, not a failure to converge.
+Add the schema back to restore the steady state.
 
 ## Notes
 
@@ -58,3 +96,7 @@ Both are reported with remedies and neither blocks the rest of the database.
   instance; `verify-full` with `sslRootCertSecretRef` is what RDS wants.
 - The operator's reconcile interval is set to 60s (default 300s) so drift
   correction is observable within a coffee-length attention span.
+- A local VM's clock can drift while the host sleeps. `lastTransitionTime` is
+  deliberately frozen at the moment a condition last flipped, so it will show
+  the skewed clock long after `lastReconciledAt` has re-synced. Compare the two
+  before suspecting a bug.

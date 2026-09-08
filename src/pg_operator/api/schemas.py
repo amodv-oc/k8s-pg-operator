@@ -35,6 +35,7 @@ class InstanceSummary(BaseModel):
     phase: Phase = "Unknown"
     endpoint: str | None = None
     server_version: str | None = None
+    server_version_text: str | None = None
     managing_role: str | None = None
     privileges: str | None = None
     ssl_mode: str | None = None
@@ -83,6 +84,9 @@ class DatabaseSummary(BaseModel):
     observed_extensions: list[str] = Field(default_factory=list)
     orphaned_extensions: list[str] = Field(default_factory=list)
     schema_grants: dict[str, list[str]] = Field(default_factory=dict)
+    #: Parameters the managing role was refused, e.g. a superuser-only GUC.
+    #: Reported rather than raised: the rest of the database still converges.
+    denied_parameters: list[str] = Field(default_factory=list)
     paused: bool = False
     last_reconciled_at: str | None = None
     observed_generation: int | None = None

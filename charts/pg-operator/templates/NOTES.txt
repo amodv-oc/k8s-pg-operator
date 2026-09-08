@@ -78,6 +78,22 @@ PushSecret: {{ if .Values.pushSecret.enabled }}{{ .Values.pushSecret.apiVersion 
 {{- end }}
 {{- end }}
 
+{{ if .Values.ui.enabled }}
+6. Open the dashboard. nginx serves it and proxies the API on loopback in the
+   same pod, so one port-forward reaches both:
+
+     kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "pg-operator.fullname" . }}-api {{ .Values.ui.service.port }}:{{ .Values.ui.service.port }}
+
+   Then open http://localhost:{{ .Values.ui.service.port }}/
+{{- if .Values.ui.ingress.enabled }}
+   Ingress: {{ range .Values.ui.ingress.hosts }}https://{{ .host }}{{ end }}
+{{- end }}
+
+   The dashboard is read-only and never returns credential values, but it does
+   enumerate database, role and Secret names - and neither it nor the API
+   authenticates. Gate it at the ingress.
+{{- end }}
+
 {{ if not .Values.pushSecret.enabled }}
 Note: PushSecret support is disabled. Enable pushSecret.enabled to mirror
 generated credentials to an external store via external-secrets.

@@ -1,0 +1,42 @@
+{{- if and .Values.ui.enabled .Values.ui.ingress.enabled }}
+{{- if .Values.api.ingress.enabled }}
+{{- fail "enable either ui.ingress or api.ingress, not both: they would claim the same host and path. The dashboard's nginx already proxies /api/v1, /docs and /openapi.json, so ui.ingress exposes the API too." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "pg-operator.fullname" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+  {{- with .Values.ui.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ui.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ui.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ui.ingress.hosts }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          {{- range .paths }}
+          - path: {{ .path }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                # The api Service, on its ui port: the dashboard is a container
+                # in the same pod and proxies the API itself.
+                name: {{ include "pg-operator.fullname" $ }}-api
+                port:
+                  name: ui
+          {{- end }}
+    {{- end }}
+{{- end }}

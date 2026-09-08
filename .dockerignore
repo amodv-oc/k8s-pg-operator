@@ -17,6 +17,8 @@ htmlcov/
 charts/
 examples/
 tests/
+# The dashboard has its own image; the Python one never needs it.
+ui/
 docs/
 Dockerfile
 .dockerignore

@@ -32,6 +32,7 @@ def instance_obj(name: str, phase: str = "Ready", **status: Any) -> dict[str, An
             "phase": phase,
             "endpoint": f"{name}.rds.amazonaws.com:5432",
             "serverVersion": "16.3",
+            "serverVersionText": "PostgreSQL 16.3 on aarch64-unknown-linux-gnu",
             "managingRole": "postgres",
             "privileges": "rds_superuser, CREATEDB, CREATEROLE",
             "credentialsSecret": f"pg-operator/{name}-super",
@@ -214,6 +215,7 @@ async def test_instances_are_projected_from_status(store: StateStore) -> None:
     prod = instances["prod-rds"]
     assert prod.phase == "Ready"
     assert prod.server_version == "16.3"
+    assert prod.server_version_text == "PostgreSQL 16.3 on aarch64-unknown-linux-gnu"
     assert prod.endpoint == "prod-rds.rds.amazonaws.com:5432"
     assert prod.privileges == "rds_superuser, CREATEDB, CREATEROLE"
     assert prod.message == "ok"
@@ -239,6 +241,24 @@ async def test_database_group_roles_are_projected(store: StateStore) -> None:
     assert orders.roles.read_write == "orders_rw"
     assert orders.roles.read_only == "orders_ro"
     assert orders.managed_schemas == ["public", "audit"]
+
+
+async def test_denied_parameters_are_projected(store: StateStore) -> None:
+    """A parameter the managing role was refused is reported, not hidden.
+
+    On RDS the master user cannot set every GUC, and the dashboard needs the
+    list to explain why an otherwise-converged database is Drifted.
+    """
+    obj = database_obj(
+        "reporting",
+        deniedParameters=["parameter log_min_duration_statement: permission denied"],
+    )
+    store._k8s.custom.items["postgresdbs"] = [obj]  # type: ignore[attr-defined]
+    database = await store.database("team-a", "reporting")
+    assert database is not None
+    assert database.denied_parameters == [
+        "parameter log_min_duration_statement: permission denied"
+    ]
 
 
 async def test_user_grants_are_projected(store: StateStore) -> None:

@@ -21,6 +21,7 @@ PostgresUser       a login role and the access it holds           (namespaced)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [The state API](#the-state-api)
+- [The dashboard](#the-dashboard)
 - [Resource reference](#resource-reference)
 - [Operating notes](#operating-notes)
 - [RDS specifics](#rds-specifics)
@@ -51,8 +52,8 @@ the only ones the operator uses to manage everything else.
            └─ orders_ro                            └─ PushSecret ──▶ external store
 ```
 
-Both the reconciler and a read-only FastAPI state API run in one pod, as
-separate containers.
+The reconciler, a read-only FastAPI state API and a React dashboard run in one
+pod as three containers.
 
 ## The access model
 
@@ -380,7 +381,59 @@ endpoint emits a password or URI field.
 
 Response models are a deliberate projection rather than raw custom resources, so
 the shape stays stable as the CRDs evolve. `api.corsOrigins` allows a browser
-frontend; `api.ingress` exposes it externally.
+frontend on another origin; `api.ingress` exposes the API on its own.
+
+## The dashboard
+
+A React dashboard over the same API runs as a third container in the operator
+pod. nginx serves the bundle and proxies the API paths to `127.0.0.1:8000`:
+
+```
+pod pg-operator
+├── operator   kopf      :8080 health   :9090 metrics
+├── api        uvicorn   :8000
+└── ui         nginx     :8081
+                 /               the bundle, with an index.html fallback
+                 /api/v1/*   ┐
+                 /readyz     ├── proxy_pass → 127.0.0.1:8000
+                 /healthz    │
+                 /docs       ┘
+                 /nginx-healthz  nginx's own 200, for this container's probe
+```
+
+Because the proxy target is loopback inside the same pod the browser is
+**same-origin**: no CORS, no cluster DNS lookup, no NetworkPolicy egress rule,
+and no service-account token mounted for the UI. One ingress — or one
+port-forward — reaches the dashboard *and* `/docs`.
+
+```bash
+kubectl -n pg-operator port-forward svc/pg-operator-api 8081:8081
+open http://localhost:8081/
+```
+
+| View | Shows |
+| --- | --- |
+| Overview | Phase counts per kind, each a link into the matching filtered list, plus the `attention` list rendered as links |
+| Instances | Endpoint, server version, managing role and its privileges, SSL mode, retention; then every database and user on it |
+| Databases | Group roles, and **one row per schema** tagged `managed` / `orphaned` / `unmanaged` / `unowned` / `missing` with the grants each group role actually holds; extensions, denied parameters, and the users granted on it |
+| Users | Grants as *database → level → group role*, the credentials Secret **name and keys only**, PushSecret ref, and whether the password is generated or supplied |
+
+Every view shows the raw conditions, so a `Drifted` resource names its reason —
+`RetainedOrphans`, `SchemaNotOwned`, `ParameterDenied`, `ImmutableFieldDrift` or
+`MultipleIssues` — rather than just its colour. Filters live in the URL and map
+one-to-one onto the API's query parameters, so a filtered view is a shareable
+link. It polls every 10s by default (`ui.config.refreshIntervalMs`), which the
+API's own 5s response cache absorbs.
+
+The UI is plain JavaScript — no TypeScript — on [Mantine](https://mantine.dev)
+9, themed from Tailwind's design tokens: its palettes folded into Mantine's
+ten-slot colour arrays, its spacing, type, radius and shadow scales, and its
+`font-sans` stack. No Tailwind dependency, and no webfont, so the page makes no
+external request at all.
+
+**It inherits the API's exposure model.** Read-only, and it never returns a
+credential value — but it does enumerate database, role and Secret names, and
+neither it nor the API authenticates. Gate it at the ingress.
 
 ## Resource reference
 
@@ -560,7 +613,12 @@ uv run ruff check src tests        # lint
 uv run mypy src/pg_operator        # types
 uv run pytest                      # unit tests
 helm lint charts/pg-operator       # chart
+
+make ui-install                    # the dashboard's npm dependencies
+make ui-check                      # ESLint and a production build
 ```
+
+`make check` runs all of it.
 
 ### Integration tests
 
@@ -596,10 +654,11 @@ non-superuser managing role. Tested on OrbStack, whose image store is shared
 with Docker so no registry is needed.
 
 ```bash
-make local-up        # build the image, start the servers, install the operator
+make local-up        # build both images, start the servers, install the operator
 make local-status    # phases for all three kinds
 make local-verify    # connect as each generated user and assert its privileges
 make local-test      # the full pytest suite against each server in turn
+make local-ui        # port-forward the dashboard to localhost:8081
 make local-down
 ```
 
@@ -607,6 +666,22 @@ Applying an identical workload to every version is the point: a behavioural
 difference between 14 and 18 shows up as a status difference between otherwise
 identical resources. PostgreSQL 14 is *expected* to report `Drifted` there — see
 `hack/local/README.md` for why, and why a real RDS 14 instance does not.
+
+### Working on the dashboard
+
+Vite proxies the same API prefixes nginx does, so the dev server behaves like
+the deployed pod — same-origin, no CORS:
+
+```bash
+make local-api    # in one shell: port-forward the API to localhost:8000
+make ui-dev       # in another: http://localhost:5173, hot reloading
+```
+
+`make ui-image-check` builds the image and runs it under exactly the
+constraints the pod imposes — `--read-only --user 65532:65532` — then asserts
+nginx came up, a deep link falls back to `index.html`, a missing asset is still
+a 404, and `/api` is proxied. That combination is the one thing about this
+container that cannot fail anywhere else.
 
 ### Running against a kubecontext directly
 

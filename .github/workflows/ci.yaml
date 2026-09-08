@@ -70,6 +70,24 @@ jobs:
           PGOP_TEST_DSN: "host=localhost port=5432 user=pgadmin password=adminpw dbname=postgres sslmode=disable"
         run: uv run pytest --cov=pg_operator --cov-report=term-missing
 
+  ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - name: ESLint
+        run: npm run lint
+      - name: Build
+        run: npm run build
+
   chart:
     runs-on: ubuntu-latest
     steps:
@@ -92,6 +110,20 @@ jobs:
             --set 'watchNamespaces={team-a}' \
             --set 'instances.prod.host=prod.rds.amazonaws.com' \
             --set 'instances.prod.credentialsSecretRef.name=prod-super'
+      - name: Render the dashboard's ingress
+        # Separate from the render above: ui.ingress and api.ingress both claim
+        # "/" on the same host, so the chart refuses to render them together.
+        run: |
+          helm template test charts/pg-operator --namespace pg-operator \
+            --set ui.ingress.enabled=true \
+            --set networkPolicy.enabled=true
+      - name: Refuse a dashboard with no API to proxy to
+        run: |
+          if helm template test charts/pg-operator --namespace pg-operator \
+               --set api.enabled=false >/dev/null 2>&1; then
+            echo "ui.enabled without api.enabled should have failed to render"
+            exit 1
+          fi
       - name: Validate manifests against the Kubernetes schema
         uses: instrumenta/kubeval-action@master
         continue-on-error: true
@@ -117,6 +149,40 @@ jobs:
           docker run --rm --user 65532:65532 pg-operator:ci \
             python -c "import pg_operator.operator, pg_operator.api.main; print('ok')"
           docker run --rm --user 65532:65532 pg-operator:ci kopf --version
+      - name: Build the dashboard image
+        uses: docker/build-push-action@v7
+        with:
+          context: ui
+          push: false
+          load: true
+          tags: pg-operator-ui:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: The dashboard serves read-only as uid 65532
+        # The pod runs this container with readOnlyRootFilesystem and
+        # runAsUser 65532, so nginx has to start with every writable path
+        # under an in-memory /tmp. That fails loudly, and only here.
+        run: |
+          docker run -d --name ui --read-only --user 65532:65532 \
+            --tmpfs /tmp -p 8081:8081 pg-operator-ui:ci
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:8081/nginx-healthz && break
+            sleep 1
+          done
+          curl -sf http://localhost:8081/nginx-healthz
+          curl -s http://localhost:8081/ | grep -q '<div id="root"></div>'
+          # A deep link must survive a reload via the SPA fallback...
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:8081/databases/team-a/orders)" = "200"
+          # ...while a missing asset must still be a 404, not index.html.
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:8081/assets/missing.js)" = "404"
+          # No API in this container, so a proxied path must fail as a proxy.
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:8081/api/v1/overview)" = "502"
+          docker rm -f ui
+
       - name: The API serves liveness without a cluster
         run: |
           docker run -d --name api -p 8000:8000 pg-operator:ci pg-operator-api

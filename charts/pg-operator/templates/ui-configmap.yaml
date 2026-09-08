@@ -1,0 +1,16 @@
+{{- if .Values.ui.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pg-operator.fullname" . }}-ui
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ui
+data:
+  # Served at /config.json and fetched by the app before its first render, so
+  # one image can be labelled per cluster without a rebuild. Every key is
+  # optional: the app has usable defaults for all of them.
+  config.json: |
+    {{- toJson .Values.ui.config | nindent 4 }}
+{{- end }}

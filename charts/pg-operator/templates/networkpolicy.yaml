@@ -21,6 +21,15 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
+    {{- if .Values.ui.enabled }}
+    - ports:
+        - port: ui
+          protocol: TCP
+      {{- with .Values.networkPolicy.uiIngressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
     {{- if .Values.metrics.enabled }}
     - ports:
         - port: metrics
