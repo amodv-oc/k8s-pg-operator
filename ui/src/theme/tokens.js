@@ -1,179 +1,157 @@
 /**
- * Tailwind's design tokens, shaped for Mantine.
- *
- * Tailwind publishes eleven shades per palette (50, 100…900, 950); Mantine's
- * colour arrays hold exactly ten and index them 0–9. The mapping used here is
- * 50…900 → 0…9, which keeps Tailwind's `-600` at index 6 — the shade Tailwind
- * itself uses for interactive elements in light mode, and therefore the right
- * `primaryShade.light`. The 950 shades are not dropped: they are exported
- * separately and used to build Mantine's `dark` surface ramp.
+ * The console's design tokens, shaped for Mantine.
  */
 
-// prettier-ignore
-export const slate = [
-  '#f8fafc', '#f1f5f9', '#e2e8f0', '#cbd5e1', '#94a3b8',
-  '#64748b', '#475569', '#334155', '#1e293b', '#0f172a',
-]
+/** The four brand greens, each with one surface role. */
+export const green = {
+  /** Headings, and the whole brand signal in dark mode. */
+  brand: '#006241',
+  /** Filled CTAs, the floating refresh button, focus rings. */
+  accent: '#00754A',
+  /** The deep near-black green: hero bands, the logo mark. */
+  house: '#1E3932',
+  /** A mid-dark green for decorative and secondary dark surfaces. */
+  uplift: '#2b5148',
+  /** The pale mint wash behind active nav items and Ready pills. */
+  light: '#d4e9e2',
+  /** The luminous mint that carries the brand on a dark ground. */
+  onDark: '#8fd6bb',
+}
 
 // prettier-ignore
-export const zinc = [
-  '#fafafa', '#f4f4f5', '#e4e4e7', '#d4d4d8', '#a1a1aa',
-  '#71717a', '#52525b', '#3f3f46', '#27272a', '#18181b',
+export const brand = [
+  '#f0f8f5', '#d4e9e2', '#b0d9cc', '#8fd6bb', '#5fb695',
+  '#249a72', '#00754A', '#006241', '#2b5148', '#1E3932',
 ]
 
+/** Gold. Reserved for the cluster badge and the health panel's ceremony. */
 // prettier-ignore
-export const blue = [
-  '#eff6ff', '#dbeafe', '#bfdbfe', '#93c5fd', '#60a5fa',
-  '#3b82f6', '#2563eb', '#1d4ed8', '#1e40af', '#1e3a8a',
+export const gold = [
+  '#faf6ee', '#f3ead6', '#e7d6b4', '#dfc49d', '#d4b37c',
+  '#cba258', '#b98f45', '#8a6a2c', '#6d5423', '#4c3a18',
 ]
 
+/**
+ * The warm neutral ramp
+ */
 // prettier-ignore
-export const emerald = [
-  '#ecfdf5', '#d1fae5', '#a7f3d0', '#6ee7b7', '#34d399',
-  '#10b981', '#059669', '#047857', '#065f46', '#064e3b',
+export const cream = [
+  '#faf9f7', '#f2f0eb', '#edebe9', '#e7e7e7', '#d6d3cd',
+  '#b3afa8', '#8a8680', '#5c5a56', '#3d3b38', '#24221f',
 ]
 
-// prettier-ignore
-export const amber = [
-  '#fffbeb', '#fef3c7', '#fde68a', '#fcd34d', '#fbbf24',
-  '#f59e0b', '#d97706', '#b45309', '#92400e', '#78350f',
-]
-
+/** Destructive and failure. */
 // prettier-ignore
 export const red = [
-  '#fef2f2', '#fee2e2', '#fecaca', '#fca5a5', '#f87171',
-  '#ef4444', '#dc2626', '#b91c1c', '#991b1b', '#7f1d1d',
+  '#fbeceb', '#f7d6d3', '#efaba5', '#e57e75', '#d95246',
+  '#c82014', '#a81a11', '#8a150e', '#6b100b', '#4a0b07',
+]
+
+/** Warning, and the amber an unreachable server is reported in. */
+// prettier-ignore
+export const amber = [
+  '#fdf3e0', '#fbe7bd', '#f8d68a', '#f5c65c', '#fbbc05',
+  '#e0a300', '#b87f00', '#8f5a00', '#6b4300', '#472c00',
 ]
 
 // prettier-ignore
-export const orange = [
-  '#fff7ed', '#ffedd5', '#fed7aa', '#fdba74', '#fb923c',
-  '#f97316', '#ea580c', '#c2410c', '#9a3412', '#7c2d12',
+export const dark = [
+  '#ffffff', // 0  body text
+  '#e6efeb', // 1
+  '#b9cfc7', // 2  dimmed text
+  '#8fada3', // 3  placeholder
+  '#3a544b', // 4  default border
+  '#264238', // 5  hover
+  '#1E3932', // 6  card / input      house green
+  '#14231d', // 7  page background
+  '#0f1c17', // 8  band
+  '#0a1411', // 9
 ]
 
-// prettier-ignore
-export const violet = [
-  '#f5f3ff', '#ede9fe', '#ddd6fe', '#c4b5fd', '#a78bfa',
-  '#8b5cf6', '#7c3aed', '#6d28d9', '#5b21b6', '#4c1d95',
-]
+/** Spacing. A rem scale whose most frequent step, 1rem, is the outer gutter. */
+export const spacing = {
+  '2xs': '0.25rem', //  4px
+  xs: '0.5rem', //      8px
+  sm: '0.75rem', //    12px
+  md: '1rem', //       16px  the universal rhythm constant
+  lg: '1.5rem', //     24px
+  xl: '2rem', //       32px
+  '2xl': '2.5rem', //  40px
+  '3xl': '4rem', //    64px
+}
 
-// prettier-ignore
-export const cyan = [
-  '#ecfeff', '#cffafe', '#a5f3fc', '#67e8f9', '#22d3ee',
-  '#06b6d4', '#0891b2', '#0e7490', '#155e75', '#164e63',
-]
+export const fontSizes = {
+  xs: '0.8125rem', //  13px  micro-copy
+  sm: '0.875rem', //   14px  metadata, button labels, table body
+  md: '0.9375rem', //  15px  body
+  lg: '1.1875rem', //  19px  body large, panel titles
+  xl: '1.5rem', //     24px  section headings
+  '2xl': '2rem', //    32px  page headings
+  '3xl': '2.8125rem', // 45px hero display
+}
 
-/** Tailwind's 950 shades, which the 50…900 mapping above has no slot for. */
-export const deepest = {
-  slate: '#020617',
-  zinc: '#09090b',
-  blue: '#172554',
-  emerald: '#022c22',
-  amber: '#451a03',
-  red: '#450a0a',
+export const lineHeights = {
+  xs: '1.5',
+  sm: '1.5',
+  md: '1.5', //  the body default
+  lg: '1.75', // body large: generous, the way the hero copy is set
+  xl: '1.3',
 }
 
 /**
- * Mantine's `dark` array is not a palette — it is the dark scheme's surface
- * ramp, read from both ends: index 0 is body text, 2 is dimmed text, 4 is the
- * default border, 6 is a card and 7 the page background. Built here from
- * Tailwind's slate so dark mode is recognisably the same design as light.
+ * Radius. `md` is the 12px card corner and `xl` the 50px full pill, which is
+ * the radius every button and badge in this system takes without exception.
  */
-// prettier-ignore
-export const dark = [
-  slate[1],   // 0  body text          slate-100
-  slate[2],   // 1                     slate-200
-  slate[4],   // 2  dimmed text        slate-400
-  slate[5],   // 3  placeholder        slate-500
-  slate[7],   // 4  default border     slate-700
-  '#253449',  // 5  hover              between slate-700 and -800
-  slate[8],   // 6  card / input       slate-800
-  slate[9],   // 7  page background    slate-900
-  '#0b1220',  // 8                     between slate-900 and -950
-  deepest.slate, // 9                  slate-950
-]
-
-/** Tailwind's spacing scale: `n` is `n * 0.25rem`. */
-export const spacing = {
-  '2xs': '0.25rem', // 1
-  xs: '0.5rem', //    2
-  sm: '0.75rem', //   3
-  md: '1rem', //      4
-  lg: '1.5rem', //    6
-  xl: '2rem', //      8
-  '2xl': '3rem', //  12
-  '3xl': '4rem', //  16
-}
-
-/** Tailwind's `text-*` sizes. */
-export const fontSizes = {
-  xs: '0.75rem', //    text-xs
-  sm: '0.875rem', //   text-sm
-  md: '1rem', //       text-base
-  lg: '1.125rem', //   text-lg
-  xl: '1.25rem', //    text-xl
-  '2xl': '1.5rem', //  text-2xl
-  '3xl': '1.875rem', //text-3xl
-}
-
-/** The line-height Tailwind pairs with each of those sizes, as a ratio. */
-export const lineHeights = {
-  xs: '1.3333', // 1rem     / 0.75rem
-  sm: '1.4286', // 1.25rem  / 0.875rem
-  md: '1.5', //    1.5rem   / 1rem
-  lg: '1.5556', // 1.75rem  / 1.125rem
-  xl: '1.4', //    1.75rem  / 1.25rem
-}
-
-/** Tailwind's `rounded-*`. */
 export const radius = {
-  xs: '0.125rem', // rounded-sm
-  sm: '0.25rem', //  rounded
-  md: '0.375rem', // rounded-md
-  lg: '0.5rem', //   rounded-lg
-  xl: '0.75rem', //  rounded-xl
+  xs: '0.25rem', //  4px  code, tight inline chrome
+  sm: '0.25rem', //  4px  inputs
+  md: '0.75rem', // 12px  cards, panels, modals
+  lg: '1rem', //    16px
+  xl: '50px', //          full pill
 }
 
-/** Tailwind's `shadow-*`. */
 export const shadows = {
-  xs: '0 1px 2px 0 rgb(0 0 0 / 0.05)',
-  sm: '0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1)',
-  md: '0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)',
-  lg: '0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1)',
-  xl: '0 20px 25px -5px rgb(0 0 0 / 0.1), 0 8px 10px -6px rgb(0 0 0 / 0.1)',
+  xs: '0 0 0.5px 0 rgb(0 0 0 / 0.14), 0 1px 1px 0 rgb(0 0 0 / 0.24)',
+  sm: '0 1px 3px rgb(0 0 0 / 0.1), 0 2px 2px rgb(0 0 0 / 0.06), 0 0 2px rgb(0 0 0 / 0.07)',
+  md: '0 0 3px rgb(0 0 0 / 0.16), 0 4px 8px rgb(0 0 0 / 0.12)',
+  lg: '0 0 6px rgb(0 0 0 / 0.24), 0 8px 12px rgb(0 0 0 / 0.14)',
+  xl: '0 0 8px rgb(0 0 0 / 0.24), 0 16px 24px rgb(0 0 0 / 0.16)',
 }
 
-/** Tailwind's breakpoints, in em because Mantine's media queries use em. */
+/** Breakpoints, in em because Mantine's media queries use em. */
 export const breakpoints = {
-  xs: '40em', //  640px  sm
-  sm: '48em', //  768px  md
-  md: '64em', // 1024px  lg
-  lg: '80em', // 1280px  xl
-  xl: '96em', // 1536px  2xl
+  xs: '30em', //  480px
+  sm: '48em', //  768px
+  md: '64em', // 1024px
+  lg: '90em', // 1440px
+  xl: '96em', // 1536px
 }
 
-/** Tailwind's own default stacks. No webfont, so no external request. */
 export const fontFamily = [
-  'ui-sans-serif',
-  'system-ui',
-  '-apple-system',
-  '"Segoe UI"',
-  'Roboto',
+  'Manrope',
   '"Helvetica Neue"',
+  'Helvetica',
   'Arial',
-  '"Noto Sans"',
   'sans-serif',
   '"Apple Color Emoji"',
   '"Segoe UI Emoji"',
 ].join(', ')
 
 export const fontFamilyMonospace = [
+  '"IBM Plex Mono"',
   'ui-monospace',
   'SFMono-Regular',
   'Menlo',
-  'Monaco',
   'Consolas',
-  '"Liberation Mono"',
-  '"Courier New"',
   'monospace',
 ].join(', ')
+
+export const fontFamilySerif = ['Lora', '"Iowan Old Style"', 'Georgia', 'serif'].join(', ')
+
+export const letterSpacing = {
+  normal: '-0.01em',
+  heading: '-0.16px',
+  /** Uppercase eyebrow labels and table headers. */
+  caps: '0.03em',
+  looser: '0.15em',
+}

@@ -1,6 +1,7 @@
-import { Badge, Group, Text, Tooltip } from '@mantine/core'
+import { Group, Text } from '@mantine/core'
 
 import { extensionRows, STATE_META } from '../lib/resources'
+import { Pill } from './Pill'
 
 /**
  * Declared and installed extensions. `plpgsql` shows up as merely `observed`
@@ -21,13 +22,15 @@ export function ExtensionList({ database }) {
       {rows.map((row) => {
         const meta = STATE_META[row.state]
         return (
-          <Tooltip key={row.name} label={meta.hint} multiline maw={320}>
-            <Badge color={meta.color} variant={row.state === 'managed' ? 'light' : 'outline'}>
-              {row.name}
-              {row.version && ` ${row.version}`}
-              {row.state !== 'managed' && ` · ${meta.label}`}
-            </Badge>
-          </Tooltip>
+          <Pill
+            key={row.name}
+            tone={meta.tone}
+            message={meta.hint}
+            variant={row.state === 'managed' ? 'light' : 'outline'}
+            label={`${row.name}${row.version ? ` ${row.version}` : ''}${
+              row.state === 'managed' ? '' : ` · ${meta.label}`
+            }`}
+          />
         )
       })}
     </Group>

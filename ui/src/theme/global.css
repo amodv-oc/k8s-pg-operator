@@ -1,24 +1,173 @@
-/* Surfaces. Mantine derives its dark-scheme background from dark[7]; naming
-   the light one explicitly gives the page the same slate-50 ground Tailwind
-   dashboards sit on, instead of pure white. */
+/* ------------------------------------------------------------------------
+   Surfaces.
+
+   Mantine derives its own scheme colours from the `dark` ramp and the palette,
+   but the design system's surface roles do not map one-to-one onto Mantine's
+   two-surface model: it has a page canvas, a card white, a *quieter* white for
+   table headers, a ceramic wash for inert containers and a deep band, and each
+   is a distinct role. They are named here so both schemes can be read side by
+   side, and so a component asks for a role rather than for a shade.
+   ------------------------------------------------------------------------ */
 :root {
-  --pgop-page-bg: var(--mantine-color-slate-0);
-  --pgop-surface: var(--mantine-color-white);
-  --pgop-border: var(--mantine-color-slate-2);
+  --pgop-canvas: #f2f0eb; /* warm cream — the page ground              */
+  --pgop-ceramic: #edebe9; /* one step warmer — inert containers        */
+  --pgop-surface: #ffffff; /* cards, panels, the header bar             */
+  --pgop-surface-alt: #f9f9f9; /* table headers, quiet utility strips   */
+  --pgop-band: #1e3932; /* the deep green hero band                    */
+  --pgop-code-bg: #edebe9;
+
+  --pgop-brand: #006241; /* headings                                   */
+  --pgop-accent: #00754a; /* CTAs, links, the floating refresh button   */
+  --pgop-gold: #cba258; /* the cluster badge and the health panel       */
+
+  --pgop-ink: rgb(0 0 0 / 0.87); /* never pure black, to sit warm       */
+  --pgop-ink-soft: rgb(0 0 0 / 0.58);
+  --pgop-ink-faint: rgb(0 0 0 / 0.38);
+  --pgop-line: rgb(0 0 0 / 0.1); /* container borders                   */
+  --pgop-hair: #e7e7e7; /* row separators inside a container            */
+  --pgop-row-hover: #f6f4f0;
+
+  --pgop-on-band: #ffffff;
+  --pgop-on-band-soft: rgb(255 255 255 / 0.7);
+  --pgop-on-band-line: rgb(255 255 255 / 0.1);
+  --pgop-on-band-panel: rgb(255 255 255 / 0.07);
+  --pgop-on-band-panel-line: rgb(255 255 255 / 0.14);
+
+  --pgop-mint: #d4e9e2; /* the pale wash behind a kind's icon            */
+  --pgop-nav-active-bg: #d4e9e2;
+  --pgop-nav-active-fg: #00543a;
+  --pgop-nav-idle-fg: rgb(0 0 0 / 0.58);
+
+  /* The band is deep green in *both* schemes, so its CTA does not follow the
+     scheme: a filled green pill on green disappears, and the design system's
+     answer is the inverted white pill with green text. Defined once, and
+     deliberately not restated in the dark block below. */
+  --pgop-band-cta-bg: #ffffff;
+  --pgop-band-cta-fg: #00754a;
+
+  --pgop-card-shadow: 0 0 0.5px 0 rgb(0 0 0 / 0.14), 0 1px 1px 0 rgb(0 0 0 / 0.24);
+  --pgop-nav-shadow: 0 1px 3px rgb(0 0 0 / 0.1), 0 2px 2px rgb(0 0 0 / 0.06),
+    0 0 2px rgb(0 0 0 / 0.07);
+  --pgop-fab-shadow: 0 0 6px rgb(0 0 0 / 0.24), 0 8px 12px rgb(0 0 0 / 0.14);
+  --pgop-fab-shadow-active: 0 0 6px rgb(0 0 0 / 0.24), 0 8px 12px rgb(0 0 0 / 0);
+
+  /* Phase pills. One pair per phase in the operator's vocabulary, so a phase
+     always reads the same colour wherever it appears — a table cell, a summary
+     chip, a condition row or a page heading. */
+  --pgop-tone-Ready-bg: #d4e9e2;
+  --pgop-tone-Ready-fg: #00543a;
+  --pgop-tone-Drifted-bg: #faf6ee;
+  --pgop-tone-Drifted-fg: #8a6a2c;
+  --pgop-tone-Pending-bg: #edebe9;
+  --pgop-tone-Pending-fg: #1e3932;
+  --pgop-tone-Paused-bg: #edebe9;
+  --pgop-tone-Paused-fg: #5c5a56;
+  --pgop-tone-Failed-bg: #fbeceb;
+  --pgop-tone-Failed-fg: #a81a11;
+  --pgop-tone-Unreachable-bg: #fdf3e0;
+  --pgop-tone-Unreachable-fg: #8f5a00;
+  --pgop-tone-Unknown-bg: #edebe9;
+  --pgop-tone-Unknown-fg: #5c5a56;
+
+  /* Gold is a ceremony tone, not a status: it marks the cluster the console
+     is pointed at and the health readout on the hero band, and nothing else. */
+  --pgop-tone-Gold-bg: #faf6ee;
+  --pgop-tone-Gold-fg: #cba258;
+
+  /* Access levels, in privilege order. OWNER takes the gold. */
+  --pgop-tone-OWNER-bg: #faf6ee;
+  --pgop-tone-OWNER-fg: #8a6a2c;
+  --pgop-tone-RW-bg: #d4e9e2;
+  --pgop-tone-RW-fg: #00543a;
+  --pgop-tone-RO-bg: #edebe9;
+  --pgop-tone-RO-fg: #33433d;
 }
 
 [data-mantine-color-scheme='dark'] {
-  --pgop-page-bg: var(--mantine-color-dark-8);
-  --pgop-surface: var(--mantine-color-dark-6);
-  --pgop-border: var(--mantine-color-dark-4);
+  --pgop-canvas: #14231d;
+  --pgop-ceramic: #2b5148;
+  --pgop-surface: #1e3932;
+  --pgop-surface-alt: #224036;
+  --pgop-band: #0f1c17;
+  --pgop-code-bg: rgb(255 255 255 / 0.08);
+
+  /* On a green ground the brand signal inverts: the pale mint carries it. */
+  --pgop-brand: #d4e9e2;
+  --pgop-accent: #8fd6bb;
+  --pgop-gold: #cba258;
+
+  --pgop-ink: #ffffff;
+  --pgop-ink-soft: rgb(255 255 255 / 0.7);
+  --pgop-ink-faint: rgb(255 255 255 / 0.45);
+  --pgop-line: rgb(255 255 255 / 0.12);
+  --pgop-hair: rgb(255 255 255 / 0.1);
+  --pgop-row-hover: rgb(255 255 255 / 0.05);
+
+  --pgop-mint: rgb(212 233 226 / 0.14);
+  --pgop-nav-active-bg: rgb(255 255 255 / 0.12);
+  --pgop-nav-active-fg: #ffffff;
+  --pgop-nav-idle-fg: rgb(255 255 255 / 0.7);
+
+  --pgop-card-shadow: 0 0 0.5px 0 rgb(0 0 0 / 0.4), 0 1px 2px 0 rgb(0 0 0 / 0.5);
+  --pgop-nav-shadow: 0 1px 3px rgb(0 0 0 / 0.35), 0 2px 2px rgb(0 0 0 / 0.2),
+    0 0 2px rgb(0 0 0 / 0.2);
+
+  --pgop-tone-Ready-bg: rgb(0 117 74 / 0.34);
+  --pgop-tone-Ready-fg: #8fd6bb;
+  --pgop-tone-Drifted-bg: rgb(203 162 88 / 0.2);
+  --pgop-tone-Drifted-fg: #e2c489;
+  --pgop-tone-Pending-bg: rgb(255 255 255 / 0.1);
+  --pgop-tone-Pending-fg: #cfe3db;
+  --pgop-tone-Paused-bg: rgb(255 255 255 / 0.08);
+  --pgop-tone-Paused-fg: rgb(255 255 255 / 0.68);
+  --pgop-tone-Failed-bg: rgb(200 32 20 / 0.26);
+  --pgop-tone-Failed-fg: #f4a49d;
+  --pgop-tone-Unreachable-bg: rgb(251 188 5 / 0.16);
+  --pgop-tone-Unreachable-fg: #f0c46a;
+  --pgop-tone-Unknown-bg: rgb(255 255 255 / 0.08);
+  --pgop-tone-Unknown-fg: rgb(255 255 255 / 0.68);
+
+  --pgop-tone-Gold-bg: rgb(203 162 88 / 0.12);
+  --pgop-tone-Gold-fg: #cba258;
+
+  --pgop-tone-OWNER-bg: rgb(203 162 88 / 0.2);
+  --pgop-tone-OWNER-fg: #e2c489;
+  --pgop-tone-RW-bg: rgb(0 117 74 / 0.34);
+  --pgop-tone-RW-fg: #8fd6bb;
+  --pgop-tone-RO-bg: rgb(255 255 255 / 0.08);
+  --pgop-tone-RO-fg: #cfe3db;
 }
 
 body {
-  background-color: var(--pgop-page-bg);
+  background-color: var(--pgop-canvas);
+  color: var(--pgop-ink);
+  letter-spacing: -0.01em;
   -webkit-font-smoothing: antialiased;
 }
 
-/* Tailwind's `tabular-nums` for anything that lines up in a column. */
+/* Mantine paints its own surfaces from the palette; these point its
+   scheme-aware variables at the design system's roles so unstyled components
+   land on the right ground without each one being overridden. */
+:root,
+[data-mantine-color-scheme] {
+  --mantine-color-body: var(--pgop-surface);
+  --mantine-color-text: var(--pgop-ink);
+  --mantine-color-dimmed: var(--pgop-ink-soft);
+  --mantine-color-default-border: var(--pgop-line);
+  --mantine-color-anchor: var(--pgop-accent);
+
+  /* Rows separate on the light hairline and warm on hover; the heavier line
+     is reserved for the edge of the container the table sits in. */
+  --table-border-color: var(--pgop-hair);
+  --table-highlight-on-hover-color: var(--pgop-row-hover);
+  --table-hover-color: var(--pgop-row-hover);
+}
+
+/* ------------------------------------------------------------------------
+   Utilities
+   ------------------------------------------------------------------------ */
+
+/* Anything that lines up in a column. */
 .pgop-numeric {
   font-variant-numeric: tabular-nums;
 }
@@ -29,14 +178,252 @@ body {
   overflow-wrap: anywhere;
 }
 
+/* The serif is deliberate and localised: the overview headline, and nothing
+   else. It is never mixed with the sans inside one surface. */
+.pgop-display {
+  font-family: Lora, 'Iowan Old Style', Georgia, serif;
+  font-weight: 500;
+  letter-spacing: -0.16px;
+  line-height: 1.2;
+  text-wrap: pretty;
+}
+
+/* Small caps label. Marks the eyebrow above a hero headline and the title of
+   a quiet container. */
+.pgop-eyebrow {
+  font-size: 0.6875rem;
+  font-weight: 700;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+/* ------------------------------------------------------------------------
+   Chrome
+   ------------------------------------------------------------------------ */
+
+.pgop-header {
+  background: var(--pgop-surface);
+  box-shadow: var(--pgop-nav-shadow);
+  /* The bar carries its own shadow instead of a border; a hairline under a
+     three-layer shadow reads as a seam. */
+  border-bottom: none !important;
+}
+
+.pgop-rail {
+  background: var(--pgop-surface);
+  border-right: 1px solid var(--pgop-line);
+}
+
+/* The circular mark the wordmark sits against. */
+.pgop-logo {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--pgop-band);
+  color: #ffffff;
+}
+
+[data-mantine-color-scheme='dark'] .pgop-logo {
+  background: var(--pgop-nav-active-bg);
+  color: var(--pgop-accent);
+}
+
+/* A nav item is a pill, and the active one is filled with the mint wash. */
+.pgop-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: 100%;
+  height: 42px;
+  padding: 0 1rem;
+  border: none;
+  border-radius: 50px;
+  background: transparent;
+  color: var(--pgop-nav-idle-fg);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background-color 0.2s ease,
+    color 0.2s ease,
+    transform 0.2s ease;
+}
+
+.pgop-nav-item:hover {
+  background: var(--pgop-ceramic);
+  color: var(--pgop-ink);
+}
+
+.pgop-nav-item:active {
+  transform: scale(0.95);
+}
+
+.pgop-nav-item[data-active] {
+  background: var(--pgop-nav-active-bg);
+  color: var(--pgop-nav-active-fg);
+  font-weight: 600;
+}
+
+.pgop-nav-item[data-active]:hover {
+  background: var(--pgop-nav-active-bg);
+  color: var(--pgop-nav-active-fg);
+}
+
+/* The reconciler note, pinned to the foot of the rail. */
+.pgop-note {
+  margin-top: auto;
+  padding: 1rem;
+  border-radius: 12px;
+  background: var(--pgop-ceramic);
+}
+
+/* Below the rail's breakpoint the rail becomes a full-width drawer, which puts
+   this note exactly where the floating refresh button sits. Clear it. */
+@media (max-width: 48em) {
+  .pgop-note {
+    margin-bottom: 72px;
+  }
+}
+
+/* ------------------------------------------------------------------------
+   Hero band. The overview's colour-block moment: a deep green section that
+   bookends the cream body, with white type and gold labels on it.
+   ------------------------------------------------------------------------ */
+.pgop-band {
+  background: var(--pgop-band);
+  color: var(--pgop-on-band);
+}
+
+.pgop-band-panel {
+  border-radius: 12px;
+  background: var(--pgop-on-band-panel);
+  border: 1px solid var(--pgop-on-band-panel-line);
+}
+
+.pgop-band-row {
+  border-bottom: 1px solid var(--pgop-on-band-line);
+}
+
+.pgop-band-row:last-of-type {
+  border-bottom: none;
+}
+
+/* ------------------------------------------------------------------------
+   The floating refresh button. The most elevated element on any page: it
+   floats over every scrolled surface, and spins while a fetch is in flight.
+   ------------------------------------------------------------------------ */
+.pgop-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 200;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border: none;
+  border-radius: 50%;
+  background: #00754a;
+  color: #ffffff;
+  cursor: pointer;
+  box-shadow: var(--pgop-fab-shadow);
+  transition:
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.pgop-fab:active {
+  transform: scale(0.95);
+  box-shadow: var(--pgop-fab-shadow-active);
+}
+
+.pgop-fab > svg {
+  display: block;
+}
+
+.pgop-fab[data-busy] > svg {
+  animation: pgop-spin 700ms linear infinite;
+}
+
+@keyframes pgop-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pgop-fab[data-busy] > svg {
+    animation: none;
+  }
+}
+
+/* ------------------------------------------------------------------------
+   Containers and tables
+   ------------------------------------------------------------------------ */
+
 /* A phase tile is a button; it must not look like one until hovered. */
 .pgop-tile {
   cursor: pointer;
   transition:
-    border-color 150ms ease,
-    background-color 150ms ease;
+    border-color 0.2s ease,
+    transform 0.2s ease;
 }
 
 .pgop-tile:hover {
-  border-color: var(--mantine-primary-color-filled);
+  border-color: var(--pgop-accent);
+}
+
+.pgop-tile:active {
+  transform: scale(0.99);
+}
+
+/* Rows inside a panel separate on a hairline and lift on hover; the container
+   border stays the heavier line. */
+.pgop-row {
+  border-bottom: 1px solid var(--pgop-hair);
+  transition: background-color 0.15s ease;
+}
+
+.pgop-row:last-of-type {
+  border-bottom: none;
+}
+
+.pgop-row:hover {
+  background: var(--pgop-row-hover);
+}
+
+/* The circle a kind's icon sits in, on a summary card or a nav item. */
+.pgop-kind-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--pgop-mint);
+  color: var(--pgop-brand);
+}
+
+/* The count a summary card leads with. */
+.pgop-total {
+  font-size: 2rem;
+  font-weight: 600;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--pgop-brand);
+}
+
+/* A heading in the brand green. Page titles and panel titles both take it;
+   hierarchy between them comes from size and weight, not from a second hue. */
+.pgop-heading {
+  color: var(--pgop-brand);
+  letter-spacing: -0.16px;
 }

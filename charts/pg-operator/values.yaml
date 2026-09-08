@@ -4,9 +4,9 @@
 image:
   repository: ghcr.io/amodv-oc/k8s-pg-operator
   # Defaults to .Chart.AppVersion.
-  tag: ""
+  tag: "latest"
   digest: ""
-  pullPolicy: IfNotPresent
+  pullPolicy: Always
 
 imagePullSecrets: []
 nameOverride: ""
@@ -108,9 +108,9 @@ ui:
   enabled: true
   image:
     repository: ghcr.io/amodv-oc/k8s-pg-operator-ui
-    tag: ""
+    tag: "latest"
     digest: ""
-    pullPolicy: IfNotPresent
+    pullPolicy: Always
   port: 8081
   config:
     # -- Shown in the header, so two tabs on two clusters are distinguishable.

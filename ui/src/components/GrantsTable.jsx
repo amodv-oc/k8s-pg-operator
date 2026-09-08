@@ -1,8 +1,9 @@
-import { Anchor, Badge, Table, Text } from '@mantine/core'
+import { Anchor, Table, Text } from '@mantine/core'
 import { Link } from 'react-router-dom'
 
-import { accessColor } from '../lib/phase'
+import { accessTone } from '../lib/phase'
 import { NoRows } from './NoRows'
+import { Pill } from './Pill'
 
 /**
  * A user's access. The role column is the group whose *membership* the login
@@ -39,9 +40,7 @@ export function GrantsTable({ grants }) {
                 </Text>
               </Table.Td>
               <Table.Td>
-                <Badge color={accessColor(grant.role)} size="sm">
-                  {grant.role}
-                </Badge>
+                <Pill tone={accessTone(grant.role)} label={grant.role} />
               </Table.Td>
               <Table.Td>
                 <Text ff="monospace" fz="sm">

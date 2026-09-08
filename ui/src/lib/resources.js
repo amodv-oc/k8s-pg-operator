@@ -93,29 +93,29 @@ export function extensionRows(db) {
 }
 
 export const STATE_META = {
-  managed: { color: 'emerald', label: 'managed', hint: 'declared and reconciled' },
+  managed: { tone: 'Ready', label: 'managed', hint: 'declared and reconciled' },
   observed: {
-    color: 'zinc',
+    tone: 'Unknown',
     label: 'observed',
     hint: 'seen on the server, not recorded as managed',
   },
   orphaned: {
-    color: 'amber',
+    tone: 'Drifted',
     label: 'orphaned',
     hint: 'no longer declared; retained because retentionPolicy is RETAIN',
   },
   unmanaged: {
-    color: 'slate',
+    tone: 'Paused',
     label: 'unmanaged',
     hint: 'created outside the operator; never modified or dropped',
   },
   unowned: {
-    color: 'orange',
+    tone: 'Unreachable',
     label: 'unowned',
     hint: 'not owned by the owner group, so default privileges cannot be set',
   },
   missing: {
-    color: 'red',
+    tone: 'Failed',
     label: 'missing',
     hint: 'recorded as managed but absent; the next pass recreates it',
   },
@@ -124,23 +124,50 @@ export const STATE_META = {
 /**
  * The store emits attention entries as `Kind/name is Phase: message` or
  * `Kind/ns/name retains orphaned object(s): ...`. Splitting the reference back
- * out turns each line into a link instead of a dead string.
+ * out turns each line into a link instead of a dead string, and lifting the
+ * phase out of the sentence lets the row carry the same pill the resource
+ * wears everywhere else - the phase is then stated once, in colour, rather
+ * than twice in prose.
  */
+const PHASES = new Set([
+  'Ready',
+  'Drifted',
+  'Pending',
+  'Paused',
+  'Failed',
+  'Unreachable',
+  'Unknown',
+])
+
+function splitPhase(text) {
+  // `is <Phase>` optionally followed by `: <message>`.
+  const match = /^is (\w+)(?::\s*([\s\S]*))?$/.exec(text)
+  if (match && PHASES.has(match[1])) {
+    return { phase: match[1], text: match[2] ?? '' }
+  }
+  // The retained-orphans line is reported against a resource that reconciled;
+  // what diverges is the live state, which is exactly what Drifted means.
+  if (text.startsWith('retains orphaned object(s)')) {
+    return { phase: 'Drifted', text }
+  }
+  return { phase: null, text }
+}
+
 export function parseAttention(entry) {
   const space = entry.indexOf(' ')
-  if (space === -1) return { text: entry }
+  if (space === -1) return { text: entry, phase: null }
 
   const ref = entry.slice(0, space)
-  const text = entry.slice(space + 1)
   const parts = ref.split('/')
+  const { phase, text } = splitPhase(entry.slice(space + 1))
 
   if (parts[0] === 'PostgresInstance' && parts.length === 2) {
-    return { kind: parts[0], ref, text, name: parts[1], to: `/instances/${parts[1]}` }
+    return { kind: parts[0], ref, text, phase, name: parts[1], to: `/instances/${parts[1]}` }
   }
   if ((parts[0] === 'PostgresDB' || parts[0] === 'PostgresUser') && parts.length === 3) {
     const [kind, namespace, name] = parts
     const section = kind === 'PostgresDB' ? 'databases' : 'users'
-    return { kind, ref, text, namespace, name, to: `/${section}/${namespace}/${name}` }
+    return { kind, ref, text, phase, namespace, name, to: `/${section}/${namespace}/${name}` }
   }
-  return { text: entry }
+  return { text: entry, phase: null }
 }

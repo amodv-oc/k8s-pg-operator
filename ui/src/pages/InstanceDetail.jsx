@@ -1,16 +1,18 @@
-import { Anchor, Badge, Code, Grid, Stack, Table, Text } from '@mantine/core'
+import { Anchor, Code, Grid, Stack, Table, Text } from '@mantine/core'
 import { Link, useParams } from 'react-router-dom'
 
 import { ConditionsTable } from '../components/ConditionsTable'
 import { DetailGrid } from '../components/DetailGrid'
 import { ErrorState } from '../components/ErrorState'
 import { NoRows } from '../components/NoRows'
+import { Page } from '../components/Page'
 import { PageHeader } from '../components/PageHeader'
 import { Panel } from '../components/Panel'
 import { PhaseBadge } from '../components/PhaseBadge'
+import { Pill } from '../components/Pill'
 import { RelativeTime } from '../components/RelativeTime'
 import { TableSkeleton } from '../components/TableSkeleton'
-import { accessColor } from '../lib/phase'
+import { accessTone, retentionTone } from '../lib/phase'
 import { useInstance } from '../lib/queries'
 
 export function InstanceDetail() {
@@ -19,31 +21,32 @@ export function InstanceDetail() {
 
   if (isError) {
     return (
-      <>
-        <PageHeader title={name} crumbs={[{ label: 'Instances', to: '/instances' }]} />
+      <Page>
+        <PageHeader title={name} crumbs={[{ label: 'Instances', to: '/instances' }]} mono />
         <ErrorState error={error} />
-      </>
+      </Page>
     )
   }
   if (isPending || !instance) {
     return (
-      <>
-        <PageHeader title={name} crumbs={[{ label: 'Instances', to: '/instances' }]} />
+      <Page>
+        <PageHeader title={name} crumbs={[{ label: 'Instances', to: '/instances' }]} mono />
         <TableSkeleton rows={6} />
-      </>
+      </Page>
     )
   }
 
   return (
-    <>
+    <Page>
       <PageHeader
         title={instance.name}
         crumbs={[{ label: 'Instances', to: '/instances' }, { label: instance.name }]}
-        badge={<PhaseBadge phase={instance.phase} size="md" />}
+        mono
+        badge={<PhaseBadge phase={instance.phase} size="lg" />}
         subtitle={instance.message}
         actions={
-          <Text fz="xs" c="dimmed">
-            connected <RelativeTime value={instance.last_connected_at} fz="xs" c="dimmed" />
+          <Text fz="sm" c="dimmed">
+            connected <RelativeTime value={instance.last_connected_at} fz="sm" c="dimmed" />
           </Text>
         }
       />
@@ -69,12 +72,11 @@ export function InstanceDetail() {
                 {
                   label: 'Retention',
                   value: instance.retention_policy && (
-                    <Badge
-                      color={instance.retention_policy === 'DROP' ? 'red' : 'slate'}
+                    <Pill
+                      tone={retentionTone(instance.retention_policy)}
                       variant="outline"
-                    >
-                      {instance.retention_policy}
-                    </Badge>
+                      label={instance.retention_policy}
+                    />
                   ),
                 },
               ]}
@@ -98,9 +100,10 @@ export function InstanceDetail() {
                   value:
                     instance.push_secrets_available === null ||
                     instance.push_secrets_available === undefined ? null : (
-                      <Badge color={instance.push_secrets_available ? 'emerald' : 'zinc'}>
-                        {instance.push_secrets_available ? 'available' : 'not installed'}
-                      </Badge>
+                      <Pill
+                        tone={instance.push_secrets_available ? 'Ready' : 'Unknown'}
+                        label={instance.push_secrets_available ? 'available' : 'not installed'}
+                      />
                     ),
                 },
                 {
@@ -165,13 +168,11 @@ export function InstanceDetail() {
                       <Table.Td>
                         <Stack gap={2}>
                           {user.grants.map((grant) => (
-                            <Badge
+                            <Pill
                               key={`${grant.database}/${grant.role}`}
-                              color={accessColor(grant.role)}
-                              size="sm"
-                            >
-                              {grant.role} · {grant.database}
-                            </Badge>
+                              tone={accessTone(grant.role)}
+                              label={`${grant.role} · ${grant.database}`}
+                            />
                           ))}
                         </Stack>
                       </Table.Td>
@@ -188,6 +189,6 @@ export function InstanceDetail() {
           </Panel>
         </Grid.Col>
       </Grid>
-    </>
+    </Page>
   )
 }

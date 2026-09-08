@@ -1,4 +1,4 @@
-import { Alert, Anchor, Badge, Code, Grid, List, Stack, Table, Text } from '@mantine/core'
+import { Alert, Anchor, Code, Grid, List, Stack, Table, Text } from '@mantine/core'
 import { IconSettingsExclamation } from '@tabler/icons-react'
 import { Link, useParams } from 'react-router-dom'
 
@@ -7,13 +7,15 @@ import { DetailGrid } from '../components/DetailGrid'
 import { ErrorState } from '../components/ErrorState'
 import { ExtensionList } from '../components/ExtensionList'
 import { NoRows } from '../components/NoRows'
+import { Page } from '../components/Page'
 import { PageHeader } from '../components/PageHeader'
 import { Panel } from '../components/Panel'
 import { PhaseBadge } from '../components/PhaseBadge'
+import { Pill } from '../components/Pill'
 import { RelativeTime } from '../components/RelativeTime'
 import { SchemaTable } from '../components/SchemaTable'
 import { TableSkeleton } from '../components/TableSkeleton'
-import { accessColor } from '../lib/phase'
+import { accessTone, retentionTone } from '../lib/phase'
 import { useDatabase } from '../lib/queries'
 
 export function DatabaseDetail() {
@@ -28,31 +30,32 @@ export function DatabaseDetail() {
 
   if (isError) {
     return (
-      <>
-        <PageHeader title={name} crumbs={crumbs} />
+      <Page>
+        <PageHeader title={name} crumbs={crumbs} mono />
         <ErrorState error={error} />
-      </>
+      </Page>
     )
   }
   if (isPending || !db) {
     return (
-      <>
-        <PageHeader title={name} crumbs={crumbs} />
+      <Page>
+        <PageHeader title={name} crumbs={crumbs} mono />
         <TableSkeleton rows={6} />
-      </>
+      </Page>
     )
   }
 
   return (
-    <>
+    <Page>
       <PageHeader
         title={db.name}
         crumbs={crumbs}
-        badge={<PhaseBadge phase={db.phase} size="md" />}
+        mono
+        badge={<PhaseBadge phase={db.phase} size="lg" />}
         subtitle={db.message}
         actions={
-          <Text fz="xs" c="dimmed">
-            reconciled <RelativeTime value={db.last_reconciled_at} fz="xs" c="dimmed" />
+          <Text fz="sm" c="dimmed">
+            reconciled <RelativeTime value={db.last_reconciled_at} fz="sm" c="dimmed" />
           </Text>
         }
       />
@@ -101,12 +104,11 @@ export function DatabaseDetail() {
                 {
                   label: 'Retention',
                   value: db.retention_policy && (
-                    <Badge
-                      color={db.retention_policy === 'DROP' ? 'red' : 'slate'}
+                    <Pill
+                      tone={retentionTone(db.retention_policy)}
                       variant="outline"
-                    >
-                      {db.retention_policy}
-                    </Badge>
+                      label={db.retention_policy}
+                    />
                   ),
                 },
                 {
@@ -133,30 +135,24 @@ export function DatabaseDetail() {
                 {
                   label: 'OWNER',
                   value: db.roles.owner && (
-                    <Badge color={accessColor('OWNER')} ff="monospace">
-                      {db.roles.owner}
-                    </Badge>
+                    <Pill tone="OWNER" label={db.roles.owner} ff="monospace" />
                   ),
                 },
                 {
                   label: 'RW',
                   value: db.roles.read_write && (
-                    <Badge color={accessColor('RW')} ff="monospace">
-                      {db.roles.read_write}
-                    </Badge>
+                    <Pill tone="RW" label={db.roles.read_write} ff="monospace" />
                   ),
                 },
                 {
                   label: 'RO',
                   value: db.roles.read_only && (
-                    <Badge color={accessColor('RO')} ff="monospace">
-                      {db.roles.read_only}
-                    </Badge>
+                    <Pill tone="RO" label={db.roles.read_only} ff="monospace" />
                   ),
                 },
               ]}
             />
-            <Text fz="xs" c="dimmed" mt="md">
+            <Text className="pgop-eyebrow" c="dimmed" mt="lg">
               Extensions
             </Text>
             <Stack mt={6}>
@@ -217,14 +213,12 @@ export function DatabaseDetail() {
                           {user.grants
                             .filter((grant) => grant.database === db.database_name)
                             .map((grant) => (
-                              <Badge
+                              <Pill
                                 key={grant.role}
-                                color={accessColor(grant.role)}
-                                size="sm"
+                                tone={accessTone(grant.role)}
                                 mr={4}
-                              >
-                                {grant.role} → {grant.group_role}
-                              </Badge>
+                                label={`${grant.role} → ${grant.group_role}`}
+                              />
                             ))}
                         </Table.Td>
                         <Table.Td>
@@ -244,6 +238,6 @@ export function DatabaseDetail() {
           </Panel>
         </Grid.Col>
       </Grid>
-    </>
+    </Page>
   )
 }

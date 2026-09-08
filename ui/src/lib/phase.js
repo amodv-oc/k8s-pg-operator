@@ -1,17 +1,25 @@
-/** The phase vocabulary, and the one place its colours are decided. */
+/**
+ * The phase vocabulary, and the one place its colours are decided.
+ *
+ * Colour is expressed as a *tone* rather than a palette shade. A tone names a
+ * background and foreground pair defined in `theme/global.css` for both colour
+ * schemes, which is what lets one phase read identically as a table cell, a
+ * summary chip, a condition row and a page heading — and lets the dark scheme
+ * restate the pair as translucency over green instead of re-deriving it.
+ */
 
-const COLORS = {
-  Ready: 'emerald',
-  Drifted: 'amber',
-  Pending: 'blue',
-  Paused: 'slate',
-  Failed: 'red',
-  Unreachable: 'orange',
-  Unknown: 'zinc',
+const PHASE_TONES = {
+  Ready: 'Ready',
+  Drifted: 'Drifted',
+  Pending: 'Pending',
+  Paused: 'Paused',
+  Failed: 'Failed',
+  Unreachable: 'Unreachable',
+  Unknown: 'Unknown',
 }
 
-export function phaseColor(phase) {
-  return COLORS[phase] ?? 'zinc'
+export function phaseTone(phase) {
+  return PHASE_TONES[phase] ?? 'Unknown'
 }
 
 /**
@@ -35,28 +43,36 @@ export const COUNTS = [
 ]
 
 /**
- * A condition's colour depends on its type, not just its status: `Drifted=True`
- * is the bad case while `Ready=True` is the good one. Drift is amber rather
- * than red because the resource did reconcile - something about the live state
- * diverges anyway.
+ * A condition's tone depends on its type, not just its status: `Drifted=True`
+ * is the bad case while `Ready=True` is the good one. Drift takes the gold
+ * rather than the red because the resource did reconcile - something about the
+ * live state diverges anyway.
  */
 const GOOD_WHEN_TRUE = new Set(['Ready', 'Reachable', 'Synced', 'Available'])
 
-export function conditionColor(type, status) {
-  if (status === 'Unknown') return 'zinc'
+export function conditionTone(type, status) {
+  if (status === 'Unknown') return 'Unknown'
   const isTrue = status === 'True'
   const good = GOOD_WHEN_TRUE.has(type) ? isTrue : !isTrue
-  if (good) return 'emerald'
-  return type === 'Drifted' ? 'amber' : 'red'
+  if (good) return 'Ready'
+  return type === 'Drifted' ? 'Drifted' : 'Failed'
 }
 
-/** Access levels, in privilege order, with a stable colour each. */
-export const ACCESS_COLORS = {
-  OWNER: 'violet',
-  RW: 'blue',
-  RO: 'cyan',
+/** Access levels, in privilege order, with a stable tone each. */
+export const ACCESS_TONES = {
+  OWNER: 'OWNER',
+  RW: 'RW',
+  RO: 'RO',
 }
 
-export function accessColor(role) {
-  return ACCESS_COLORS[role] ?? 'zinc'
+export function accessTone(role) {
+  return ACCESS_TONES[role] ?? 'Unknown'
+}
+
+/**
+ * Retention. RETAIN is the quiet default and reads as neutral chrome; DROP is
+ * the one that deletes a real database or role, so it is never quiet.
+ */
+export function retentionTone(policy) {
+  return policy === 'DROP' ? 'Failed' : 'Paused'
 }

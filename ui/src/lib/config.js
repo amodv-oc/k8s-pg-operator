@@ -1,10 +1,5 @@
 /**
  * Runtime configuration, fetched once before the app renders.
- *
- * The chart mounts `config.json` from a ConfigMap so one image can be labelled
- * per cluster without a rebuild. It is optional: the defaults below are the
- * correct values for the in-pod deployment, where nginx proxies the API on
- * loopback and the UI is therefore same-origin.
  */
 
 const DEFAULTS = {

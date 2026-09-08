@@ -1,12 +1,13 @@
-import { Badge, Table, Text } from '@mantine/core'
+import { Table, Text } from '@mantine/core'
 
-import { conditionColor } from '../lib/phase'
+import { conditionTone } from '../lib/phase'
+import { Pill } from './Pill'
 import { RelativeTime } from './RelativeTime'
 
 /**
  * The operator's conditions, verbatim.
  *
- * `Drifted=True` is amber rather than red on purpose: the resource did
+ * `Drifted=True` takes the gold rather than the red on purpose: the resource did
  * reconcile, and something about the live state diverges anyway. Its `reason`
  * distinguishes the five cases - RetainedOrphans, SchemaNotOwned,
  * ParameterDenied, ImmutableFieldDrift, MultipleIssues.
@@ -29,7 +30,7 @@ export function ConditionsTable({ conditions }) {
             <Table.Th w={90}>Status</Table.Th>
             <Table.Th w={170}>Reason</Table.Th>
             <Table.Th>Message</Table.Th>
-            <Table.Th w={120}>Since</Table.Th>
+            <Table.Th w={150}>Since</Table.Th>
           </Table.Tr>
         </Table.Thead>
         <Table.Tbody>
@@ -37,9 +38,10 @@ export function ConditionsTable({ conditions }) {
             <Table.Tr key={condition.type}>
               <Table.Td fw={500}>{condition.type}</Table.Td>
               <Table.Td>
-                <Badge color={conditionColor(condition.type, condition.status)} size="sm">
-                  {condition.status}
-                </Badge>
+                <Pill
+                  tone={conditionTone(condition.type, condition.status)}
+                  label={condition.status}
+                />
               </Table.Td>
               <Table.Td>
                 <Text fz="xs" ff="monospace" className="pgop-wrap">

@@ -3,7 +3,6 @@ name: ci
 on:
   push:
     branches: [main]
-    # Publishes semver-tagged images; drop this if you only want main + sha.
     tags: ["v*"]
   pull_request:
 
@@ -11,15 +10,13 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# Read-only by default; the image job widens it to publish packages.
 permissions:
   contents: read
 
 env:
   UV_VERSION: "0.12.10"
   REGISTRY: ghcr.io
-  # ghcr.io/<owner>/<repo> and ghcr.io/<owner>/<repo>-ui, so the names follow
-  # the repository wherever it is forked or renamed.
+  # ghcr.io/<owner>/<repo> and ghcr.io/<owner>/<repo>-ui
   IMAGE_NAME: ${{ github.repository }}
   UI_IMAGE_NAME: ${{ github.repository }}-ui
 
@@ -122,8 +119,6 @@ jobs:
             --set 'instances.prod.host=prod.rds.amazonaws.com' \
             --set 'instances.prod.credentialsSecretRef.name=prod-super'
       - name: Render the dashboard's ingress
-        # Separate from the render above: ui.ingress and api.ingress both claim
-        # "/" on the same host, so the chart refuses to render them together.
         run: |
           helm template test charts/pg-operator --namespace pg-operator \
             --set ui.ingress.enabled=true \
@@ -207,9 +202,6 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: The dashboard serves read-only as uid 65532
-        # The pod runs this container with readOnlyRootFilesystem and
-        # runAsUser 65532, so nginx has to start with every writable path
-        # under an in-memory /tmp. That fails loudly, and only here.
         run: |
           docker run -d --name ui --read-only --user 65532:65532 \
             --tmpfs /tmp -p 8081:8081 pg-operator-ui:ci
@@ -241,13 +233,7 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/readyz)" = "503"
           docker rm -f api
 
-      # --- publish ------------------------------------------------------
-      # Deliberately last: every assertion above has to pass before either
-      # image is pushed, so a broken dashboard cannot ship an operator image
-      # alongside it. Nothing is pushed for a pull request - a fork's
-      # GITHUB_TOKEN has no packages:write, and an unreviewed branch should not
-      # be able to publish. The tags are still computed above so the metadata
-      # step itself is exercised on every run.
+      # --- publish ----
       - name: Log in to ${{ env.REGISTRY }}
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
@@ -256,10 +242,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # These two re-run the same builds, which is nearly free: every layer is
-      # already in the gha cache from the steps above, so this only exports and
-      # uploads. Building once with `load` and `push` together would skip the
-      # cache export the test steps depend on.
       - name: Push the operator image
         uses: docker/build-push-action@v7
         with:
@@ -285,9 +267,6 @@ jobs:
       - name: Summarise what was published
         if: github.event_name != 'pull_request'
         env:
-          # Passed through the environment rather than interpolated into the
-          # script: `${{ }}` is substituted before the shell sees it, so a ref
-          # containing shell metacharacters would otherwise be executed.
           OPERATOR_TAGS: ${{ steps.meta.outputs.tags }}
           UI_TAGS: ${{ steps.meta-ui.outputs.tags }}
         run: |

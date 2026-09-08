@@ -1,7 +1,8 @@
-import { Card, Group, Text, Title, UnstyledButton } from '@mantine/core'
+import { Card, Group, Text, UnstyledButton } from '@mantine/core'
 import { useNavigate } from 'react-router-dom'
 
-import { COUNTS, phaseColor } from '../lib/phase'
+import { COUNTS, phaseTone } from '../lib/phase'
+import { Pill } from './Pill'
 
 /**
  * A kind's phase breakdown. Every non-zero phase is a link into the matching
@@ -12,14 +13,21 @@ export function PhaseSummaryCard({ title, icon, counts, to }) {
   const shown = COUNTS.filter(({ key }) => counts?.[key] > 0)
 
   return (
-    <Card className="pgop-tile" onClick={() => navigate(to)} role="link" tabIndex={0}
-      onKeyDown={(event) => event.key === 'Enter' && navigate(to)}>
+    <Card
+      className="pgop-tile"
+      onClick={() => navigate(to)}
+      role="link"
+      tabIndex={0}
+      onKeyDown={(event) => event.key === 'Enter' && navigate(to)}
+    >
       <Group justify="space-between" align="flex-start" wrap="nowrap">
-        <Group gap="xs">
-          {icon}
-          <Title order={6}>{title}</Title>
+        <Group gap="xs" wrap="nowrap">
+          <span className="pgop-kind-icon">{icon}</span>
+          <Text fz="md" fw={600}>
+            {title}
+          </Text>
         </Group>
-        <Text fz="2xl" fw={600} className="pgop-numeric" lh={1}>
+        <Text component="span" className="pgop-total">
           {counts?.total ?? 0}
         </Text>
       </Group>
@@ -29,19 +37,22 @@ export function PhaseSummaryCard({ title, icon, counts, to }) {
           shown.map(({ key, label, phase }) => (
             <UnstyledButton
               key={key}
+              title={`Show only ${label.toLowerCase()} ${title.toLowerCase()}`}
               onClick={(event) => {
                 event.stopPropagation()
                 navigate(`${to}?phase=${phase}`)
               }}
             >
-              <Group gap={6} wrap="nowrap">
-                <Text fz="sm" fw={600} className="pgop-numeric" c={phaseColor(phase)}>
-                  {counts[key]}
-                </Text>
-                <Text fz="xs" c="dimmed">
-                  {label}
-                </Text>
-              </Group>
+              <Pill
+                tone={phaseTone(phase)}
+                size="md"
+                label={
+                  <span style={{ display: 'inline-flex', gap: 6, alignItems: 'baseline' }}>
+                    <span className="pgop-numeric">{counts[key]}</span>
+                    <span style={{ fontWeight: 500, opacity: 0.85 }}>{label}</span>
+                  </span>
+                }
+              />
             </UnstyledButton>
           ))
         ) : (

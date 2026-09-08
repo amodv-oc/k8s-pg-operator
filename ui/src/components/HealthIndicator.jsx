@@ -1,7 +1,14 @@
-import { Badge, Group, Popover, Stack, Text } from '@mantine/core'
+import { Group, Popover, Stack, Text } from '@mantine/core'
 import { IconCircleCheck, IconCircleX } from '@tabler/icons-react'
 
 import { useHealth } from '../lib/queries'
+import { Pill } from './Pill'
+
+/** The tone a readyz answer reads in: healthy, degraded, or not yet known. */
+function healthTone(data) {
+  if (!data) return 'Unknown'
+  return data.status === 'ok' ? 'Ready' : 'Failed'
+}
 
 /**
  * `/readyz`, which is ready only when the Kubernetes API answers *and* all
@@ -16,31 +23,31 @@ export function HealthIndicator() {
   return (
     <Popover width={340} position="bottom-end" withArrow shadow="md">
       <Popover.Target>
-        <Badge
-          color={data ? (ok ? 'emerald' : 'red') : 'zinc'}
-          variant="light"
+        <Pill
+          tone={healthTone(data)}
           style={{ cursor: 'pointer' }}
           leftSection={ok ? <IconCircleCheck size={13} /> : <IconCircleX size={13} />}
-        >
-          API {label}
-        </Badge>
+          label={`API ${label}`}
+        />
       </Popover.Target>
       <Popover.Dropdown>
         <Stack gap="xs">
           <Group justify="space-between">
             <Text fz="sm">Kubernetes API</Text>
-            <Badge color={data?.kubernetes ? 'emerald' : 'red'} size="sm">
-              {data?.kubernetes ? 'reachable' : 'unreachable'}
-            </Badge>
+            <Pill
+              tone={data?.kubernetes ? 'Ready' : 'Failed'}
+              label={data?.kubernetes ? 'reachable' : 'unreachable'}
+            />
           </Group>
           {Object.entries(data?.crds ?? {}).map(([plural, installed]) => (
             <Group key={plural} justify="space-between">
               <Text fz="sm" ff="monospace">
                 {plural}
               </Text>
-              <Badge color={installed ? 'emerald' : 'red'} size="sm">
-                {installed ? 'installed' : 'missing'}
-              </Badge>
+              <Pill
+                tone={installed ? 'Ready' : 'Failed'}
+                label={installed ? 'installed' : 'missing'}
+              />
             </Group>
           ))}
           {data?.detail && (

@@ -1,16 +1,19 @@
-import { Anchor, Badge, Code, Grid, Text } from '@mantine/core'
+import { Anchor, Code, Grid, Text } from '@mantine/core'
 import { Link, useParams } from 'react-router-dom'
 
 import { ConditionsTable } from '../components/ConditionsTable'
 import { DetailGrid } from '../components/DetailGrid'
 import { ErrorState } from '../components/ErrorState'
 import { GrantsTable } from '../components/GrantsTable'
+import { Page } from '../components/Page'
 import { PageHeader } from '../components/PageHeader'
 import { Panel } from '../components/Panel'
 import { PhaseBadge } from '../components/PhaseBadge'
+import { Pill } from '../components/Pill'
 import { RelativeTime } from '../components/RelativeTime'
 import { SecretPanel } from '../components/SecretPanel'
 import { TableSkeleton } from '../components/TableSkeleton'
+import { retentionTone } from '../lib/phase'
 import { useUser } from '../lib/queries'
 
 export function UserDetail() {
@@ -21,31 +24,32 @@ export function UserDetail() {
 
   if (isError) {
     return (
-      <>
-        <PageHeader title={name} crumbs={crumbs} />
+      <Page>
+        <PageHeader title={name} crumbs={crumbs} mono />
         <ErrorState error={error} />
-      </>
+      </Page>
     )
   }
   if (isPending || !user) {
     return (
-      <>
-        <PageHeader title={name} crumbs={crumbs} />
+      <Page>
+        <PageHeader title={name} crumbs={crumbs} mono />
         <TableSkeleton rows={6} />
-      </>
+      </Page>
     )
   }
 
   return (
-    <>
+    <Page>
       <PageHeader
         title={user.name}
         crumbs={crumbs}
-        badge={<PhaseBadge phase={user.phase} size="md" />}
+        mono
+        badge={<PhaseBadge phase={user.phase} size="lg" />}
         subtitle={user.message}
         actions={
-          <Text fz="xs" c="dimmed">
-            reconciled <RelativeTime value={user.last_reconciled_at} fz="xs" c="dimmed" />
+          <Text fz="sm" c="dimmed">
+            reconciled <RelativeTime value={user.last_reconciled_at} fz="sm" c="dimmed" />
           </Text>
         }
       />
@@ -69,20 +73,20 @@ export function UserDetail() {
                 {
                   label: 'Login',
                   value: (
-                    <Badge color={user.login ? 'emerald' : 'zinc'}>
-                      {user.login ? 'LOGIN' : 'NOLOGIN'}
-                    </Badge>
+                    <Pill
+                      tone={user.login ? 'Ready' : 'Unknown'}
+                      label={user.login ? 'LOGIN' : 'NOLOGIN'}
+                    />
                   ),
                 },
                 {
                   label: 'Retention',
                   value: user.retention_policy && (
-                    <Badge
-                      color={user.retention_policy === 'DROP' ? 'red' : 'slate'}
+                    <Pill
+                      tone={retentionTone(user.retention_policy)}
                       variant="outline"
-                    >
-                      {user.retention_policy}
-                    </Badge>
+                      label={user.retention_policy}
+                    />
                   ),
                 },
                 {
@@ -118,6 +122,6 @@ export function UserDetail() {
           </Panel>
         </Grid.Col>
       </Grid>
-    </>
+    </Page>
   )
 }

@@ -1,7 +1,8 @@
-import { Badge, Group, Table, Text, Tooltip } from '@mantine/core'
+import { Group, Table, Text } from '@mantine/core'
 
 import { schemaRows, STATE_META } from '../lib/resources'
 import { NoRows } from './NoRows'
+import { Pill } from './Pill'
 
 /**
  * What the operator holds on each schema, read back from the server.
@@ -38,17 +39,14 @@ export function SchemaTable({ database }) {
                 </Table.Td>
                 <Table.Td>
                   <Group gap={6} wrap="nowrap">
-                    <Tooltip label={meta.hint} multiline maw={320}>
-                      <Badge color={meta.color} size="sm">
-                        {meta.label}
-                      </Badge>
-                    </Tooltip>
+                    <Pill tone={meta.tone} label={meta.label} message={meta.hint} />
                     {row.unowned && row.state !== 'unowned' && (
-                      <Tooltip label={STATE_META.unowned.hint} multiline maw={320}>
-                        <Badge color={STATE_META.unowned.color} size="sm" variant="outline">
-                          unowned
-                        </Badge>
-                      </Tooltip>
+                      <Pill
+                        tone={STATE_META.unowned.tone}
+                        label="unowned"
+                        message={STATE_META.unowned.hint}
+                        variant="outline"
+                      />
                     )}
                   </Group>
                 </Table.Td>
@@ -56,9 +54,7 @@ export function SchemaTable({ database }) {
                   {row.grants.length ? (
                     <Group gap={6}>
                       {row.grants.map((grant) => (
-                        <Badge key={grant} color="slate" size="sm" variant="outline" ff="monospace">
-                          {grant}
-                        </Badge>
+                        <Pill key={grant} tone="RO" label={grant} variant="outline" ff="monospace" />
                       ))}
                     </Group>
                   ) : (
