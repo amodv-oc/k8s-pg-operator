@@ -120,6 +120,50 @@ def test_labels_and_annotations_are_merged() -> None:
     assert body["metadata"]["annotations"]["note"] == "generated"
 
 
+def test_data_entries_carry_no_metadata_unless_configured() -> None:
+    """Omitted, not empty: an unused envelope would be drift on every entry."""
+    assert all("metadata" not in entry for entry in _build()["spec"]["data"])
+
+
+def test_provider_metadata_is_wrapped_in_a_pushsecretmetadata_envelope() -> None:
+    spec = PushSecretSpec.model_validate(
+        {
+            "secretStoreRefs": [{"name": "aws-sm"}],
+            "metadata": {
+                "secretPushFormat": "string",
+                "description": "managed by pg-operator",
+                "tags": {"env": "prod"},
+            },
+        }
+    )
+    data = _build(spec)["spec"]["data"]
+    assert data, "expected one entry per pushed key"
+    for entry in data:
+        assert entry["metadata"] == {
+            "apiVersion": "kubernetes.external-secrets.io/v1alpha1",
+            "kind": "PushSecretMetadata",
+            # Passed through verbatim: only the provider knows this shape.
+            "spec": {
+                "secretPushFormat": "string",
+                "description": "managed by pg-operator",
+                "tags": {"env": "prod"},
+            },
+        }
+
+
+def test_metadata_is_copied_per_entry_and_not_shared_with_the_spec() -> None:
+    """Entries must not alias each other, or the CR's own metadata dict."""
+    source = {"tags": {"env": "prod"}}
+    spec = PushSecretSpec.model_validate(
+        {"secretStoreRefs": [{"name": "aws-sm"}], "metadata": source}
+    )
+    data = _build(spec)["spec"]["data"]
+    data[0]["metadata"]["spec"]["tags"]["env"] = "mutated"
+    assert data[1]["metadata"]["spec"]["tags"]["env"] == "prod"
+    assert spec.metadata["tags"]["env"] == "prod"
+    assert source == {"tags": {"env": "prod"}}
+
+
 @pytest.mark.parametrize(
     ("template", "expected"),
     [

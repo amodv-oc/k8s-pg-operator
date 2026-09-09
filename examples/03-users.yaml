@@ -90,6 +90,14 @@ spec:
     updatePolicy: Replace
     # Leave the remote value alone if the PushSecret goes away.
     deletionPolicy: None
+    # Provider-specific options, wrapped in a PushSecretMetadata by the
+    # operator and passed through as written (AWS Secrets Manager shape here).
+    metadata:
+      secretPushFormat: string
+      description: orders-worker credentials managed by pg-operator
+      tags:
+        env: prod
+        team: team-a
 ---
 # --- bring your own password ----------------------------------------------
 # For a credential an external system already owns. The operator reads this

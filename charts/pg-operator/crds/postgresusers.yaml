@@ -266,6 +266,15 @@ spec:
                     annotations:
                       type: object
                       additionalProperties: { type: string }
+                    metadata:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                      description: >-
+                        Provider-specific push options, emitted as the spec of a
+                        PushSecretMetadata on every data entry. The shape is
+                        defined by the external-secrets provider (for AWS Secrets
+                        Manager: secretPushFormat, description, tags, kmsKeyID)
+                        and is passed through unvalidated.
                 paused:
                   type: boolean
                   default: false

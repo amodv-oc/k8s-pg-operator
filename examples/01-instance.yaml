@@ -46,6 +46,14 @@ spec:
         kind: ClusterSecretStore
     remoteRefKey: rds/prod/{{ .namespace }}/{{ .name }}
     deletionPolicy: None
+    # Provider-specific options, emitted as a PushSecretMetadata on every data
+    # entry and passed through unvalidated. These are the AWS Secrets Manager
+    # fields; Vault and GCP take a different shape.
+    metadata:
+      secretPushFormat: string
+      description: PostgreSQL credentials managed by pg-operator
+      tags:
+        env: prod
 ---
 # A second instance sharing one server across environments. rolePrefix keeps the
 # generated group role names from colliding with the instance above.

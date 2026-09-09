@@ -13,10 +13,16 @@ external-secrets 0.14; the emitted body is compatible with both.
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import Any
 
 from ..config import Settings
-from ..constants import PUSHSECRET_KIND, PUSHSECRET_PLURAL
+from ..constants import (
+    PUSHSECRET_KIND,
+    PUSHSECRET_METADATA_API_VERSION,
+    PUSHSECRET_METADATA_KIND,
+    PUSHSECRET_PLURAL,
+)
 from ..models import PushSecretSpec
 from .client import K8sClient, is_not_found, merge_patch
 
@@ -46,6 +52,45 @@ def render_remote_key(template: str, *, namespace: str, name: str, username: str
     )
 
 
+def build_push_secret_metadata(spec: PushSecretSpec) -> dict[str, Any] | None:
+    """Wrap ``pushSecret.metadata`` in a PushSecretMetadata envelope.
+
+    external-secrets reads this document with the *provider's* decoder, so the
+    body is passed through exactly as written — validating it here would mean
+    encoding one provider's schema into a provider-agnostic operator. Returns
+    ``None`` when nothing was configured, so the emitted body keeps its
+    previous shape and steady state stays a no-op.
+    """
+    if not spec.metadata:
+        return None
+    return {
+        "apiVersion": PUSHSECRET_METADATA_API_VERSION,
+        "kind": PUSHSECRET_METADATA_KIND,
+        "spec": deepcopy(spec.metadata),
+    }
+
+
+def _data_entry(
+    key: str, *, remote_key: str, metadata: dict[str, Any] | None
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "match": {
+            "secretKey": key,
+            "remoteRef": {
+                "remoteKey": remote_key,
+                # One remote object per Secret, with each Kubernetes key as a
+                # property inside it.
+                "property": key,
+            },
+        }
+    }
+    if metadata is not None:
+        # Every entry targets the same remote object, so they must carry the
+        # same metadata — external-secrets applies it per push.
+        entry["metadata"] = deepcopy(metadata)
+    return entry
+
+
 def build_push_secret(
     spec: PushSecretSpec,
     *,
@@ -59,6 +104,7 @@ def build_push_secret(
 ) -> dict[str, Any]:
     """Build the PushSecret body that mirrors one credentials Secret."""
     keys = spec.keys or secret_keys
+    metadata = build_push_secret_metadata(spec)
     body: dict[str, Any] = {
         "apiVersion": api_version,
         "kind": PUSHSECRET_KIND,
@@ -76,17 +122,7 @@ def build_push_secret(
             ],
             "selector": {"secret": {"name": source_secret}},
             "data": [
-                {
-                    "match": {
-                        "secretKey": key,
-                        "remoteRef": {
-                            "remoteKey": remote_key,
-                            # One remote object per Secret, with each Kubernetes
-                            # key as a property inside it.
-                            "property": key,
-                        },
-                    }
-                }
+                _data_entry(key, remote_key=remote_key, metadata=metadata)
                 for key in keys
             ],
         },

@@ -45,3 +45,10 @@ COND_DRIFTED: Final = "Drifted"
 # chart can target either external-secrets.io/v1 (>= 0.14) or v1alpha1.
 PUSHSECRET_KIND: Final = "PushSecret"
 PUSHSECRET_PLURAL: Final = "pushsecrets"
+
+# Provider-specific push options travel inside each data entry as an embedded
+# PushSecretMetadata document. The shape of its `spec` is decided by the
+# provider (AWS Secrets Manager, Vault, GCP, ...), so the operator only supplies
+# the envelope and passes the body through untouched.
+PUSHSECRET_METADATA_API_VERSION: Final = "kubernetes.external-secrets.io/v1alpha1"
+PUSHSECRET_METADATA_KIND: Final = "PushSecretMetadata"

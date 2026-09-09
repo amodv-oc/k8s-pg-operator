@@ -232,7 +232,22 @@ pushSecret:
   remoteRefKey: rds/prod/{{ .namespace }}/{{ .name }}
   keys: [username, password, host, port, database]
   deletionPolicy: None
+  metadata:
+    secretPushFormat: string
+    description: managed by pg-operator
+    tags:
+      env: prod
 ```
+
+`metadata` carries provider-specific push options. The operator wraps it in the
+envelope external-secrets expects — `apiVersion:
+kubernetes.external-secrets.io/v1alpha1`, `kind: PushSecretMetadata` — and
+emits it as the `metadata` of every data entry, but passes the body through
+unvalidated: the fields above are the AWS Secrets Manager set, while Vault
+takes `customMetadata` and GCP takes `annotations`/`labels`. Only the
+external-secrets provider knows which is which, and encoding that here would
+put provider logic back into an operator that deliberately has none. Omitting
+`metadata` omits the envelope entirely.
 
 `deletionPolicy: None` (the default) matches `RETAIN`: removing the resource
 does not destroy the remote value. The API version is a chart value

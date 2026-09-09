@@ -110,6 +110,11 @@ class PushSecretSpec(Spec):
     annotations: dict[str, str] = Field(default_factory=dict)
     #: Restrict which Secret keys are pushed. Empty means all managed keys.
     keys: list[str] = Field(default_factory=list)
+    #: Provider-specific push options (AWS Secrets Manager tags and
+    #: description, Vault customMetadata, ...). Passed through verbatim as the
+    #: ``spec`` of the PushSecretMetadata embedded in every data entry, because
+    #: only the external-secrets provider knows what belongs here.
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _require_store_when_enabled(self) -> Self:
