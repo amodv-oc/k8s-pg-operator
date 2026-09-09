@@ -6,6 +6,7 @@ conditions, events and metrics behave identically for all three kinds.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -18,6 +19,7 @@ from ..config import get_settings
 from ..errors import (
     ConfigurationError,
     ConnectionFailure,
+    InstanceNotFound,
     OperatorError,
     ReconcileFailure,
     ReferenceNotFound,
@@ -93,19 +95,23 @@ async def run_reconcile(
     name = str(meta.get("name"))
     namespace = meta.get("namespace")
     labels = (kind, namespace or "-", name)
+    ctx = context()
     started = time.monotonic()
 
-    try:
-        message, status = await reconcile()
-    except Exception as exc:
-        RECONCILE_TOTAL.labels(kind=kind, outcome="failure").inc()
-        RECONCILE_DURATION.labels(kind=kind).observe(time.monotonic() - started)
-        RESOURCE_READY.labels(*labels).set(0)
-        logger.error("reconcile failed: %s", exc)
-        await _publish_failure(kind, plural, body, exc)
-        raise as_kopf_error(exc) from exc
+    # One pass at a time per resource: the periodic timer and the change
+    # handler are independent kopf tasks and would otherwise overlap.
+    async with ctx.locks.hold(kind, namespace, name):
+        try:
+            message, status = await reconcile()
+        except Exception as exc:
+            RECONCILE_TOTAL.labels(kind=kind, outcome="failure").inc()
+            RECONCILE_DURATION.labels(kind=kind).observe(time.monotonic() - started)
+            RESOURCE_READY.labels(*labels).set(0)
+            logger.error("reconcile failed: %s", exc)
+            await _publish_failure(kind, plural, body, exc)
+            raise as_kopf_error(exc) from exc
 
-    await patch_status(context().k8s, plural, name, status, namespace)
+        await patch_status(ctx.k8s, plural, name, status, namespace)
     RECONCILE_TOTAL.labels(kind=kind, outcome="success").inc()
     RECONCILE_DURATION.labels(kind=kind).observe(time.monotonic() - started)
     RESOURCE_READY.labels(*labels).set(1 if status.get("phase") in {"Ready", "Drifted"} else 0)
@@ -129,23 +135,57 @@ async def run_teardown(
     teardown: Callable[[], Awaitable[str]],
 ) -> str:
     """Run a finalizer, mapping errors so a stuck delete is visible, not silent."""
+    meta = body.get("metadata") or {}
+    name = str(meta.get("name"))
+    namespace = meta.get("namespace")
     try:
-        message = await teardown()
-    except (ConfigurationError, ReferenceNotFound) as exc:
-        # The instance is gone, or the spec cannot be parsed: there is nothing
-        # left to act on. Release the finalizer rather than wedging the delete
-        # on a resource that can never be cleaned up.
-        TEARDOWN_TOTAL.labels(kind=kind, outcome="skipped").inc()
-        logger.warning("releasing finalizer without cleanup: %s", exc)
-        return f"cleanup skipped: {exc}"
+        async with context().locks.hold(kind, namespace, name):
+            message = await teardown()
+    except InstanceNotFound as exc:
+        # The instance is gone: there is nothing left to act on. Release the
+        # finalizer rather than wedging the delete on a resource that can never
+        # be cleaned up.
+        return _skip_teardown(kind, namespace, name, logger, exc)
+    except ReferenceNotFound as exc:
+        # Some *other* reference is missing - typically the instance's
+        # credentials Secret. That is a temporary condition, and releasing the
+        # finalizer over it would leave a DROP-policy role live on the server
+        # with nothing left tracking it. Retry instead.
+        TEARDOWN_TOTAL.labels(kind=kind, outcome="failure").inc()
+        logger.error("cleanup failed: %s", exc)
+        raise as_kopf_error(exc) from exc
+    except ConfigurationError as exc:
+        # The spec cannot be parsed or the namespace is not permitted: no
+        # retry can change that, so the delete must be allowed to complete.
+        return _skip_teardown(kind, namespace, name, logger, exc)
     except Exception as exc:
         TEARDOWN_TOTAL.labels(kind=kind, outcome="failure").inc()
         logger.error("cleanup failed: %s", exc)
         raise as_kopf_error(exc) from exc
 
     TEARDOWN_TOTAL.labels(kind=kind, outcome="success").inc()
+    _forget_resource_metrics(kind, namespace, name)
     logger.info(message)
     return message
+
+
+def _skip_teardown(
+    kind: str, namespace: str | None, name: str, logger: Any, exc: BaseException
+) -> str:
+    TEARDOWN_TOTAL.labels(kind=kind, outcome="skipped").inc()
+    _forget_resource_metrics(kind, namespace, name)
+    logger.warning("releasing finalizer without cleanup: %s", exc)
+    return f"cleanup skipped: {exc}"
+
+
+def _forget_resource_metrics(kind: str, namespace: str | None, name: str) -> None:
+    """Drop a deleted resource's per-resource gauge.
+
+    Without this every resource that ever existed stays in the metrics output
+    forever, reported as not-ready, and the label cardinality grows unbounded.
+    """
+    with contextlib.suppress(KeyError):
+        RESOURCE_READY.remove(kind, namespace or "-", name)
 
 
 async def _publish_failure(
@@ -157,9 +197,18 @@ async def _publish_failure(
     meta = body.get("metadata") or {}
     generation = int(meta.get("generation") or 0)
     reason = type(exc).__name__.removesuffix("Error") or "ReconcileFailed"
+    updates = [st.not_ready(reason, str(exc), generation)]
+    if isinstance(exc, ConnectionFailure):
+        # Without this the Reachable condition keeps saying "Connected" from
+        # the last good pass and the phase reads Failed instead of Unreachable,
+        # which sends the reader looking for a bug in the spec rather than at
+        # the network or the credentials.
+        updates = [
+            st.not_ready("ConnectionFailed", str(exc), generation),
+            st.unreachable("ConnectionFailed", str(exc), generation),
+        ]
     conditions = st.merge_conditions(
-        (body.get("status") or {}).get("conditions"),
-        [st.not_ready(reason, str(exc), generation)],
+        (body.get("status") or {}).get("conditions"), updates
     )
     payload = {
         "observedGeneration": generation,

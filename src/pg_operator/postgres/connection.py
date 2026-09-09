@@ -20,7 +20,7 @@ from pathlib import Path
 
 import psycopg
 from psycopg import AsyncConnection
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from ..config import Settings, get_settings
 from ..errors import ConnectionFailure
@@ -152,14 +152,46 @@ class PoolRegistry:
         """Check out a connection to ``dbname`` (default: the maintenance database)."""
         target = dbname or endpoint.maintenance_database
         pool = await self._pool(endpoint, target)
+        acquired = False
         try:
             async with pool.connection() as conn:
+                acquired = True
                 yield conn
         except psycopg.OperationalError as exc:
+            if acquired:
+                # Raised by the caller's own statements, not by connecting;
+                # reporting it as a connection failure would misdirect the fix.
+                raise
+            detail = _terse(exc)
+            if isinstance(exc, PoolTimeout):
+                # The pool retries in the background and, when it gives up,
+                # says only that it ran out of time. The libpq error that
+                # explains *why* - a bad password, a missing database, a
+                # rejected certificate - is logged by the pool at warning level
+                # and never reaches the caller. Ask the server once, directly,
+                # so the status condition names the actual cause.
+                detail = await self._diagnose(endpoint, target) or detail
             raise ConnectionFailure(
                 f"cannot connect to {endpoint.host}:{endpoint.port}/{target} "
-                f"as {endpoint.username}: {_terse(exc)}"
+                f"as {endpoint.username}: {detail}"
             ) from exc
+
+    async def _diagnose(self, endpoint: Endpoint, dbname: str) -> str | None:
+        """One direct connection attempt, returning libpq's error text if it fails."""
+        conninfo = endpoint.conninfo(
+            dbname,
+            statement_timeout_ms=self._settings.statement_timeout_ms,
+            app_name=self._settings.application_name,
+        )
+        try:
+            conn = await AsyncConnection.connect(conninfo)
+        except psycopg.OperationalError as exc:
+            return _terse(exc)
+        except Exception:  # noqa: BLE001 - diagnostics must not mask the original error
+            return None
+        # The server answered after all: the pool was merely slow or saturated.
+        await conn.close()
+        return None
 
     async def close_database(self, instance: str, dbname: str) -> None:
         """Drop the pool for one database — required before DROP DATABASE."""

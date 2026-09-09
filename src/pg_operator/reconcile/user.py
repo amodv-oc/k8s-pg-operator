@@ -130,13 +130,10 @@ async def reconcile_user(
     name = str(meta.get("name"))
     existing_status = obj.get("status") or {}
 
-    try:
-        spec = parse_user_spec(obj.get("spec") or {})
-    except Exception as exc:
-        raise ConfigurationError(f"invalid spec: {exc}") from exc
+    spec = _parse_spec(obj)
+    username = _derive_username(spec, name)
 
     instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)
-    username = spec.resolve_username(name)
     retention = effective_retention(spec.retention_policy, instance.spec.retention_policy)
 
     result = UserResult(username=username, retention=retention)
@@ -178,10 +175,29 @@ async def reconcile_user(
         result.changes.extend(param_changes)
 
     # -- kubernetes ---------------------------------------------------------
-    await _write_credentials(ctx, spec, instance, result, password)
+    await _write_credentials(ctx, spec, instance, namespace, name, result, password)
     await _sync_push_secret(ctx, spec, instance, namespace, name, result)
 
     return result, instance
+
+
+def _parse_spec(obj: dict[str, Any]) -> UserSpec:
+    try:
+        return parse_user_spec(obj.get("spec") or {})
+    except Exception as exc:
+        raise ConfigurationError(f"invalid spec: {exc}") from exc
+
+
+def _derive_username(spec: UserSpec, resource_name: str) -> str:
+    """The login role name, or a configuration error if none can be derived.
+
+    A resource name that sanitises to nothing, or to a reserved ``pg_`` name,
+    can never be created; reporting it as misconfiguration beats retrying it.
+    """
+    try:
+        return spec.resolve_username(resource_name)
+    except ValueError as exc:
+        raise ConfigurationError(f"invalid spec: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -202,10 +218,31 @@ async def _resolve_grants(
     user believing they had access they do not have.
     """
     grants: list[Grant] = []
+    seen: set[tuple[str, str]] = set()
     for access in spec.access:
         ref_namespace = access.db_ref.resolve_namespace(namespace)
+        # The model validator catches literal duplicates, but a reference with
+        # the namespace spelled out and one relying on the default are the same
+        # database and only become comparable once resolved.
+        if (ref_namespace, access.db_ref.name) in seen:
+            raise ConfigurationError(
+                f"spec.access lists PostgresDB {ref_namespace}/{access.db_ref.name} "
+                "more than once; a user holds exactly one access level per database"
+            )
+        seen.add((ref_namespace, access.db_ref.name))
+
         db_obj = await get_database_cr(ctx.k8s, ref_namespace, access.db_ref.name)
-        db_spec = parse_database_spec(db_obj.get("spec") or {})
+        try:
+            db_spec = parse_database_spec(db_obj.get("spec") or {})
+            database = db_spec.resolve_database_name(str(db_obj["metadata"]["name"]))
+            group_roles = GroupRoles.from_mapping(
+                db_spec.resolve_role_names(database, instance.spec.role_prefix)
+            )
+        except ValueError as exc:
+            raise ConfigurationError(
+                f"PostgresDB {ref_namespace}/{access.db_ref.name} has an invalid "
+                f"spec: {exc}"
+            ) from exc
 
         if db_spec.instance_ref.name != spec.instance_ref.name:
             raise ConfigurationError(
@@ -213,11 +250,6 @@ async def _resolve_grants(
                 f"{db_spec.instance_ref.name!r} but this user targets "
                 f"{spec.instance_ref.name!r}; a grant cannot span instances"
             )
-
-        database = db_spec.resolve_database_name(str(db_obj["metadata"]["name"]))
-        group_roles = GroupRoles.from_mapping(
-            db_spec.resolve_role_names(database, instance.spec.role_prefix)
-        )
         grants.append(
             Grant(
                 database=database,
@@ -393,6 +425,8 @@ async def _write_credentials(
     ctx: ReconcileContext,
     spec: UserSpec,
     instance: ResolvedInstance,
+    namespace: str,
+    name: str,
     result: UserResult,
     password: str,
 ) -> None:
@@ -412,10 +446,13 @@ async def _write_credentials(
     data = {spec.secret_key(key): value for key, value in logical.items()}
     result.secret_keys = sorted(data)
 
+    # The owner labels name the PostgresUser, not the role or the Secret's own
+    # namespace: they are what leads from a Secret in another namespace back to
+    # the resource that produced it, and what a label selector matches on.
     labels = managed_labels(
         owner_kind=KIND_USER,
-        owner_name=result.username,
-        owner_namespace=result.secret_namespace,
+        owner_name=name,
+        owner_namespace=namespace,
         instance=instance.name,
         extra=spec.generated_secret.labels,
     )
@@ -542,20 +579,27 @@ async def teardown_user(ctx: ReconcileContext, obj: dict[str, Any]) -> str:
     namespace = str(meta.get("namespace"))
     name = str(meta.get("name"))
     existing_status = obj.get("status") or {}
-    spec = parse_user_spec(obj.get("spec") or {})
-
-    instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)
-    username = spec.resolve_username(name)
-    retention = effective_retention(spec.retention_policy, instance.spec.retention_policy)
+    spec = _parse_spec(obj)
+    username = _derive_username(spec, name)
     secret_namespace = spec.resolve_secret_namespace(namespace)
     secret_name = spec.resolve_secret_name(name)
+
+    # Decide the policy from the specs alone. A RETAIN teardown touches nothing
+    # on the server, so it must complete even while the server is unreachable
+    # or its credentials Secret is missing.
+    instance_spec, _ = await ctx.load_instance_spec(
+        spec.instance_ref.name, for_namespace=namespace
+    )
+    retention = effective_retention(spec.retention_policy, instance_spec.retention_policy)
 
     if retention != DROP:
         log.info("retention policy RETAIN: leaving role %s in place", username)
         return (
             f"retained role {username} and Secret {secret_namespace}/{secret_name} "
-            f"on {instance.display}"
+            f"on {instance_spec.host}:{instance_spec.port}"
         )
+
+    instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)
 
     databases = sorted(
         {

@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .constants import ACCESS_OWNER, ACCESS_RO, ACCESS_RW, DROP, RETAIN
 from .naming import (
     group_role_names,
+    reject_reserved_role_prefix,
     sanitize_identifier,
     secret_name,
     validate_identifier,
@@ -407,7 +408,9 @@ class UserSpec(Spec):
     def resolve_username(self, resource_name: str) -> str:
         if self.username:
             return self.username
-        return sanitize_identifier(resource_name, kind="username")
+        return reject_reserved_role_prefix(
+            sanitize_identifier(resource_name, kind="username"), kind="username"
+        )
 
     def resolve_secret_name(self, resource_name: str) -> str:
         return self.generated_secret.name or secret_name(resource_name)

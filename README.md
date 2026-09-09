@@ -158,6 +158,10 @@ Synced   False   ImmutableFieldDrift   encoding is UTF8, spec requests LATIN1
 | `PostgresUser` deleted | role and credentials Secret kept | sessions terminated, privileges cleared, role dropped, Secret and PushSecret removed |
 | `PostgresInstance` deleted | connections closed; **the server is never touched** | same — the operator does not own the server |
 
+A `RETAIN` teardown never opens a connection, so deleting a retained resource
+completes even while its server is unreachable or its credentials Secret is
+gone. A `DROP` teardown needs the server and retries until it can reach it.
+
 Two safeguards apply regardless of policy:
 
 - **Only objects the operator created are eligible.** What it manages is
@@ -530,6 +534,7 @@ is recognisable. `lastTransitionTime` only moves when the status actually flips.
 | `SchemaNotOwned` | *cannot* fix — the managing role cannot take the schema | Yes |
 | `ParameterDenied` | *cannot* fix — the managing role may not set the parameter | Yes |
 | `ImmutableFieldDrift` | *cannot* fix — PostgreSQL has no `ALTER` for the field | Yes |
+| `DefaultPrivilegesDenied` | *cannot* fix — `setRoleForOwners` is off and the managing role cannot act as an owner-group member it did not create | Yes |
 | `MultipleIssues` | more than one of the above; every cause is in the message | Yes |
 
 A cause that the operator cannot fix does not abort the pass. Schemas,
