@@ -13,6 +13,7 @@ external-secrets 0.14; the emitted body is compatible with both.
 from __future__ import annotations
 
 import logging
+import re
 from copy import deepcopy
 from typing import Any
 
@@ -23,7 +24,7 @@ from ..constants import (
     PUSHSECRET_METADATA_KIND,
     PUSHSECRET_PLURAL,
 )
-from ..models import PushSecretSpec
+from ..models import PushSecretSpec, SecretStoreRef
 from .client import K8sClient, is_not_found, merge_patch
 
 log = logging.getLogger(__name__)
@@ -70,23 +71,40 @@ def build_push_secret_metadata(spec: PushSecretSpec) -> dict[str, Any] | None:
     }
 
 
-def _data_entry(
-    key: str, *, remote_key: str, metadata: dict[str, Any] | None
+def key_match_regexp(keys: list[str]) -> str:
+    """Anchored pattern matching exactly ``keys`` and nothing else.
+
+    external-secrets tests the pattern with Go's ``regexp.MatchString``, which
+    is unanchored, so ``^(?:...)$`` is required — bare ``port`` would also
+    select a key named ``export_port``.
+    """
+    return "^(?:" + "|".join(re.escape(key) for key in keys) + ")$"
+
+
+def _data_to_entry(
+    ref: SecretStoreRef,
+    *,
+    remote_key: str,
+    keys: list[str],
+    metadata: dict[str, Any] | None,
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
-        "match": {
-            "secretKey": key,
-            "remoteRef": {
-                "remoteKey": remote_key,
-                # One remote object per Secret, with each Kubernetes key as a
-                # property inside it.
-                "property": key,
-            },
-        }
+        "storeRef": {"name": ref.name, "kind": ref.kind},
+        # A `remoteKey` on dataTo bundles every matched key into one remote
+        # object written by a single PutSecretValue. The alternative — one
+        # `data` entry per key, each with its own `remoteRef.property` — makes
+        # every key an independent read-modify-write of the *same* remote
+        # object, with no compare-and-swap. Against an eventually consistent
+        # store like AWS Secrets Manager those pushes silently lose each
+        # other's keys. See README's "One object, one write".
+        "remoteKey": remote_key,
+        # Defaulted by the CRD; emitted so a converged spec compares equal and
+        # the steady-state reconcile stays a genuine no-op.
+        "conversionStrategy": "None",
     }
+    if keys:
+        entry["match"] = {"regexp": key_match_regexp(keys)}
     if metadata is not None:
-        # Every entry targets the same remote object, so they must carry the
-        # same metadata — external-secrets applies it per push.
         entry["metadata"] = deepcopy(metadata)
     return entry
 
@@ -121,9 +139,11 @@ def build_push_secret(
                 {"name": ref.name, "kind": ref.kind} for ref in spec.secret_store_refs
             ],
             "selector": {"secret": {"name": source_secret}},
-            "data": [
-                _data_entry(key, remote_key=remote_key, metadata=metadata)
-                for key in keys
+            "dataTo": [
+                _data_to_entry(
+                    ref, remote_key=remote_key, keys=keys, metadata=metadata
+                )
+                for ref in spec.secret_store_refs
             ],
         },
     }
@@ -165,6 +185,14 @@ async def apply_push_secret(
     if existing.get("spec") == body["spec"] and _metadata_matches(existing, body):
         return False, False
 
+    spec = dict(body["spec"])
+    if (existing.get("spec") or {}).get("data") is not None:
+        # Upgrade path off the per-property layout. A JSON merge patch only
+        # deletes a field when it is explicitly null, so without this the old
+        # `data` entries would survive alongside the new `dataTo` and
+        # external-secrets would push both.
+        spec["data"] = None
+
     await merge_patch(
         k8s.custom.patch_namespaced_custom_object,
         group=group,
@@ -172,7 +200,7 @@ async def apply_push_secret(
         namespace=namespace,
         plural=PUSHSECRET_PLURAL,
         name=name,
-        body={"metadata": body["metadata"], "spec": body["spec"]},
+        body={"metadata": body["metadata"], "spec": spec},
     )
     log.info("updated PushSecret %s/%s", namespace, name)
     return False, True

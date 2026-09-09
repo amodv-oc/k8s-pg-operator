@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
+from pg_operator.config import Settings
 from pg_operator.k8s.pushsecret import (
+    apply_push_secret,
     build_push_secret,
     render_remote_key,
     split_api_version,
 )
 from pg_operator.models import PushSecretSpec
+
+from .fakes import FakeK8sClient
 
 SPEC = PushSecretSpec.model_validate(
     {
@@ -60,30 +66,75 @@ def test_body_selects_the_generated_secret() -> None:
     }
 
 
-def test_every_secret_key_becomes_a_property_of_one_remote_object() -> None:
-    data = _build()["spec"]["data"]
-    assert [entry["match"]["secretKey"] for entry in data] == [
+def test_all_keys_are_bundled_into_one_atomic_write() -> None:
+    """The whole point: one remote object, one push, no read-modify-write.
+
+    Per-key entries with `remoteRef.property` each re-read and rewrite the same
+    remote object, so against an eventually consistent store they drop each
+    other's keys.
+    """
+    spec = _build()["spec"]
+    assert "data" not in spec
+    assert len(spec["dataTo"]) == 1
+    entry = spec["dataTo"][0]
+    assert entry["remoteKey"] == "prod/team-a/orders-api"
+    assert entry["storeRef"] == {"name": "aws-sm", "kind": "ClusterSecretStore"}
+    # No `property` anywhere — that is what makes the push a single write.
+    assert "property" not in repr(entry)
+
+
+def test_keys_are_selected_by_an_anchored_pattern() -> None:
+    """Unanchored would let `port` also select `export_port`."""
+    pattern = _build()["spec"]["dataTo"][0]["match"]["regexp"]
+    assert pattern == "^(?:username|password|uri)$"
+    compiled = re.compile(pattern)
+    assert [k for k in ("username", "password", "uri") if compiled.search(k)] == [
         "username",
         "password",
         "uri",
     ]
-    # One remote object, each Kubernetes key a property inside it.
-    assert {entry["match"]["remoteRef"]["remoteKey"] for entry in data} == {
-        "prod/team-a/orders-api"
-    }
-    assert [entry["match"]["remoteRef"]["property"] for entry in data] == [
-        "username",
-        "password",
-        "uri",
-    ]
+    assert not compiled.search("export_uri")
+    assert not compiled.search("uri_args")
 
 
 def test_keys_can_be_restricted() -> None:
     spec = PushSecretSpec.model_validate(
         {"secretStoreRefs": [{"name": "aws-sm"}], "keys": ["password"]}
     )
-    data = _build(spec)["spec"]["data"]
-    assert [entry["match"]["secretKey"] for entry in data] == ["password"]
+    assert _build(spec)["spec"]["dataTo"][0]["match"]["regexp"] == "^(?:password)$"
+
+
+def test_regex_metacharacters_in_a_key_are_escaped() -> None:
+    spec = PushSecretSpec.model_validate(
+        {"secretStoreRefs": [{"name": "aws-sm"}], "keys": ["ca.crt"]}
+    )
+    pattern = _build(spec)["spec"]["dataTo"][0]["match"]["regexp"]
+    assert re.compile(pattern).search("ca.crt")
+    # The dot must not act as a wildcard.
+    assert not re.compile(pattern).search("caXcrt")
+
+
+def test_one_data_to_entry_per_store() -> None:
+    spec = PushSecretSpec.model_validate(
+        {
+            "secretStoreRefs": [
+                {"name": "aws-sm"},
+                {"name": "vault", "kind": "SecretStore"},
+            ]
+        }
+    )
+    entries = _build(spec)["spec"]["dataTo"]
+    assert [e["storeRef"]["name"] for e in entries] == ["aws-sm", "vault"]
+    assert [e["storeRef"]["kind"] for e in entries] == [
+        "ClusterSecretStore",
+        "SecretStore",
+    ]
+
+
+def test_conversion_strategy_is_emitted_so_steady_state_is_a_no_op() -> None:
+    """The CRD defaults this; omitting it means the read-back never compares
+    equal and every reconcile re-patches."""
+    assert _build()["spec"]["dataTo"][0]["conversionStrategy"] == "None"
 
 
 def test_deletion_policy_defaults_to_leaving_the_remote_value() -> None:
@@ -122,7 +173,7 @@ def test_labels_and_annotations_are_merged() -> None:
 
 def test_data_entries_carry_no_metadata_unless_configured() -> None:
     """Omitted, not empty: an unused envelope would be drift on every entry."""
-    assert all("metadata" not in entry for entry in _build()["spec"]["data"])
+    assert all("metadata" not in entry for entry in _build()["spec"]["dataTo"])
 
 
 def test_provider_metadata_is_wrapped_in_a_pushsecretmetadata_envelope() -> None:
@@ -136,32 +187,77 @@ def test_provider_metadata_is_wrapped_in_a_pushsecretmetadata_envelope() -> None
             },
         }
     )
-    data = _build(spec)["spec"]["data"]
-    assert data, "expected one entry per pushed key"
-    for entry in data:
-        assert entry["metadata"] == {
-            "apiVersion": "kubernetes.external-secrets.io/v1alpha1",
-            "kind": "PushSecretMetadata",
-            # Passed through verbatim: only the provider knows this shape.
-            "spec": {
-                "secretPushFormat": "string",
-                "description": "managed by pg-operator",
-                "tags": {"env": "prod"},
-            },
-        }
+    entry = _build(spec)["spec"]["dataTo"][0]
+    assert entry["metadata"] == {
+        "apiVersion": "kubernetes.external-secrets.io/v1alpha1",
+        "kind": "PushSecretMetadata",
+        # Passed through verbatim: only the provider knows this shape.
+        "spec": {
+            "secretPushFormat": "string",
+            "description": "managed by pg-operator",
+            "tags": {"env": "prod"},
+        },
+    }
 
 
 def test_metadata_is_copied_per_entry_and_not_shared_with_the_spec() -> None:
     """Entries must not alias each other, or the CR's own metadata dict."""
     source = {"tags": {"env": "prod"}}
     spec = PushSecretSpec.model_validate(
-        {"secretStoreRefs": [{"name": "aws-sm"}], "metadata": source}
+        {
+            "secretStoreRefs": [{"name": "aws-sm"}, {"name": "vault"}],
+            "metadata": source,
+        }
     )
-    data = _build(spec)["spec"]["data"]
-    data[0]["metadata"]["spec"]["tags"]["env"] = "mutated"
-    assert data[1]["metadata"]["spec"]["tags"]["env"] == "prod"
+    entries = _build(spec)["spec"]["dataTo"]
+    entries[0]["metadata"]["spec"]["tags"]["env"] = "mutated"
+    assert entries[1]["metadata"]["spec"]["tags"]["env"] == "prod"
     assert spec.metadata["tags"]["env"] == "prod"
     assert source == {"tags": {"env": "prod"}}
+
+
+async def test_upgrade_clears_the_legacy_per_property_data_field() -> None:
+    """A JSON merge patch only deletes a field when it is explicitly null.
+
+    Without the null, a PushSecret written by an older operator would keep its
+    per-property `data` entries alongside the new `dataTo` and external-secrets
+    would push both — reintroducing the read-modify-write that loses keys.
+    """
+    k8s = FakeK8sClient()
+    body = _build()
+    legacy = {
+        "apiVersion": body["apiVersion"],
+        "kind": body["kind"],
+        "metadata": dict(body["metadata"]),
+        "spec": {
+            "selector": {"secret": {"name": "orders-api-pg-credentials"}},
+            "data": [
+                {"match": {"secretKey": "username", "remoteRef": {"property": "u"}}}
+            ],
+        },
+    }
+    k8s.custom.objects[("pushsecrets", "team-a", "orders-api-pg-push")] = legacy
+
+    created, changed = await apply_push_secret(k8s, Settings(), body)  # type: ignore[arg-type]
+
+    assert (created, changed) == (False, True)
+    stored = k8s.custom.objects[("pushsecrets", "team-a", "orders-api-pg-push")]
+    assert stored["spec"]["data"] is None
+    assert stored["spec"]["dataTo"] == body["spec"]["dataTo"]
+
+
+async def test_a_converged_push_secret_is_left_alone() -> None:
+    """Steady state must be a genuine no-op, not a patch every reconcile."""
+    k8s = FakeK8sClient()
+    body = _build()
+    k8s.custom.objects[("pushsecrets", "team-a", "orders-api-pg-push")] = {
+        "metadata": dict(body["metadata"]),
+        "spec": body["spec"],
+    }
+
+    created, changed = await apply_push_secret(k8s, Settings(), body)  # type: ignore[arg-type]
+
+    assert (created, changed) == (False, False)
 
 
 @pytest.mark.parametrize(

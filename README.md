@@ -239,6 +239,30 @@ pushSecret:
       env: prod
 ```
 
+#### One object, one write
+
+All selected keys are pushed as a **single** remote object, via one `dataTo`
+entry per store with `remoteKey` set and the keys chosen by an anchored
+`match.regexp`. external-secrets bundles them into one JSON document and writes
+it in a single call.
+
+The obvious-looking alternative — one `data` entry per key, each with its own
+`remoteRef.property` against a shared `remoteKey` — is quietly lossy, and the
+operator deliberately does not emit it. Each such entry is an independent
+read-modify-write of the *same* remote object (`GetSecretValue`, set one
+property, `PutSecretValue`) with no compare-and-swap. Against AWS Secrets
+Manager, which is eventually consistent, an entry can read a version predating
+the previous entry's write and put back a document missing that key. It also
+burns one secret version per key per reconcile, and a single failed entry
+aborts every later entry in that pass. Upstream's guidance is the same
+([#4746](https://github.com/external-secrets/external-secrets/issues/4746)); the
+underlying concurrency gap is [#2662](https://github.com/external-secrets/external-secrets/issues/2662),
+open since 2023.
+
+Because `dataTo` is used, `keys` is honoured by pattern rather than by
+enumeration — the regexp is anchored (`^(?:username|password)$`) so a key named
+`export_port` is not selected by `port`.
+
 `metadata` carries provider-specific push options. The operator wraps it in the
 envelope external-secrets expects — `apiVersion:
 kubernetes.external-secrets.io/v1alpha1`, `kind: PushSecretMetadata` — and
