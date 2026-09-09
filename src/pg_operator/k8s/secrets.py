@@ -209,7 +209,7 @@ def connection_keys(
             f"jdbc:postgresql://{host}:{port}/{database}"
             f"?user={safe_user}&password={safe_password}&sslmode={ssl_mode}"
         )
-        data["spring_datasource_url"] = (
+        data["springDatasourceUri"] = (
             f"jdbc:postgresql://{host}:{port}/{database}"
         )
     return data

@@ -50,6 +50,7 @@ def test_connection_keys_cover_the_documented_set() -> None:
         "sslmode",
         "uri",
         "jdbcUri",
+        "springDatasourceUri",
     }
     assert data["port"] == "5432"
 
@@ -64,7 +65,7 @@ def test_uri_can_be_omitted() -> None:
         ssl_mode="require",
         include_uri=False,
     )
-    assert "uri" not in data and "jdbcUri" not in data
+    assert "uri" not in data and "jdbcUri" not in data and "springDatasourceUri" not in data
 
 
 def test_uri_percent_encodes_special_characters() -> None:
