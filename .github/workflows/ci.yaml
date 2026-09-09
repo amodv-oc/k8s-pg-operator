@@ -137,6 +137,10 @@ jobs:
           files: charts/pg-operator/crds
 
   image:
+    # Build and smoke-test only — nothing is published here. Publishing lives
+    # in image-push, which waits on lint, test, ui and chart, so a red check
+    # can never put an image in the registry.
+    #
     # One native runner per architecture rather than one runner emulating the
     # other: a uv sync and a vite build under QEMU cost far more than the
     # extra job, and building natively means the smoke tests below actually
@@ -150,30 +154,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-
-      - name: Labels for the operator image
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          labels: |
-            org.opencontainers.image.title=pg-operator
-            org.opencontainers.image.description=Kubernetes operator for external PostgreSQL (RDS) instances
-
-      - name: Labels for the dashboard image
-        id: meta-ui
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
-          labels: |
-            org.opencontainers.image.title=pg-operator-ui
-            org.opencontainers.image.description=Dashboard for the pg-operator state API
 
       - name: Build
         uses: docker/build-push-action@v7
@@ -233,12 +216,53 @@ jobs:
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/readyz)" = "503"
           docker rm -f api
 
-      # --- publish ----
-      # Each runner pushes an untagged, single-arch image and reports its
-      # digest; image-manifest joins the two into one tagged manifest list, so
-      # a tag never points at a half-published pair.
+  # --- publish ----
+  # Gated on every check in the workflow, so nothing reaches the registry
+  # unless lint, the PostgreSQL matrix, the dashboard and the chart all pass
+  # and both architectures built and smoke-tested cleanly.
+  #
+  # Each runner pushes an untagged, single-arch image and reports its digest;
+  # image-manifest joins the two into one tagged manifest list, so a tag never
+  # points at a half-published pair. The build here is the same one image
+  # already did, restored from the shared gha cache scope.
+  image-push:
+    needs: [lint, test, ui, chart, image]
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Labels for the operator image
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=pg-operator
+            org.opencontainers.image.description=Kubernetes operator for external PostgreSQL (RDS) instances
+
+      - name: Labels for the dashboard image
+        id: meta-ui
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=pg-operator-ui
+            org.opencontainers.image.description=Dashboard for the pg-operator state API
+
       - name: Log in to ${{ env.REGISTRY }}
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
@@ -247,7 +271,6 @@ jobs:
 
       - name: Push the operator image
         id: push
-        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -259,7 +282,6 @@ jobs:
 
       - name: Push the dashboard image
         id: push-ui
-        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v7
         with:
           context: ui
@@ -270,7 +292,6 @@ jobs:
           cache-to: type=gha,mode=max,scope=ui-${{ matrix.arch }}
 
       - name: Record the digests
-        if: github.event_name != 'pull_request'
         env:
           OPERATOR_DIGEST: ${{ steps.push.outputs.digest }}
           UI_DIGEST: ${{ steps.push-ui.outputs.digest }}
@@ -280,7 +301,6 @@ jobs:
           touch "${RUNNER_TEMP}/digests/ui/${UI_DIGEST#sha256:}"
 
       - name: Upload the digests
-        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v7
         with:
           name: digests-${{ matrix.arch }}
@@ -289,8 +309,7 @@ jobs:
           retention-days: 1
 
   image-manifest:
-    needs: image
-    if: github.event_name != 'pull_request'
+    needs: image-push
     runs-on: ubuntu-latest
     permissions:
       contents: read
