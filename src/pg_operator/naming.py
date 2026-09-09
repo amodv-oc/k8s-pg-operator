@@ -75,7 +75,16 @@ def validate_identifier(value: str, *, kind: str = "identifier") -> str:
 
 def validate_role_name(value: str, *, kind: str = "role") -> str:
     """Validate a role name, additionally rejecting the reserved ``pg_`` prefix."""
-    candidate = validate_identifier(value, kind=kind)
+    return reject_reserved_role_prefix(validate_identifier(value, kind=kind), kind=kind)
+
+
+def reject_reserved_role_prefix(candidate: str, *, kind: str = "role") -> str:
+    """Refuse a role name PostgreSQL reserves for itself.
+
+    Applied to derived names as well as explicit ones: ``CREATE ROLE pg_x`` is
+    refused by the server, so a PostgresUser named ``pg-x`` would otherwise be
+    retried forever instead of being reported as misconfigured.
+    """
     for prefix in _RESERVED_ROLE_PREFIXES:
         if candidate.startswith(prefix):
             raise InvalidIdentifier(

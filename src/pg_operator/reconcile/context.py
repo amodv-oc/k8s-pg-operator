@@ -7,6 +7,7 @@ Everything a handler needs to act on a resource hangs off one
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -46,6 +47,50 @@ class ResolvedInstance:
         return f"{self.endpoint.host}:{self.endpoint.port}"
 
 
+class ResourceLocks:
+    """Per-resource mutual exclusion for reconcile and teardown passes.
+
+    kopf runs timers as tasks of their own, independent of the change-handling
+    flow, so a periodic pass can start while the create/update handler for the
+    same object is still running - or while its finalizer is. Two passes over
+    one resource race each other in ways that do not self-heal: both may
+    generate a password and only one of them lands in the Secret, both may
+    ``CREATE ROLE`` the same name, and the second status patch overwrites the
+    first. Holding one lock per resource removes the race without serialising
+    unrelated resources - or unrelated instances - against each other.
+
+    Locks are reference-counted so the table does not grow with every resource
+    the operator has ever seen.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[tuple[str, str, str], tuple[asyncio.Lock, int]] = {}
+
+    @contextlib.asynccontextmanager
+    async def hold(
+        self, kind: str, namespace: str | None, name: str
+    ) -> AsyncIterator[None]:
+        key = (kind, namespace or "", name)
+        lock, holders = self._locks.get(key) or (asyncio.Lock(), 0)
+        self._locks[key] = (lock, holders + 1)
+        try:
+            async with lock:
+                yield
+        finally:
+            lock, holders = self._locks[key]
+            if holders <= 1:
+                del self._locks[key]
+            else:
+                self._locks[key] = (lock, holders - 1)
+
+    def is_held(self, kind: str, namespace: str | None, name: str) -> bool:
+        entry = self._locks.get((kind, namespace or "", name))
+        return entry is not None and entry[0].locked()
+
+    def __len__(self) -> int:
+        return len(self._locks)
+
+
 class ReconcileContext:
     """Long-lived collaborators shared by every handler."""
 
@@ -58,9 +103,36 @@ class ReconcileContext:
         self.k8s = k8s
         self.settings = settings or get_settings()
         self.pools = pools or PoolRegistry(self.settings)
-        self._server_info: dict[str, tuple[float, ServerInfo]] = {}
+        self.locks = ResourceLocks()
+        #: Probed capabilities, keyed by (instance, connection fingerprint).
+        self._server_info: dict[tuple[str, str], tuple[float, ServerInfo]] = {}
 
     # -- instance resolution ------------------------------------------------
+
+    async def load_instance_spec(
+        self, name: str, *, for_namespace: str | None = None
+    ) -> tuple[InstanceSpec, int]:
+        """Read and validate a PostgresInstance without connecting to it.
+
+        Enforces the ``allowedNamespaces`` gate. Used on its own by the
+        finalizers: a RETAIN teardown has nothing to do on the server, so it
+        must not depend on being able to reach it.
+        """
+        obj = await get_instance(self.k8s, name)
+        try:
+            spec = parse_instance_spec(obj.get("spec") or {})
+        except Exception as exc:
+            raise ConfigurationError(
+                f"PostgresInstance {name!r} has an invalid spec: {exc}"
+            ) from exc
+        generation = int((obj.get("metadata") or {}).get("generation") or 0)
+
+        if for_namespace and not spec.permits_namespace(for_namespace):
+            raise ConfigurationError(
+                f"PostgresInstance {name!r} does not permit namespace "
+                f"{for_namespace!r}; allowedNamespaces = {spec.allowed_namespaces}"
+            )
+        return spec, generation
 
     async def resolve_instance(
         self, name: str, *, for_namespace: str | None = None
@@ -72,15 +144,7 @@ class ReconcileContext:
         not permitted to use an instance fails with a clear message instead of
         quietly getting objects created.
         """
-        obj = await get_instance(self.k8s, name)
-        spec = parse_instance_spec(obj.get("spec") or {})
-        generation = int((obj.get("metadata") or {}).get("generation") or 0)
-
-        if for_namespace and not spec.permits_namespace(for_namespace):
-            raise ConfigurationError(
-                f"PostgresInstance {name!r} does not permit namespace "
-                f"{for_namespace!r}; allowedNamespaces = {spec.allowed_namespaces}"
-            )
+        spec, generation = await self.load_instance_spec(name, for_namespace=for_namespace)
 
         endpoint = await self.build_endpoint(name, spec)
         server = await self._describe(endpoint)
@@ -134,7 +198,8 @@ class ReconcileContext:
         )
 
     async def _describe(self, endpoint: Endpoint) -> ServerInfo:
-        cached = self._server_info.get(endpoint.fingerprint)
+        key = (endpoint.instance, endpoint.fingerprint)
+        cached = self._server_info.get(key)
         if cached is not None and time.monotonic() - cached[0] < _SERVER_INFO_TTL:
             return cached[1]
         async with self.pools.connection(endpoint) as conn:
@@ -147,12 +212,17 @@ class ReconcileContext:
                 info.current_user,
                 info.describe_privileges(),
             )
-        self._server_info[endpoint.fingerprint] = (time.monotonic(), info)
+        self._server_info[key] = (time.monotonic(), info)
         return info
 
     def invalidate(self, instance: str) -> None:
-        """Forget cached capability data — used when an instance spec changes."""
-        self._server_info.clear()
+        """Forget cached capability data — used when an instance spec changes.
+
+        Scoped to the one instance: a spec change on one server must not force
+        every other server to be re-probed.
+        """
+        for key in [key for key in self._server_info if key[0] == instance]:
+            del self._server_info[key]
         log.debug("invalidated cached server info for %s", instance)
 
     # -- connections --------------------------------------------------------

@@ -276,3 +276,17 @@ def test_retention_inherits_from_the_instance_unless_set(
     child: str | None, instance_default: str, expected: str
 ) -> None:
     assert effective_retention(child, instance_default) == expected  # type: ignore[arg-type]
+
+
+def test_derived_username_with_a_reserved_prefix_is_rejected() -> None:
+    """`pg-admin` sanitises to `pg_admin`, which PostgreSQL refuses to create.
+
+    Caught at derivation so it is reported as misconfiguration rather than
+    retried against the server forever.
+    """
+    from pg_operator.naming import InvalidIdentifier
+
+    spec = parse_user_spec({"instanceRef": {"name": "prod"}})
+    with pytest.raises(InvalidIdentifier, match="reserved"):
+        spec.resolve_username("pg-admin")
+    assert spec.resolve_username("pga-admin") == "pga_admin"

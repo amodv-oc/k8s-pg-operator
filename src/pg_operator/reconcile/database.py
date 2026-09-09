@@ -26,7 +26,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 
 from .. import status as st
 from ..constants import DROP, PLURAL_DATABASE
@@ -41,6 +41,7 @@ from ..postgres.privileges import (
     apply_schema_privileges,
     observed_schema_grants,
 )
+from ..postgres.sql import fetch_scalar
 from .context import ReconcileContext, ResolvedInstance
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,9 @@ class DatabaseResult:
     unowned_schemas: list[str] = field(default_factory=list)
     denied_parameters: list[str] = field(default_factory=list)
     immutable_drift: list[str] = field(default_factory=list)
+    #: Owner-group members whose default privileges could not be managed when
+    #: ``setRoleForOwners`` is off (see ``_owner_creators``).
+    unmanageable_creators: list[str] = field(default_factory=list)
     managed_schemas: list[str] = field(default_factory=list)
     managed_extensions: list[str] = field(default_factory=list)
     observed: db.DatabaseObservation = field(default_factory=db.DatabaseObservation)
@@ -92,18 +96,11 @@ async def reconcile_database(
     name = str(meta.get("name"))
     existing_status = obj.get("status") or {}
 
-    try:
-        spec = parse_database_spec(obj.get("spec") or {})
-    except Exception as exc:
-        raise ConfigurationError(f"invalid spec: {exc}") from exc
-
+    spec = _parse_spec(obj)
     instance = await ctx.resolve_instance(
         spec.instance_ref.name, for_namespace=namespace
     )
-    database = spec.resolve_database_name(name)
-    roles = GroupRoles.from_mapping(
-        spec.resolve_role_names(database, instance.spec.role_prefix)
-    )
+    database, roles = _derive_names(spec, name, instance.spec.role_prefix)
     retention = effective_retention(spec.retention_policy, instance.spec.retention_policy)
 
     result = DatabaseResult(database=database, roles=roles, retention=retention)
@@ -114,6 +111,7 @@ async def reconcile_database(
     )
 
     # -- phase 1: cluster-wide objects, on the maintenance connection --------
+    creators: list[str] = []
     async with ctx.connect(instance) as conn:
         await _ensure_group_roles(
             conn,
@@ -124,11 +122,18 @@ async def reconcile_database(
         await _ensure_database(conn, spec, database, roles, result)
         await _apply_database_privileges(conn, spec, database, roles)
         await _apply_database_attributes(conn, spec, database, result)
+        if not spec.set_role_for_owners:
+            creators = await _owner_creators(
+                conn,
+                roles,
+                result,
+                per_grant_options=instance.server.supports_per_grant_options,
+            )
 
     # -- phase 2: in-database objects ---------------------------------------
     desired_schemas = spec.resolve_schemas()
     async with ctx.connect(instance, database) as conn:
-        await _ensure_schemas(conn, desired_schemas, roles, options, result)
+        await _ensure_schemas(conn, desired_schemas, roles, options, result, creators)
         await _ensure_extensions(conn, spec, result)
         await _handle_orphans(
             conn, spec, desired_schemas, existing_status, retention, result
@@ -156,9 +161,71 @@ async def reconcile_database(
     return result, instance
 
 
+def _parse_spec(obj: dict[str, Any]) -> DatabaseSpec:
+    try:
+        return parse_database_spec(obj.get("spec") or {})
+    except Exception as exc:
+        raise ConfigurationError(f"invalid spec: {exc}") from exc
+
+
+def _derive_names(spec: DatabaseSpec, resource_name: str, prefix: str) -> tuple[str, GroupRoles]:
+    """The database name and group role names a PostgresDB resolves to.
+
+    Both derivations can fail - a resource name with no usable characters, a
+    role override that collides with a derived name - and both are facts about
+    the spec, so they are reported as configuration errors rather than retried.
+    """
+    try:
+        database = spec.resolve_database_name(resource_name)
+        roles = GroupRoles.from_mapping(spec.resolve_role_names(database, prefix))
+    except ValueError as exc:
+        raise ConfigurationError(f"invalid spec: {exc}") from exc
+    return database, roles
+
+
 # ---------------------------------------------------------------------------
 # phase 1
 # ---------------------------------------------------------------------------
+
+
+async def _owner_creators(
+    conn: AsyncConnection,
+    roles: GroupRoles,
+    result: DatabaseResult,
+    *,
+    per_grant_options: bool,
+) -> list[str]:
+    """Login roles whose future objects need default privileges of their own.
+
+    With ``setRoleForOwners`` on, everything an owner-group member creates
+    belongs to the group, so the group's DEFAULT PRIVILEGES cover it. With it
+    off each member creates objects under its own name, and PostgreSQL keys
+    default privileges on the creating role - so the RW and RO grants have to be
+    declared once per member or the readers never see the new tables.
+
+    ``ALTER DEFAULT PRIVILEGES FOR ROLE x`` requires the managing role to be
+    able to act as ``x``, which creating ``x`` does not confer; the membership
+    is taken here, as teardown does. A member the operator cannot take (one a
+    DBA added by hand) is reported rather than allowed to fail the pass.
+    """
+    current = str(await fetch_scalar(conn, sql.SQL("SELECT current_user")))
+    members = sorted(await pgroles.members_of(conn, roles.owner) - {current, *roles.all})
+    creators: list[str] = []
+    for member in members:
+        try:
+            await pgroles.ensure_self_membership(
+                conn, member, per_grant_options=per_grant_options
+            )
+        except ReconcileFailure as exc:
+            log.warning(
+                "cannot manage default privileges for owner-group member %s: %s",
+                member,
+                exc,
+            )
+            result.unmanageable_creators.append(member)
+            continue
+        creators.append(member)
+    return creators
 
 
 async def _ensure_group_roles(
@@ -265,6 +332,7 @@ async def _ensure_schemas(
     roles: GroupRoles,
     options: GrantOptions,
     result: DatabaseResult,
+    creators: list[str] | None = None,
 ) -> None:
     for schema in desired:
         outcome = await db.ensure_schema(conn, schema.name, roles.owner)
@@ -284,7 +352,9 @@ async def _ensure_schemas(
         # warning today, and start working the moment ownership is fixed, while
         # status.schemaGrants reports what is actually in force.
         await apply_schema_privileges(conn, schema.name, roles, options)
-        await apply_default_privileges(conn, schema.name, roles, options)
+        await apply_default_privileges(
+            conn, schema.name, roles, options, creators=[roles.owner, *(creators or [])]
+        )
 
 
 async def _ensure_extensions(
@@ -387,14 +457,16 @@ async def teardown_database(ctx: ReconcileContext, obj: dict[str, Any]) -> str:
     meta = obj.get("metadata") or {}
     namespace = str(meta.get("namespace"))
     name = str(meta.get("name"))
-    spec = parse_database_spec(obj.get("spec") or {})
+    spec = _parse_spec(obj)
 
-    instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)
-    database = spec.resolve_database_name(name)
-    roles = GroupRoles.from_mapping(
-        spec.resolve_role_names(database, instance.spec.role_prefix)
+    # Decide the policy from the specs alone. A RETAIN teardown touches nothing
+    # on the server, so it must complete even while the server is unreachable
+    # or its credentials Secret is missing.
+    instance_spec, _ = await ctx.load_instance_spec(
+        spec.instance_ref.name, for_namespace=namespace
     )
-    retention = effective_retention(spec.retention_policy, instance.spec.retention_policy)
+    database, roles = _derive_names(spec, name, instance_spec.role_prefix)
+    retention = effective_retention(spec.retention_policy, instance_spec.retention_policy)
 
     if retention != DROP:
         log.info(
@@ -404,8 +476,10 @@ async def teardown_database(ctx: ReconcileContext, obj: dict[str, Any]) -> str:
         )
         return (
             f"retained database {database} and group roles "
-            f"{', '.join(roles.all)} on {instance.display}"
+            f"{', '.join(roles.all)} on {instance_spec.host}:{instance_spec.port}"
         )
+
+    instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)
 
     # The operator's own pool must be released, or it counts as an open
     # connection and blocks the drop.
@@ -556,6 +630,21 @@ def build_status(
         divergence.append(("ImmutableFieldDrift", result.immutable_drift))
     if result.denied_parameters:
         divergence.append(("ParameterDenied", result.denied_parameters))
+    if result.unmanageable_creators:
+        divergence.append(
+            (
+                "DefaultPrivilegesDenied",
+                [
+                    "setRoleForOwners is off but the managing role cannot act as "
+                    "owner-group member(s) "
+                    + ", ".join(result.unmanageable_creators)
+                    + f", so default privileges for {result.roles.read_write} and "
+                    f"{result.roles.read_only} on objects they create cannot be set; "
+                    "grant the managing role membership of those roles, or manage "
+                    "them as PostgresUsers"
+                ],
+            )
+        )
 
     def _collapse(entries: list[tuple[str, list[str]]]) -> tuple[str, str]:
         reason = entries[0][0] if len(entries) == 1 else "MultipleIssues"
@@ -614,6 +703,7 @@ def build_status(
         "unmanagedSchemas": result.unmanaged_schemas,
         "unownedSchemas": result.unowned_schemas,
         "deniedParameters": result.denied_parameters,
+        "unmanageableCreators": result.unmanageable_creators,
         "schemaGrants": result.schema_grants,
         "lastReconciledAt": st.now(),
     }
