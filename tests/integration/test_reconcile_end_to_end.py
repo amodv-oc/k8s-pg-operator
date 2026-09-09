@@ -690,10 +690,12 @@ async def test_push_secret_is_created_and_removed(ctx, k8s, provisioned_db, clea
     assert push["apiVersion"] == "external-secrets.io/v1"
     assert push["spec"]["selector"]["secret"]["name"] == "push-user-pg-credentials"
     assert push["spec"]["deletionPolicy"] == "None"
-    remote_keys = {
-        entry["match"]["remoteRef"]["remoteKey"] for entry in push["spec"]["data"]
-    }
-    assert remote_keys == {f"prod/{NS}/push-user"}
+    # One bundled write per store, never one entry per key — see README's
+    # "One object, one write".
+    assert "data" not in push["spec"]
+    assert [entry["remoteKey"] for entry in push["spec"]["dataTo"]] == [
+        f"prod/{NS}/push-user"
+    ]
 
     # Turning it off removes the PushSecret.
     del obj["spec"]["pushSecret"]
