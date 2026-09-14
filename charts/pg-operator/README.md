@@ -116,7 +116,7 @@ two reconcilers issuing DDL against the same server.
 | --- | --- | --- |
 | `credentials.passwordLength` | `32` | Overridable per `PostgresUser` |
 | `pushSecret.enabled` | `true` | Emit `external-secrets.io` PushSecrets |
-| `pushSecret.apiVersion` | `external-secrets.io/v1` | Use `external-secrets.io/v1alpha1` below external-secrets 0.14 |
+| `pushSecret.apiVersion` | `external-secrets.io/v1alpha1` | The version external-secrets serves `PushSecret` under |
 
 If the PushSecret CRD is absent, each `PostgresInstance` reports it in one
 condition rather than failing every user reconcile.

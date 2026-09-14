@@ -5,9 +5,10 @@ itself — it writes a Kubernetes Secret and then declares a PushSecret so
 external-secrets mirrors it outward. That keeps backend credentials and
 provider logic entirely inside external-secrets.
 
-The API version is configurable because the resource moved from
-``external-secrets.io/v1alpha1`` to ``external-secrets.io/v1`` in
-external-secrets 0.14; the emitted body is compatible with both.
+external-secrets still serves PushSecret as ``external-secrets.io/v1alpha1``
+(the 0.14 promotion to ``v1`` covered ExternalSecret and SecretStore, not this
+kind), so that is the default. The API version stays configurable, and the
+emitted body is version-independent.
 """
 
 from __future__ import annotations

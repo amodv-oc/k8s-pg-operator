@@ -687,7 +687,7 @@ async def test_push_secret_is_created_and_removed(ctx, k8s, provisioned_db, clea
     assert status["pushSecretRef"] == {"name": "push-user-pg-push", "namespace": NS}
     push = k8s.custom.get_stored("pushsecrets", NS, "push-user-pg-push")
     assert push is not None
-    assert push["apiVersion"] == "external-secrets.io/v1"
+    assert push["apiVersion"] == "external-secrets.io/v1alpha1"
     assert push["spec"]["selector"]["secret"]["name"] == "push-user-pg-credentials"
     assert push["spec"]["deletionPolicy"] == "None"
     # One bundled write per store, never one entry per key — see README's
