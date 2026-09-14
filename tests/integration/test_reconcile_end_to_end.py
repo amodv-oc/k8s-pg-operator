@@ -48,7 +48,7 @@ INSTANCE = "test-rds"
 @pytest.fixture
 def k8s(endpoint: Endpoint) -> FakeK8sClient:
     """A cluster holding the instance, its credentials and the PushSecret CRD."""
-    client = FakeK8sClient(crds={"pushsecrets.external-secrets.io": ["v1"]})
+    client = FakeK8sClient(crds={"pushsecrets.external-secrets.io": ["v1alpha1"]})
     client.core.seed(
         OPERATOR_NS,
         "rds-superuser",
