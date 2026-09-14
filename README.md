@@ -275,8 +275,8 @@ put provider logic back into an operator that deliberately has none. Omitting
 
 `deletionPolicy: None` (the default) matches `RETAIN`: removing the resource
 does not destroy the remote value. The API version is a chart value
-(`pushSecret.apiVersion`), so targeting `external-secrets.io/v1alpha1` on an
-older external-secrets is a values change, not a code change. If the PushSecret
+(`pushSecret.apiVersion`), so following a future promotion of the kind is a
+values change, not a code change. If the PushSecret
 CRD is missing, the instance says so in one condition instead of failing every
 user reconcile. A PushSecret that external-secrets cannot sync is surfaced on
 the user's status.
@@ -313,7 +313,7 @@ Values worth reviewing:
 | `ui.image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator-ui` | The dashboard image, same pipeline |
 | `watchNamespaces` | `[]` (all) | `PostgresInstance` is always watched cluster-wide |
 | `reconcile.interval` | `300` | Full convergence pass, in seconds |
-| `pushSecret.apiVersion` | `external-secrets.io/v1` | Use `v1alpha1` below external-secrets 0.14 |
+| `pushSecret.apiVersion` | `external-secrets.io/v1alpha1` | The version external-secrets serves `PushSecret` under |
 | `rbac.namespacedSecrets` | `false` | See below |
 | `api.enabled` | `true` | The state API container |
 | `ui.enabled` | `true` | The dashboard container; requires `api.enabled` |

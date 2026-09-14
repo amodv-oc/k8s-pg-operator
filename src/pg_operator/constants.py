@@ -41,8 +41,9 @@ COND_REACHABLE: Final = "Reachable"
 COND_SYNCED: Final = "Synced"
 COND_DRIFTED: Final = "Drifted"
 
-# external-secrets.io PushSecret coordinates. The version is overridable so the
-# chart can target either external-secrets.io/v1 (>= 0.14) or v1alpha1.
+# external-secrets.io PushSecret coordinates. Upstream still serves PushSecret
+# as v1alpha1 — the 0.14 promotion to v1 covered ExternalSecret/SecretStore but
+# not this kind — so the version stays overridable via the chart.
 PUSHSECRET_KIND: Final = "PushSecret"
 PUSHSECRET_PLURAL: Final = "pushsecrets"
 

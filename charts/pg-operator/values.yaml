@@ -71,8 +71,9 @@ credentials:
 
 pushSecret:
   enabled: true
-  # -- external-secrets.io/v1 for external-secrets >= 0.14; use
-  # external-secrets.io/v1alpha1 for older installations.
+  # -- PushSecret is still served as external-secrets.io/v1alpha1 upstream. The
+  # 0.14 promotion to v1 covered ExternalSecret/SecretStore, not PushSecret.
+  # Override only if your external-secrets serves it under another version.
   apiVersion: external-secrets.io/v1alpha1
 
 # -- FastAPI state API.

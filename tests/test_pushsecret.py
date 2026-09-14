@@ -25,7 +25,9 @@ SPEC = PushSecretSpec.model_validate(
 )
 
 
-def _build(spec: PushSecretSpec = SPEC, api_version: str = "external-secrets.io/v1"):
+def _build(
+    spec: PushSecretSpec = SPEC, api_version: str = "external-secrets.io/v1alpha1"
+):
     return build_push_secret(
         spec,
         api_version=api_version,
@@ -52,10 +54,10 @@ def test_api_version_without_a_group_is_rejected() -> None:
 
 
 def test_body_targets_the_configured_api_version() -> None:
-    assert _build()["apiVersion"] == "external-secrets.io/v1"
-    # Switching to the older API is a values change, not a code change.
-    assert _build(api_version="external-secrets.io/v1alpha1")["apiVersion"] == (
-        "external-secrets.io/v1alpha1"
+    assert _build()["apiVersion"] == "external-secrets.io/v1alpha1"
+    # Retargeting the version is a values change, not a code change.
+    assert _build(api_version="external-secrets.io/v1")["apiVersion"] == (
+        "external-secrets.io/v1"
     )
 
 
