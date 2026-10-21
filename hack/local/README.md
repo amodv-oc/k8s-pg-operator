@@ -17,7 +17,7 @@ Storage is ephemeral. These servers exist to be reconciled against.
 
 ```sh
 make local-up        # build both images, start the servers, install the operator
-make local-status    # phases for all three kinds
+make local-status    # phases for all four kinds
 make local-verify    # functional OWNER/RW/RO checks on all five versions
 make local-ui        # port-forward the dashboard to localhost:8081
 make local-down      # remove everything
@@ -127,6 +127,16 @@ then streams.
 The first pass for each new login is refused a walsender until the shim
 (below) has run. The replication shows `ReplicationRefused` for one retry, and
 then subscribes.
+
+Health is observed every pass (`reconcile.replicationInterval` here is the
+chart's 60s), so `make local-status` shows each replication's `LAG` and
+`STATE`. The dashboard's Replications page shows lag and retained WAL against
+the thresholds. To watch a replication go `Degraded` on demand, lower a
+threshold below the live number:
+
+```sh
+kubectl -n team-a patch pgrepl orders-16-to-17 --type=merge -p '{"spec":{"alerting":{"maxRetainedWal":1}}}'
+```
 
 The bootstrap SQL in `00-servers.yaml` is `hack/rds-like.sql` verbatim, plus
 one local-only script for `GRANT SET ON PARAMETER`. `tests/test_harness.py`

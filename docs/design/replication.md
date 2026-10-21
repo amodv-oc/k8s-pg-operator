@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | Accepted 2026-10-21, D1–D11 included. PRs 1–3 merged; PR 4 (the subscription) in progress |
+| Status | Accepted 2026-10-21, D1–D11 included. PRs 1–4 merged; PRs 5–7 (health, state API, dashboard) built together |
 | Date | 2026-10-21 |
 | Scope | Long-lived, one-way logical replication from a database on one `PostgresInstance` into a database on another |
 
@@ -546,10 +546,30 @@ from them:
 | `SlotLost` | `wal_status = lost`: `max_slot_wal_keep_size` invalidated the slot. Recovery means deleting and recreating the resource, which runs a full re-copy |
 | `Disabled` | `spec.enabled: false` |
 
-A new `Streaming` condition carries the state. It is `False` for `Lagging`,
-`Stalled` and `SlotLost`, and those collapse into a new **`Degraded`** phase
-(see D3). `Initializing` and `Disabled` are healthy, so the phase stays
-`Ready`.
+**Precedence, worst first:** `SlotLost`, `Disabled`, `Stalled`, `Lagging`,
+`Initializing`, `Streaming`. `SlotLost` outranks even `Disabled`, because a
+switched-off subscription must not hide that its replica now needs rebuilding.
+A slot missing altogether counts as lost.
+
+A new `Streaming` condition carries the state:
+
+- **`True`** for `Streaming` and `Initializing`.
+- **`False`** for the other four.
+- Only `Lagging`, `Stalled` and `SlotLost` make the phase **`Degraded`** (see
+  D3). It outranks `Drifted`.
+- `Disabled` is `False`, but a subscription switched off on purpose is healthy,
+  so the phase stays `Ready`.
+
+The condition's message carries no live numbers. Those go to `status.health`,
+so the condition changes on a transition rather than on every pass (D4).
+
+**A pass that fails is still observed.** Suppose a replication's `PostgresDB`
+was deleted under `RETAIN`. The pass can no longer resolve, but its slot still
+pins WAL. After any failed pass, the handler reads the slot and subscription
+from the names and oid recorded in status, and writes `status.health`,
+`replicationState` and the metrics. It writes nothing when the source cannot be
+read: reporting a slot lost because it could not be seen would be worse than
+silence.
 
 The slot's inactive time is tracked by the operator itself, from the first
 pass that saw the slot without a consumer. `inactive_since` only exists from
@@ -582,7 +602,9 @@ always true when a whole namespace is being deleted.
    2. The slots are dropped by the managing role where it holds the
       replication privilege (on RDS, through `rds_replication`). Otherwise the
       replication login drops them, since it was created to use exactly these
-      slots.
+      slots. For a generated login, teardown first sets a fresh password and
+      does not trust the Secret's. A password changed out of band would
+      otherwise leave the slot undroppable by anyone.
    3. **The finalizer is held until no slot remains.**
 3. **Source, publication:** `DROP PUBLICATION`, if `status.created` says the
    operator made it.
@@ -672,8 +694,10 @@ observation.
 | `GET /api/v1/replications` | `?namespace=` `?instance=` (either side) `?database=` `?phase=` `?state=` |
 | `GET /api/v1/replications/{ns}/{name}` | One replication, including per-table state and exclusions |
 
-- **Instance and database detail.** `InstanceDetail` and `DatabaseDetail` gain
-  `replications`, split into outbound and inbound.
+- **Instance and database detail.** `InstanceDetail` gains `replication_list`
+  and `DatabaseDetail` gains `replications`. Each is one list, not split into
+  outbound and inbound: every entry names its source and target, which says
+  the direction already.
 - **Overview.** `/overview` gains replication phase counts. Its `attention` list
   gains `Degraded` replications and excluded tables.
 - **Stable projection.** The response model is a projection, like the other
@@ -832,9 +856,9 @@ Each PR updates `README.md` for what it ships.
 | 2 | CRD, models, naming, row-filter DSL, chart (CRD, RBAC, aggregation), example. Handlers registered; step 1 (Resolve) implemented in full, including the cycle check; status `Pending` via `Ready=Unknown` | `test_crds`/`test_examples`, spec and reconcile unit tests; CEL rules verified with `make local-up` |
 | 3 | Source side: login, Secret, table resolution, eligibility, publication convergence, and the teardown of all of it. Teardown was planned for PR 4, but PR 3 is the first PR to *create* objects, so shipping removal later would strand them | Integration: publication contents and exclusions, steady-state no-op, teardown (including after a failed pass) proven against real servers |
 | 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; the slot and subscription half of teardown; `PostgresDB` teardown ordering; `TargetTableNotEmpty` | Integration: rows stream through filters and column lists; steady-state no-op; teardown with both servers, with either unreachable, and leaving no table-sync slots |
-| 5 | Health: observation, `status.health`, `Streaming` condition, `Degraded` phase, metrics, `PrometheusRule` | Integration: lag, stall and lost-slot states produced on demand |
-| 6 | State API | Projection tests; credential-leak test extended |
-| 7 | Dashboard | `make ui-check`, `make ui-image-check`, exercised on `make local-ui` |
+| 5 | Health: observation (also after a failed pass), `status.health`, `Streaming` condition, `Degraded` phase, a 60s `reconcile.replicationInterval` timer, metrics, `PrometheusRule` | Integration: Lagging, Stalled (broken login; real apply errors with the suspect named), SlotLost (a real `max_slot_wal_keep_size` invalidation), Disabled, observation without resolution |
+| 6 | State API: replications list/detail, replications on instance and database detail, the instance's readiness block, `Degraded`, overview counts and attention; the replication CRD optional on `/readyz` | Projection and filter tests; credential-leak test extended to every replication endpoint |
+| 7 | Dashboard: Replications list and detail (lag and retained WAL as meters against their thresholds; a per-table grid), replication panels on instance and database pages, the instance's readiness, an overview card, the nav entry | `make ui-check`, `make ui-image-check`, exercised on `make local-ui` |
 | — | Real-RDS gate | Every item above confirmed or the design adjusted. `CLAUDE.md` updated: four CRDs, the two-server harness |
 
 PRs 6 and 7 can proceed alongside 3–5 against fixture status objects.

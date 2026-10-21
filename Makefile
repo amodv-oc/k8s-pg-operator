@@ -75,7 +75,7 @@ chart-lint: ## helm lint and a render of every feature
 	helm template test $(CHART) --namespace $(NAMESPACE) >/dev/null
 	helm template test $(CHART) --namespace $(NAMESPACE) \
 	  --set replicaCount=2 --set peering.enabled=true \
-	  --set metrics.serviceMonitor.enabled=true \
+	  --set metrics.serviceMonitor.enabled=true --set metrics.prometheusRule.enabled=true \
 	  --set podDisruptionBudget.enabled=true \
 	  --set networkPolicy.enabled=true \
 	  --set api.ingress.enabled=true \

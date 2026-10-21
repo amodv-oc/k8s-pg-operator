@@ -11,8 +11,8 @@ PostgresDB         a database, its schemas, extensions, roles     (namespaced)
 PostgresUser       a login role and the access it holds           (namespaced)
 ```
 
-A fourth, `PostgresReplication`, replicates selected tables between instances.
-It is arriving in increments; see [PostgresReplication](#postgresreplication-namespaced-preview).
+A fourth, `PostgresReplication`, replicates selected tables between instances;
+see [PostgresReplication](#postgresreplication-namespaced).
 
 ## Table of contents
 
@@ -317,6 +317,8 @@ Values worth reviewing:
 | `ui.image.repository` | `ghcr.io/amodv-oc/k8s-pg-operator-ui` | The dashboard image, same pipeline |
 | `watchNamespaces` | `[]` (all) | `PostgresInstance` is always watched cluster-wide |
 | `reconcile.interval` | `300` | Full convergence pass, in seconds |
+| `reconcile.replicationInterval` | `60` | A `PostgresReplication`'s pass, which also observes its health |
+| `metrics.prometheusRule.enabled` | `false` | Alerts on replication health, for the Prometheus Operator |
 | `pushSecret.apiVersion` | `external-secrets.io/v1alpha1` | The version external-secrets serves `PushSecret` under |
 | `rbac.namespacedSecrets` | `false` | See below |
 | `api.enabled` | `true` | The state API container |
@@ -417,6 +419,15 @@ open http://localhost:8000/docs
 | `GET /api/v1/databases/{ns}/{name}` | Database plus the users granted on it |
 | `GET /api/v1/users` | `?namespace=` `?instance=` `?database=` `?access=` `?phase=` |
 | `GET /api/v1/users/{ns}/{name}` | One user |
+| `GET /api/v1/replications` | `?namespace=` `?instance=` (either end) `?database=` (either end, as `ns/name` or its database name) `?phase=` `?state=` |
+| `GET /api/v1/replications/{ns}/{name}` | One replication, with every table: subscribed and its sync state, or held back and why |
+
+Instance and database detail include the replications from or into them, and
+an instance reports its `logical_replication` readiness. A replication names
+its login's Secret and keys, never a value, and never the subscription's
+connection string. A missing `postgresreplications` CRD is reported on
+`/readyz` without failing it. Helm never upgrades CRDs, and a failed readiness
+check would take the dashboard down with it.
 
 ```console
 $ curl -s localhost:8000/api/v1/overview | jq
@@ -474,6 +485,7 @@ open http://localhost:8081/
 | Instances | Endpoint, server version, managing role and its privileges, SSL mode, retention; then every database and user on it |
 | Databases | Group roles, and **one row per schema** tagged `managed` / `orphaned` / `unmanaged` / `unowned` / `missing` with the grants each group role actually holds; extensions, denied parameters, and the users granted on it |
 | Users | Grants as *database → level → group role*, the credentials Secret **name and keys only**, PushSecret ref, and whether the password is generated or supplied |
+| Replications | Source → target, state, tables ready/subscribed, lag and retained WAL. Each replication shows lag and retained WAL as meters against its own thresholds, with every table and either its sync state or why it is held back. Instance pages add the server's replication readiness; instance and database pages list the replications that use them |
 
 Every view shows the raw conditions, so a `Drifted` resource names its reason —
 `RetainedOrphans`, `SchemaNotOwned`, `ParameterDenied`, `ImmutableFieldDrift` or
@@ -545,16 +557,13 @@ neither it nor the API authenticates. Gate it at the ingress.
 | `generatedSecret` | — | `name`, `namespace`, `keys`, `labels`, `annotations`, `includeUri`, `defaultDatabase` |
 | `pushSecret` | inherits instance | Overrides the instance default |
 
-### PostgresReplication (namespaced, preview)
+### PostgresReplication (namespaced)
 
 One-way logical replication of selected tables from a `PostgresDB` on one
 instance into a `PostgresDB` on another. The design is
 [`docs/design/replication.md`](docs/design/replication.md).
 
-**Preview: replication without health reporting.** This version creates and
-converges everything a replication needs, and rows stream. Lag, retained WAL
-and apply errors are reported from a later version. Until then, watch
-`pg_replication_slots` on the source. A pass:
+Every `reconcile.replicationInterval` seconds (60 by default), a pass:
 
 1. **Refuses a replication that can never work.** It checks that both
    `PostgresDB`s exist on different servers, and that both instances admit the
@@ -589,6 +598,32 @@ and apply errors are reported from a later version. Until then, watch
    tables change, so a new table is copied and then streams.
    `status.tables` counts subscribed tables and how many have finished their
    initial copy; the `TABLES` column shows ready/subscribed.
+
+5. **Observes health.** Lag and retained WAL come from the slot on the source.
+   The apply worker and the error counts come from the subscription on the
+   target. Together they set `status.replicationState`:
+
+   | State | When | Phase |
+   | --- | --- | --- |
+   | `Streaming` | Every table copied, worker running, under the thresholds | `Ready` |
+   | `Initializing` | Some table is still in its initial copy | `Ready` |
+   | `Disabled` | `spec.enabled: false` (the slot keeps retaining WAL) | `Ready` |
+   | `Lagging` | Lag over `alerting.maxLag`, or retained WAL over `alerting.maxRetainedWal`. Clears below 80% of the threshold, so it does not flap | `Degraded` |
+   | `Stalled` | Enabled but the worker is not running, error counts rose, or the slot has had no consumer for `alerting.maxSlotInactive` | `Degraded` |
+   | `SlotLost` | The slot is gone, or `max_slot_wal_keep_size` invalidated it. The replica can only be rebuilt: delete and recreate the resource | `Degraded` |
+
+   PostgreSQL counts apply errors but does not expose them, so a `Stalled`
+   message points at the target server's log (CloudWatch on RDS). When a
+   published table has a target-side problem, the message names it as the
+   likely cause. Health keeps being read even when a pass cannot resolve, for
+   example after its `PostgresDB` was deleted under `RETAIN`, because the slot
+   is still pinning WAL.
+
+```
+$ kubectl get postgresreplications -A
+NAMESPACE  NAME                 SOURCE           TARGET                        TABLES  LAG     STATE      PHASE  AGE
+team-a     orders-to-reporting  prod-rds/orders  reporting-rds/orders_replica  40/41   12 KiB  Streaming  Ready  9d
+```
 
 The target server, not the operator, connects to the source. If it cannot, the
 replication reports `SourceUnreachableFromTarget`. Set `source.connection.host`
@@ -637,6 +672,7 @@ replication uses it, in either direction.
 kubectl get postgresinstances
 kubectl get postgresdbs -A
 kubectl get postgresusers -A
+kubectl get postgresreplications -A
 kubectl describe postgresdb orders -n team-a
 ```
 
@@ -649,9 +685,17 @@ is recognisable. `lastTransitionTime` only moves when the status actually flips.
 | `Reachable` | The server answered |
 | `Synced` | Spec fully applied. `False` when something in the spec cannot be satisfied |
 | `Drifted` | Live state diverges from the spec and this pass did not converge it |
+| `Streaming` | `PostgresReplication` only: whether changes flow as they should. Its reason is the replication's state |
 
 `status.phase` collapses these into one printer column: `Ready`, `Drifted`,
-`Unreachable`, `Failed`, `Paused`, `Pending`.
+`Degraded`, `Unreachable`, `Failed`, `Paused`, `Pending`. `Degraded` is a
+`PostgresReplication` that reconciled but whose data is not flowing as it
+should: Lagging, Stalled or SlotLost. It outranks `Drifted`.
+
+Every pass that ends `Drifted` or `Degraded` also emits a `Warning` event of
+that reason, carrying the condition's message. A `Degraded` replication whose
+`Drifted` condition is also true emits both. `pg_operator_resource_ready` is 1
+for `Ready` and `Drifted` only, so a `Degraded` replication reads 0.
 
 `Drifted` covers two different situations, and its `reason` says which:
 
@@ -686,7 +730,28 @@ pg_operator_reconcile_total{kind,outcome}
 pg_operator_reconcile_duration_seconds{kind}
 pg_operator_resource_ready{kind,namespace,name}
 pg_operator_teardown_total{kind,outcome}
+
+pg_operator_replication_lag_bytes{namespace,name}
+pg_operator_replication_retained_wal_bytes{namespace,name}
+pg_operator_replication_slot_active{namespace,name}
+pg_operator_replication_worker_running{namespace,name}
+pg_operator_replication_tables{namespace,name,state}       published|subscribed|ready|syncing|excluded
+pg_operator_replication_errors{namespace,name,kind}        apply|sync (a gauge: server stats can reset)
+pg_operator_replication_state{namespace,name,state}        1 for the current state
+pg_operator_replication_observed_timestamp_seconds{namespace,name}
 ```
+
+A replication's series are removed when it is deleted. With
+`metrics.prometheusRule.enabled`, the chart adds alerts. They key off
+`pg_operator_replication_state`, so each replication's own thresholds decide
+when they fire:
+
+- `SlotLost` fires immediately, as critical.
+- `Stalled` and `Lagging` fire after `metrics.prometheusRule.for`.
+- Rising error counts raise a warning.
+- So does a replication nothing has observed for three intervals. That means
+  the operator, or its access to the servers, is down, and the slot is
+  unwatched.
 
 ### Logical replication readiness
 
@@ -860,7 +925,7 @@ with Docker so no registry is needed.
 
 ```bash
 make local-up        # build both images, start the servers, install the operator
-make local-status    # phases for all three kinds
+make local-status    # phases for all four kinds
 make local-verify    # connect as each generated user and assert its privileges
 make local-test      # the full pytest suite against each server in turn
 make local-ui        # port-forward the dashboard to localhost:8081
@@ -913,8 +978,15 @@ src/pg_operator/
     database.py      databases, schemas, extensions, parameters
     privileges.py    the OWNER/RW/RO grant matrix
     settings.py      pg_db_role_setting parsing
+    replication.py   what a server can take part in (wal_level, slots, rights)
+    publication.py   the catalog facts a table is judged on; publication DDL
+    subscription.py  subscriptions, slots, and their health
+    filters.py       the row-filter DSL, composed as SQL
+  units.py           Kubernetes quantities and durations; byte formatting
   k8s/               client, cross-namespace Secrets, PushSecret, CR access
-  reconcile/         instance, database and user convergence + teardown
+  reconcile/         convergence + teardown for each kind; for replication also
+                     eligibility.py (which tables may be published) and
+                     health.py (the state a replication's numbers put it in)
   handlers/          kopf registration, retry mapping, metrics
   api/               FastAPI state API
 ```

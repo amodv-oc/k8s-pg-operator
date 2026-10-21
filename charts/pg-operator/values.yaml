@@ -59,6 +59,9 @@ reconcile:
   idle: 30
   # -- Backoff after a temporary failure, in seconds.
   retryBackoff: 30
+  # -- How often a PostgresReplication is converged and its health (lag,
+  # retained WAL, apply errors) observed, in seconds.
+  replicationInterval: 60
 
 postgres:
   connectTimeout: 10
@@ -161,6 +164,15 @@ metrics:
     labels: {}
     interval: 30s
     scrapeTimeout: 10s
+  # -- Alerts on replication health, for the Prometheus Operator. They key off
+  # pg_operator_replication_state, so each replication's own spec.alerting
+  # thresholds decide when Lagging fires.
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    labels: {}
+    # -- How long a replication may stay Lagging or Stalled before alerting.
+    for: 10m
 
 podDisruptionBudget:
   enabled: false

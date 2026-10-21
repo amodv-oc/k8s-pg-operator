@@ -12,5 +12,5 @@ router = APIRouter(tags=["overview"])
 
 @router.get("/overview", summary="Aggregate state", response_model=Overview)
 async def overview(store: StoreDep) -> Overview:
-    """Phase counts across all three kinds, plus anything needing attention."""
+    """Phase counts across every kind, plus anything needing attention."""
     return await store.overview()

@@ -16,6 +16,7 @@ import kopf
 from prometheus_client import Counter, Gauge, Histogram
 
 from ..config import get_settings
+from ..constants import COND_DRIFTED, COND_STREAMING
 from ..errors import (
     ConfigurationError,
     ConnectionFailure,
@@ -116,12 +117,23 @@ async def run_reconcile(
     RECONCILE_DURATION.labels(kind=kind).observe(time.monotonic() - started)
     RESOURCE_READY.labels(*labels).set(1 if status.get("phase") in {"Ready", "Drifted"} else 0)
 
-    if status.get("phase") == "Drifted":
+    conditions = {str(entry.get("type")): entry for entry in status.get("conditions") or []}
+    if status.get("phase") == "Degraded":
+        streaming = conditions.get(COND_STREAMING) or {}
+        kopf.event(
+            body,
+            type="Warning",
+            reason="Degraded",
+            message=str(streaming.get("message") or message),
+        )
+    # The condition, not the phase: a Degraded replication can be drifted too.
+    drift = conditions.get(COND_DRIFTED) or {}
+    if drift.get("status") == "True":
         kopf.event(
             body,
             type="Warning",
             reason="Drifted",
-            message=_drift_message(status) or message,
+            message=str(drift.get("message") or message),
         )
     logger.info(message)
     return message
@@ -222,13 +234,6 @@ async def _publish_failure(
         )
     except Exception as patch_exc:  # noqa: BLE001 - never mask the original error
         log.warning("could not publish failure status for %s: %s", kind, patch_exc)
-
-
-def _drift_message(status: dict[str, Any]) -> str:
-    for entry in status.get("conditions") or []:
-        if entry.get("type") == "Drifted" and entry.get("status") == "True":
-            return str(entry.get("message") or "")
-    return ""
 
 
 def is_paused(body: kopf.Body) -> bool:

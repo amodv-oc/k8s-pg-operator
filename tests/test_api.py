@@ -13,6 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pg_operator.api.main import create_app
+from pg_operator.api.schemas import ResourceRef
 from pg_operator.api.store import StateStore
 from pg_operator.config import Settings
 
@@ -467,3 +468,227 @@ def test_phase_message_falls_back_to_ready_when_in_sync() -> None:
         ]
     }
     assert phase_message(status) == "orders in sync"
+
+
+# --- replications ------------------------------------------------------------
+
+
+def replication_obj(
+    name: str,
+    namespace: str = "team-a",
+    phase: str = "Ready",
+    state: str = "Streaming",
+    **status: Any,
+) -> dict[str, Any]:
+    return {
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
+        "kind": "PostgresReplication",
+        "metadata": {"name": name, "namespace": namespace, "generation": 3},
+        "spec": {
+            "source": {"dbRef": {"name": "orders"}},
+            "target": {"dbRef": {"name": "orders-copy", "namespace": "analytics"}},
+            "schemas": [{"name": "public"}],
+            "alerting": {"maxLag": "512Mi"},
+        },
+        "status": {
+            "phase": phase,
+            "replicationState": state,
+            "source": {
+                "instance": "prod-rds", "database": "orders", "postgresDB": "team-a/orders",
+                "display": "prod-rds/orders", "publication": "pgop_x", "slot": "pgop_x",
+                "login": "pgop_repl_x",
+            },
+            "target": {
+                "instance": "reporting-rds", "database": "orders_copy",
+                "postgresDB": "analytics/orders-copy", "display": "reporting-rds/orders_copy",
+                "subscription": "pgop_x", "subscriptionOid": 16400,
+            },
+            "credentialsSecret": {"namespace": "pg-operator", "name": "pgop-repl.team-a.x", "generated": True},
+            "tables": {"published": 2, "subscribed": 2, "ready": 1, "syncing": 1, "excluded": 1},
+            "publishedTables": ["public.a", "public.b"],
+            "subscribedTables": [{"table": "public.a", "state": "r"}, {"table": "public.b", "state": "d"}],
+            "excludedTables": [{"table": "public.c", "reason": "TargetTableMissing", "message": "create it"}],
+            "health": {
+                "observedAt": "2026-10-21T00:00:00Z", "lag": "12 KiB", "lagBytes": 12288,
+                "retainedWal": "48 MiB", "retainedWalBytes": 50331648, "slotActive": True,
+                "walStatus": "reserved", "workerRunning": True, "applyErrorCount": 0,
+                "syncErrorCount": 0, "conflicts": {"insert_exists": 2},
+            },
+            "conditions": [
+                {"type": "Ready", "status": "True", "reason": "Reconciled", "message": "ok"},
+                {"type": "Streaming", "status": "True", "reason": state, "message": "flowing"},
+            ],
+            **status,
+        },
+    }
+
+
+def replication_store(items: dict[str, list[dict[str, Any]]], *replications: dict[str, Any]) -> StateStore:
+    return StateStore(  # type: ignore[arg-type]
+        FakeK8s({**items, "postgresreplications": list(replications)}), Settings(api_cache_ttl=0)
+    )
+
+
+DEGRADED = replication_obj(
+    "into-archive",
+    phase="Degraded",
+    state="Stalled",
+    conditions=[
+        {"type": "Ready", "status": "True", "reason": "Reconciled", "message": "ok"},
+        {"type": "Streaming", "status": "False", "reason": "Stalled", "message": "the apply worker is not running"},
+    ],
+)
+
+
+async def test_a_replication_is_projected_from_status(items) -> None:
+    store = replication_store(items, replication_obj("to-reporting"))
+    (replication,) = await store.replications()
+    assert replication.state == "Streaming"
+    assert replication.source.display == "prod-rds/orders"
+    assert replication.target.postgres_db == "analytics/orders-copy"
+    assert (replication.tables.ready, replication.tables.subscribed) == (1, 2)
+    assert replication.health is not None and replication.health.lag_bytes == 12288
+    assert replication.health.conflicts == {"insert_exists": 2}
+    assert replication.thresholds.max_lag_bytes == 512 * 1024**2
+    assert replication.thresholds.max_retained_wal == "10Gi"
+    assert replication.credentials_secret == ResourceRef(name="pgop-repl.team-a.x", namespace="pg-operator")
+    assert replication.secret_keys == ["username", "password"]
+    assert [t.state for t in replication.subscribed_tables] == ["r", "d"]
+
+
+async def test_before_its_first_pass_a_replication_shows_its_spec(items) -> None:
+    fresh = replication_obj("fresh")
+    fresh["status"] = {}
+    (replication,) = await replication_store(items, fresh).replications()
+    assert replication.phase == "Unknown"
+    assert replication.source.postgres_db == "team-a/orders"
+    assert replication.target.postgres_db == "analytics/orders-copy"
+    assert replication.health is None and replication.secret_keys == []
+
+
+async def test_a_provided_login_names_the_keys_of_its_own_secret(items) -> None:
+    provided = replication_obj("byo", credentialsSecret={"namespace": "team-a", "name": "byo", "generated": False})
+    provided["spec"]["source"]["credentialsSecretRef"] = {"name": "byo", "passwordKey": "PGPASSWORD"}
+    (replication,) = await replication_store(items, provided).replications()
+    assert replication.secret_keys == ["username", "PGPASSWORD"]
+
+
+async def test_a_degraded_replication_explains_itself_and_needs_attention(items) -> None:
+    store = replication_store(items, replication_obj("fine"), DEGRADED)
+    degraded = await store.replication("team-a", "into-archive")
+    assert degraded is not None and degraded.message == "the apply worker is not running"
+    overview = await store.overview()
+    assert (overview.replications.total, overview.replications.degraded) == (2, 1)
+    assert any(
+        line.startswith("PostgresReplication/team-a/into-archive is Degraded: the apply worker")
+        for line in overview.attention
+    )
+
+
+async def test_a_missing_replication_crd_is_an_empty_list(items) -> None:
+    class Missing(FakeCustomObjects):
+        async def list_cluster_custom_object(self, group: str, version: str, plural: str, **kw: Any):
+            if plural == "postgresreplications":
+                from kubernetes_asyncio.client.exceptions import ApiException
+
+                raise ApiException(status=404)
+            return await super().list_cluster_custom_object(group, version, plural, **kw)
+
+    k8s = FakeK8s(items)
+    k8s.custom = Missing(items)
+    store = StateStore(k8s, Settings(api_cache_ttl=0))  # type: ignore[arg-type]
+    assert await store.replications() == []
+    assert (await store.overview()).replications.total == 0
+    health = await store.health()
+    # Reported, but not fatal: the rest of the API still serves.
+    assert health.crds["postgresreplications"] is False
+    assert health.status == "ok"
+
+
+@pytest.fixture
+def replication_client(items) -> TestClient:
+    store = replication_store(
+        items,
+        replication_obj("to-reporting"),
+        DEGRADED,
+        replication_obj("other-team", namespace="team-b", state="Lagging", phase="Degraded"),
+    )
+    app = create_app()
+
+    class Provider:
+        async def store(self) -> StateStore:
+            return store
+
+        async def close(self) -> None:
+            return None
+
+    with TestClient(app) as test_client:
+        test_client.app.state.provider = Provider()  # type: ignore[attr-defined]
+        yield test_client
+
+
+@pytest.mark.parametrize(
+    ("query", "names"),
+    [
+        ("", ["into-archive", "to-reporting", "other-team"]),
+        ("?namespace=team-b", ["other-team"]),
+        ("?instance=reporting-rds", ["into-archive", "to-reporting", "other-team"]),
+        ("?instance=nowhere", []),
+        ("?database=team-a/orders", ["into-archive", "to-reporting", "other-team"]),
+        ("?database=orders_copy", ["into-archive", "to-reporting", "other-team"]),
+        ("?phase=degraded", ["into-archive", "other-team"]),
+        ("?state=Lagging", ["other-team"]),
+    ],
+)
+def test_replications_filter(replication_client: TestClient, query: str, names: list[str]) -> None:
+    body = replication_client.get(f"/api/v1/replications{query}").json()
+    assert [entry["name"] for entry in body] == names
+
+
+def test_a_replication_list_entry_is_a_summary_and_its_detail_has_the_tables(
+    replication_client: TestClient,
+) -> None:
+    listed = replication_client.get("/api/v1/replications?namespace=team-a").json()[0]
+    assert "subscribed_tables" not in listed
+    detail = replication_client.get("/api/v1/replications/team-a/to-reporting").json()
+    assert detail["subscribed_tables"] == [
+        {"table": "public.a", "state": "r"}, {"table": "public.b", "state": "d"},
+    ]
+    assert detail["excluded_tables"][0]["reason"] == "TargetTableMissing"
+    assert replication_client.get("/api/v1/replications/team-a/nope").status_code == 404
+
+
+def test_instance_and_database_pages_list_their_replications(replication_client: TestClient) -> None:
+    instance = replication_client.get("/api/v1/instances/prod-rds").json()
+    assert [r["name"] for r in instance["replication_list"]] == ["into-archive", "to-reporting", "other-team"]
+    database = replication_client.get("/api/v1/databases/team-a/orders").json()
+    assert {r["name"] for r in database["replications"]} == {"into-archive", "to-reporting", "other-team"}
+    assert replication_client.get("/api/v1/databases/team-b/billing").json()["replications"] == []
+
+
+def test_no_replication_response_exposes_a_credential(replication_client: TestClient) -> None:
+    for path in (
+        "/api/v1/replications",
+        "/api/v1/replications/team-a/to-reporting",
+        "/api/v1/instances/prod-rds",
+        "/api/v1/databases/team-a/orders",
+        "/api/v1/overview",
+    ):
+        body = replication_client.get(path).text.lower()
+        assert '"password":' not in body
+        assert "conninfo" not in body and "postgresql://" not in body
+
+
+def test_an_instance_reports_its_replication_readiness(items) -> None:
+    items["postgresinstances"][0]["status"]["logicalReplication"] = {
+        "walLevel": "replica", "createSubscription": "Assumed", "replicationGrant": "rds_replication",
+        "maxReplicationSlots": 20, "replicationSlotsInUse": 0, "maxWalSenders": 35,
+        "maxSlotWalKeepSize": "-1", "issues": ["wal_level is replica; set rds.logical_replication = 1"],
+    }
+    store = StateStore(FakeK8s(items), Settings(api_cache_ttl=0))  # type: ignore[arg-type]
+    import asyncio
+
+    instance = asyncio.run(store.instance("prod-rds"))
+    assert instance is not None and instance.logical_replication is not None
+    assert instance.logical_replication.wal_level == "replica"
+    assert instance.logical_replication.issues

@@ -132,6 +132,7 @@ export const STATE_META = {
 const PHASES = new Set([
   'Ready',
   'Drifted',
+  'Degraded',
   'Pending',
   'Paused',
   'Failed',
@@ -153,6 +154,13 @@ function splitPhase(text) {
   return { phase: null, text }
 }
 
+/** Namespaced kinds, and the dashboard section each one's page lives under. */
+const NAMESPACED_SECTIONS = {
+  PostgresDB: 'databases',
+  PostgresUser: 'users',
+  PostgresReplication: 'replications',
+}
+
 export function parseAttention(entry) {
   const space = entry.indexOf(' ')
   if (space === -1) return { text: entry, phase: null }
@@ -164,10 +172,52 @@ export function parseAttention(entry) {
   if (parts[0] === 'PostgresInstance' && parts.length === 2) {
     return { kind: parts[0], ref, text, phase, name: parts[1], to: `/instances/${parts[1]}` }
   }
-  if ((parts[0] === 'PostgresDB' || parts[0] === 'PostgresUser') && parts.length === 3) {
+  if (NAMESPACED_SECTIONS[parts[0]] && parts.length === 3) {
     const [kind, namespace, name] = parts
-    const section = kind === 'PostgresDB' ? 'databases' : 'users'
-    return { kind, ref, text, phase, namespace, name, to: `/${section}/${namespace}/${name}` }
+    return {
+      kind,
+      ref,
+      text,
+      phase,
+      namespace,
+      name,
+      to: `/${NAMESPACED_SECTIONS[kind]}/${namespace}/${name}`,
+    }
   }
   return { text: entry, phase: null }
+}
+
+/** pg_subscription_rel.srsubstate, as words. */
+export const SYNC_STATES = {
+  i: { label: 'queued', tone: 'Pending', hint: 'waiting for its initial copy to start' },
+  d: { label: 'copying', tone: 'Pending', hint: 'initial copy in progress' },
+  f: { label: 'syncing', tone: 'Pending', hint: 'copy done; catching up with the stream' },
+  s: { label: 'syncing', tone: 'Pending', hint: 'handing over to the apply worker' },
+  r: { label: 'ready', tone: 'Ready', hint: 'streaming' },
+}
+
+/**
+ * Every table a replication knows of, in one list: what it subscribes (with
+ * its sync state), what it holds back (with the reason and remedy), and the
+ * warnings on published tables - so the grid can show each table once.
+ */
+export function replicationTableRows(replication) {
+  const rows = new Map()
+  for (const { table, state } of replication.subscribed_tables ?? []) {
+    rows.set(table, { table, sync: state, issues: [], warnings: [] })
+  }
+  for (const table of replication.published_tables ?? []) {
+    if (!rows.has(table)) rows.set(table, { table, sync: null, issues: [], warnings: [] })
+  }
+  for (const issue of replication.excluded_tables ?? []) {
+    const row = rows.get(issue.table) ?? { table: issue.table, sync: null, issues: [], warnings: [] }
+    row.issues.push(issue)
+    rows.set(issue.table, row)
+  }
+  for (const warning of replication.table_warnings ?? []) {
+    const row = rows.get(warning.table) ?? { table: warning.table, sync: null, issues: [], warnings: [] }
+    row.warnings.push(warning)
+    rows.set(warning.table, row)
+  }
+  return [...rows.values()].sort((a, b) => a.table.localeCompare(b.table))
 }

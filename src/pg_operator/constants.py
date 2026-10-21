@@ -42,6 +42,8 @@ COND_READY: Final = "Ready"
 COND_REACHABLE: Final = "Reachable"
 COND_SYNCED: Final = "Synced"
 COND_DRIFTED: Final = "Drifted"
+#: PostgresReplication only: whether changes are flowing as they should.
+COND_STREAMING: Final = "Streaming"
 
 # external-secrets.io PushSecret coordinates. Upstream still serves PushSecret
 # as v1alpha1 — the 0.14 promotion to v1 covered ExternalSecret/SecretStore but

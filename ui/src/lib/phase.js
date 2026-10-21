@@ -11,6 +11,7 @@
 const PHASE_TONES = {
   Ready: 'Ready',
   Drifted: 'Drifted',
+  Degraded: 'Degraded',
   Pending: 'Pending',
   Paused: 'Paused',
   Failed: 'Failed',
@@ -35,6 +36,7 @@ export function needsAttention(phase) {
 export const COUNTS = [
   { key: 'failed', label: 'Failed', phase: 'Failed' },
   { key: 'unreachable', label: 'Unreachable', phase: 'Unreachable' },
+  { key: 'degraded', label: 'Degraded', phase: 'Degraded' },
   { key: 'drifted', label: 'Drifted', phase: 'Drifted' },
   { key: 'pending', label: 'Pending', phase: 'Pending' },
   { key: 'unknown', label: 'Unknown', phase: 'Unknown' },
@@ -48,7 +50,7 @@ export const COUNTS = [
  * rather than the red because the resource did reconcile - something about the
  * live state diverges anyway.
  */
-const GOOD_WHEN_TRUE = new Set(['Ready', 'Reachable', 'Synced', 'Available'])
+const GOOD_WHEN_TRUE = new Set(['Ready', 'Reachable', 'Synced', 'Available', 'Streaming'])
 
 export function conditionTone(type, status) {
   if (status === 'Unknown') return 'Unknown'
@@ -75,4 +77,22 @@ export function accessTone(role) {
  */
 export function retentionTone(policy) {
   return policy === 'DROP' ? 'Failed' : 'Paused'
+}
+
+/**
+ * A replication's state, from its Streaming condition. Lagging, Stalled and
+ * SlotLost are what make the phase Degraded; Initializing and Disabled are
+ * healthy - a copy in progress, and a subscription switched off on purpose.
+ */
+export const REPLICATION_STATES = {
+  Streaming: { tone: 'Ready', hint: 'changes are flowing within the alerting thresholds' },
+  Initializing: { tone: 'Pending', hint: 'some tables are still in their initial copy' },
+  Disabled: { tone: 'Paused', hint: 'spec.enabled is false; the slot keeps retaining WAL' },
+  Lagging: { tone: 'Degraded', hint: 'lag or retained WAL is over its alerting threshold' },
+  Stalled: { tone: 'Failed', hint: 'changes are not being applied' },
+  SlotLost: { tone: 'Failed', hint: 'the slot is gone; the replica must be rebuilt' },
+}
+
+export function stateTone(state) {
+  return REPLICATION_STATES[state]?.tone ?? 'Unknown'
 }

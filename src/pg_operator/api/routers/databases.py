@@ -38,7 +38,7 @@ async def list_databases(
     "/{namespace}/{name}", summary="Get one database", response_model=DatabaseDetail
 )
 async def get_database(namespace: str, name: str, store: StoreDep) -> DatabaseDetail:
-    """A database plus the users granted access to it."""
+    """A database, the users granted access to it, and replications from or into it."""
     database = await store.database(namespace, name)
     if database is None:
         raise HTTPException(
@@ -51,7 +51,13 @@ async def get_database(namespace: str, name: str, store: StoreDep) -> DatabaseDe
         for user in await store.users()
         if any(grant.db_ref == reference for grant in user.grants)
     ]
+    replications = [
+        r
+        for r in await store.replications()
+        if reference in (r.source.postgres_db, r.target.postgres_db)
+    ]
     return DatabaseDetail(
         **database.model_dump(),
         users=sorted(users, key=lambda u: (u.namespace, u.name)),
+        replications=sorted(replications, key=lambda r: (r.namespace, r.name)),
     )

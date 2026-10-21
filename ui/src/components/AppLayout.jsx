@@ -14,6 +14,7 @@ import {
 } from '@mantine/core'
 import { useDisclosure } from '@mantine/hooks'
 import {
+  IconArrowsRightLeft,
   IconBook,
   IconDatabase,
   IconGauge,
@@ -36,6 +37,7 @@ const SECTIONS = [
   { to: '/instances', label: 'Instances', icon: IconServer2, kind: 'instances' },
   { to: '/databases', label: 'Databases', icon: IconDatabase, kind: 'databases' },
   { to: '/users', label: 'Users', icon: IconUsers, kind: 'users' },
+  { to: '/replications', label: 'Replications', icon: IconArrowsRightLeft, kind: 'replications' },
 ]
 
 /** The database mark the wordmark sits against. */

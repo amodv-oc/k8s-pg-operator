@@ -54,6 +54,10 @@ class Settings:
     retry_backoff: int = 30
     #: Hard ceiling on a single reconcile pass, in seconds.
     reconcile_timeout: int = 300
+    #: How often a PostgresReplication is converged and its health observed, in
+    #: seconds. Shorter than reconcile_interval: lag is worth knowing about
+    #: within a minute, and a pass over a converged replication only reads.
+    replication_interval: int = 60
 
     # --- postgres ----------------------------------------------------------
     connect_timeout: int = 10
@@ -91,6 +95,7 @@ class Settings:
             reconcile_idle=_env_int("PG_OPERATOR_RECONCILE_IDLE", 30),
             retry_backoff=_env_int("PG_OPERATOR_RETRY_BACKOFF", 30),
             reconcile_timeout=_env_int("PG_OPERATOR_RECONCILE_TIMEOUT", 300),
+            replication_interval=_env_int("PG_OPERATOR_REPLICATION_INTERVAL", 60),
             connect_timeout=_env_int("PG_OPERATOR_CONNECT_TIMEOUT", 10),
             statement_timeout_ms=_env_int("PG_OPERATOR_STATEMENT_TIMEOUT_MS", 30_000),
             pool_max_size=_env_int("PG_OPERATOR_POOL_MAX_SIZE", 4),

@@ -64,3 +64,18 @@ def parse_duration(value: str) -> int:
         )
     hours, minutes, seconds = (int(part[:-1]) if part else 0 for part in match.groups())
     return hours * 3600 + minutes * 60 + seconds
+
+
+_BINARY_UNITS = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+
+
+def format_bytes(value: int) -> str:
+    """``12 KiB``, ``1.5 GiB`` - for status a person reads; status keeps the bytes too."""
+    amount = float(value)
+    for unit in _BINARY_UNITS:
+        if abs(amount) < 1024 or unit == _BINARY_UNITS[-1]:
+            if unit == "B":
+                return f"{int(amount)} B"
+            return f"{amount:.1f} {unit}".replace(".0 ", " ")
+        amount /= 1024
+    raise AssertionError("unreachable")  # pragma: no cover

@@ -101,6 +101,8 @@ configuration from one place.
   value: {{ .Values.reconcile.idle | quote }}
 - name: PG_OPERATOR_RETRY_BACKOFF
   value: {{ .Values.reconcile.retryBackoff | quote }}
+- name: PG_OPERATOR_REPLICATION_INTERVAL
+  value: {{ .Values.reconcile.replicationInterval | quote }}
 - name: PG_OPERATOR_CONNECT_TIMEOUT
   value: {{ .Values.postgres.connectTimeout | quote }}
 - name: PG_OPERATOR_STATEMENT_TIMEOUT_MS

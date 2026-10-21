@@ -16,18 +16,34 @@ import time
 from typing import Any
 
 from ..config import Settings
-from ..constants import API_GROUP, API_VERSION, PLURAL_DATABASE, PLURAL_INSTANCE, PLURAL_USER
+from ..constants import (
+    API_GROUP,
+    API_VERSION,
+    PLURAL_DATABASE,
+    PLURAL_INSTANCE,
+    PLURAL_REPLICATION,
+    PLURAL_USER,
+)
 from ..k8s.client import K8sClient, is_forbidden, is_not_found
-from ..k8s.resources import list_databases, list_instances, list_users
+from ..k8s.resources import list_databases, list_instances, list_replications, list_users
+from ..models import AlertingSpec
 from .schemas import (
     DatabaseSummary,
     GrantSummary,
     GroupRoleSummary,
     Health,
     InstanceSummary,
+    LogicalReplicationSummary,
     Overview,
     PhaseCounts,
+    ReplicationDetail,
+    ReplicationEndSummary,
+    ReplicationHealthSummary,
+    ReplicationTables,
+    ReplicationThresholds,
     ResourceRef,
+    SubscribedTable,
+    TableIssue,
     UserSummary,
     conditions_of,
     phase_message,
@@ -36,9 +52,13 @@ from .schemas import Phase as PhaseLiteral
 
 log = logging.getLogger(__name__)
 
+_REQUIRED_CRDS = (PLURAL_INSTANCE, PLURAL_DATABASE, PLURAL_USER)
+_OPTIONAL_CRDS = (PLURAL_REPLICATION,)
+
 _KNOWN_PHASES = {
     "Ready",
     "Drifted",
+    "Degraded",
     "Pending",
     "Paused",
     "Failed",
@@ -119,11 +139,33 @@ class StateStore:
                 return item
         return None
 
+    # -- replications -------------------------------------------------------
+
+    async def replications(self, namespace: str | None = None) -> list[ReplicationDetail]:
+        async def _load() -> list[ReplicationDetail]:
+            try:
+                items = await list_replications(self._k8s, namespace)
+            except Exception as exc:
+                # A chart upgrade does not upgrade CRDs: until the new one is
+                # applied there is simply nothing to show, not an error.
+                if is_not_found(exc):
+                    return []
+                raise
+            return [_replication_detail(item) for item in items]
+
+        return await self._cached(f"replications/{namespace or '*'}", _load)
+
+    async def replication(self, namespace: str, name: str) -> ReplicationDetail | None:
+        for item in await self.replications(namespace):
+            if item.name == name:
+                return item
+        return None
+
     # -- aggregates ---------------------------------------------------------
 
     async def overview(self) -> Overview:
-        instances, databases, users = await asyncio.gather(
-            self.instances(), self.databases(), self.users()
+        instances, databases, users, replications = await asyncio.gather(
+            self.instances(), self.databases(), self.users(), self.replications()
         )
         attention: list[str] = []
         for item in instances:
@@ -150,6 +192,13 @@ class StateStore:
                     f"PostgresUser/{user.namespace}/{user.name} is {user.phase}"
                     + (f": {user.message}" if user.message else "")
                 )
+        for replication in replications:
+            if replication.phase not in {"Ready", "Paused"}:
+                attention.append(
+                    f"PostgresReplication/{replication.namespace}/{replication.name} is "
+                    f"{replication.phase}"
+                    + (f": {replication.message}" if replication.message else "")
+                )
 
         from .. import status as st
 
@@ -157,6 +206,7 @@ class StateStore:
             instances=_count_phases(item.phase for item in instances),
             databases=_count_phases(item.phase for item in databases),
             users=_count_phases(item.phase for item in users),
+            replications=_count_phases(item.phase for item in replications),
             healthy=not attention,
             attention=attention,
             generated_at=st.now(),
@@ -167,7 +217,7 @@ class StateStore:
         crds: dict[str, bool] = {}
         kubernetes_ok = True
         detail: str | None = None
-        for plural in (PLURAL_INSTANCE, PLURAL_DATABASE, PLURAL_USER):
+        for plural in (*_REQUIRED_CRDS, *_OPTIONAL_CRDS):
             try:
                 await self._k8s.custom.list_cluster_custom_object(
                     group=API_GROUP, version=API_VERSION, plural=plural, limit=1
@@ -183,7 +233,10 @@ class StateStore:
                     kubernetes_ok = False
                     detail = f"Kubernetes API error listing {plural}: {exc}"
 
-        ok = kubernetes_ok and all(crds.values())
+        # A missing replication CRD is reported, not fatal: Helm installs CRDs
+        # but never upgrades them, and failing readiness would take the whole
+        # pod - dashboard included - out of service until someone applied it.
+        ok = kubernetes_ok and all(crds[plural] for plural in _REQUIRED_CRDS)
         return Health(
             status="ok" if ok else "degraded",
             kubernetes=kubernetes_ok,
@@ -220,6 +273,7 @@ def _instance_summary(obj: dict[str, Any]) -> InstanceSummary:
         credentials_secret=status.get("credentialsSecret")
         or (f"{ref.get('namespace', '')}/{ref.get('name', '')}".strip("/") or None),
         push_secrets_available=status.get("pushSecretsAvailable"),
+        logical_replication=_logical_replication(status.get("logicalReplication")),
         databases=int(status.get("databases") or 0),
         users=int(status.get("users") or 0),
         paused=bool(spec.get("paused")),
@@ -321,6 +375,143 @@ def _user_summary(obj: dict[str, Any]) -> UserSummary:
     )
 
 
+def _logical_replication(block: Any) -> LogicalReplicationSummary | None:
+    if not isinstance(block, dict):
+        return None
+    return LogicalReplicationSummary(
+        wal_level=block.get("walLevel"),
+        max_replication_slots=block.get("maxReplicationSlots"),
+        replication_slots_in_use=block.get("replicationSlotsInUse"),
+        max_wal_senders=block.get("maxWalSenders"),
+        max_slot_wal_keep_size=block.get("maxSlotWalKeepSize"),
+        create_subscription=block.get("createSubscription"),
+        replication_grant=block.get("replicationGrant"),
+        issues=_strings(block.get("issues")),
+    )
+
+
+def _replication_detail(obj: dict[str, Any]) -> ReplicationDetail:
+    meta = obj.get("metadata") or {}
+    spec = obj.get("spec") or {}
+    status = obj.get("status") or {}
+    namespace = str(meta.get("namespace"))
+    source = status.get("source") or {}
+    target = status.get("target") or {}
+    credentials = status.get("credentialsSecret") or {}
+    provided = (spec.get("source") or {}).get("credentialsSecretRef") or {}
+    generated = credentials.get("generated")
+    if not credentials.get("name"):
+        keys: list[str] = []
+    elif generated:
+        keys = ["username", "password"]
+    else:
+        keys = [provided.get("usernameKey") or "username", provided.get("passwordKey") or "password"]
+    tables = status.get("tables") or {}
+    return ReplicationDetail(
+        name=str(meta.get("name")),
+        namespace=namespace,
+        phase=_phase(status),
+        state=status.get("replicationState"),
+        source=_end(source, (spec.get("source") or {}).get("dbRef"), namespace),
+        target=_end(target, (spec.get("target") or {}).get("dbRef"), namespace),
+        tables=ReplicationTables(
+            **{key: int(tables[key]) for key in ReplicationTables.model_fields if key in tables}
+        ),
+        health=_replication_health(status.get("health")),
+        thresholds=_thresholds(spec.get("alerting")),
+        enabled=bool(spec.get("enabled", True)),
+        paused=bool(spec.get("paused")),
+        publication=source.get("publication"),
+        subscription=target.get("subscription"),
+        slot=source.get("slot"),
+        login=source.get("login"),
+        credentials_secret=(
+            ResourceRef(name=credentials["name"], namespace=credentials.get("namespace"))
+            if credentials.get("name")
+            else None
+        ),
+        credentials_generated=generated,
+        secret_keys=keys,
+        excluded_tables=_issues(status.get("excludedTables")),
+        published_tables=_strings(status.get("publishedTables")),
+        subscribed_tables=[
+            SubscribedTable(table=str(entry.get("table")), state=str(entry.get("state")))
+            for entry in status.get("subscribedTables") or []
+        ],
+        table_warnings=_issues(status.get("tableWarnings")),
+        last_reconciled_at=status.get("lastReconciledAt"),
+        observed_generation=status.get("observedGeneration"),
+        generation=meta.get("generation"),
+        creation_timestamp=meta.get("creationTimestamp"),
+        conditions=conditions_of(status),
+        message=phase_message(status),
+    )
+
+
+def _end(recorded: dict[str, Any], ref: Any, namespace: str) -> ReplicationEndSummary:
+    """One side of a replication; before its first pass, only the spec's dbRef is known."""
+    ref = ref if isinstance(ref, dict) else {}
+    fallback = f"{ref.get('namespace') or namespace}/{ref['name']}" if ref.get("name") else None
+    return ReplicationEndSummary(
+        instance=recorded.get("instance"),
+        database=recorded.get("database"),
+        postgres_db=recorded.get("postgresDB") or fallback,
+        display=recorded.get("display"),
+    )
+
+
+_HEALTH_KEYS = {
+    "observed_at": "observedAt",
+    "lag": "lag",
+    "lag_bytes": "lagBytes",
+    "retained_wal": "retainedWal",
+    "retained_wal_bytes": "retainedWalBytes",
+    "safe_wal_size_bytes": "safeWalSizeBytes",
+    "slot_active": "slotActive",
+    "wal_status": "walStatus",
+    "inactive_since": "inactiveSince",
+    "worker_running": "workerRunning",
+    "last_message_at": "lastMessageAt",
+    "apply_error_count": "applyErrorCount",
+    "sync_error_count": "syncErrorCount",
+}
+
+
+def _replication_health(block: Any) -> ReplicationHealthSummary | None:
+    if not isinstance(block, dict) or not block:
+        return None
+    return ReplicationHealthSummary(
+        **{field: block.get(key) for field, key in _HEALTH_KEYS.items()},
+        conflicts={str(key): int(value) for key, value in (block.get("conflicts") or {}).items()},
+    )
+
+
+def _thresholds(alerting: Any) -> ReplicationThresholds:
+    try:
+        spec = AlertingSpec.model_validate(alerting or {})
+    except ValueError:
+        spec = AlertingSpec()
+    return ReplicationThresholds(
+        max_lag=str(spec.max_lag),
+        max_lag_bytes=spec.max_lag_bytes,
+        max_retained_wal=str(spec.max_retained_wal),
+        max_retained_wal_bytes=spec.max_retained_wal_bytes,
+        max_slot_inactive=spec.max_slot_inactive,
+        max_slot_inactive_seconds=spec.max_slot_inactive_seconds,
+    )
+
+
+def _issues(entries: Any) -> list[TableIssue]:
+    return [
+        TableIssue(
+            table=str(entry.get("table", "")),
+            reason=str(entry.get("reason", "")),
+            message=str(entry.get("message", "")),
+        )
+        for entry in entries or []
+    ]
+
+
 def _endpoint_from_spec(spec: dict[str, Any]) -> str | None:
     host = spec.get("host")
     if not host:
@@ -343,6 +534,8 @@ def _count_phases(phases: Any) -> PhaseCounts:
                 counts.ready += 1
             case "Drifted":
                 counts.drifted += 1
+            case "Degraded":
+                counts.degraded += 1
             case "Failed":
                 counts.failed += 1
             case "Unreachable":

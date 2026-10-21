@@ -364,7 +364,12 @@ spec:
               properties:
                 observedGeneration: { type: integer }
                 phase: { type: string }
-                replicationState: { type: string }
+                replicationState:
+                  type: string
+                  description: >-
+                    Initializing, Streaming, Lagging, Stalled, SlotLost or
+                    Disabled. Lagging, Stalled and SlotLost make the phase
+                    Degraded.
                 lastReconciledAt: { type: string }
                 source:
                   type: object
@@ -467,16 +472,42 @@ spec:
                       applied: { type: string }
                 health:
                   type: object
+                  description: >-
+                    Measured on every pass (reconcile.replicationInterval),
+                    so unlike the rest of status it changes in steady state.
+                    Lag and retained WAL are read from the slot on the source;
+                    the worker and error counts from the subscription on the
+                    target.
                   properties:
                     observedAt: { type: string }
                     lag: { type: string }
                     lagBytes: { type: integer }
+                    retainedWal: { type: string }
                     retainedWalBytes: { type: integer }
+                    safeWalSizeBytes:
+                      type: integer
+                      description: WAL that can still be written before max_slot_wal_keep_size invalidates the slot.
                     slotActive: { type: boolean }
                     walStatus: { type: string }
+                    inactiveSince:
+                      type: string
+                      description: When the slot was first seen without a consumer.
                     workerRunning: { type: boolean }
+                    lastMessageAt: { type: string }
                     applyErrorCount: { type: integer }
                     syncErrorCount: { type: integer }
+                    conflicts:
+                      type: object
+                      description: PostgreSQL 18's conflict counters, by kind.
+                      additionalProperties: { type: integer }
+                subscribedTables:
+                  type: array
+                  description: Each subscribed table and its sync state - i init, d copying, f/s syncing, r ready.
+                  items:
+                    type: object
+                    properties:
+                      table: { type: string }
+                      state: { type: string }
                 conditions:
                   type: array
                   items:

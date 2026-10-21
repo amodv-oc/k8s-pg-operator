@@ -58,6 +58,10 @@
   --pgop-tone-Ready-fg: #00543a;
   --pgop-tone-Drifted-bg: #faf6ee;
   --pgop-tone-Drifted-fg: #8a6a2c;
+  /* Burnt orange, between Drifted's gold and Failed's red: the resource
+     reconciled, but data is not flowing as it should. 6.5:1 on its bg. */
+  --pgop-tone-Degraded-bg: #fdeee6;
+  --pgop-tone-Degraded-fg: #9a3412;
   --pgop-tone-Pending-bg: #edebe9;
   --pgop-tone-Pending-fg: #1e3932;
   --pgop-tone-Paused-bg: #edebe9;
@@ -116,6 +120,8 @@
   --pgop-tone-Ready-fg: #8fd6bb;
   --pgop-tone-Drifted-bg: rgb(203 162 88 / 0.2);
   --pgop-tone-Drifted-fg: #e2c489;
+  --pgop-tone-Degraded-bg: rgb(234 88 12 / 0.22);
+  --pgop-tone-Degraded-fg: #fdba74;
   --pgop-tone-Pending-bg: rgb(255 255 255 / 0.1);
   --pgop-tone-Pending-fg: #cfe3db;
   --pgop-tone-Paused-bg: rgb(255 255 255 / 0.08);
@@ -426,4 +432,19 @@ body {
 .pgop-heading {
   color: var(--pgop-brand);
   letter-spacing: -0.16px;
+}
+
+/* A meter: a measurement against its threshold. The track is the fill's own
+   tone a step lighter, so the severity reads across the whole bar; the ends
+   are rounded like every other data mark. */
+.pgop-meter {
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.pgop-meter-fill {
+  height: 100%;
+  min-width: 4px;
+  border-radius: 4px;
 }

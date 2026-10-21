@@ -249,3 +249,28 @@ async def test_teardown_forgets_the_resource_gauge(cluster) -> None:
         kind="PostgresDB", body=_db(name="gone"), logger=_log, teardown=teardown
     )
     assert ("PostgresDB", "team-a", "gone") not in _ready_gauge_labels()
+
+
+async def test_degraded_warns_and_drift_still_warns_alongside(cluster, monkeypatch) -> None:
+    """Degraded outranks Drifted as the phase; the drift warning must not go quiet."""
+    events: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        kopf, "event", lambda _body, *, type, reason, message: events.append((reason, message))
+    )
+    body = _db()
+    cluster.custom.add(body, PLURAL_DATABASE)
+
+    async def degraded() -> tuple[str, dict[str, Any]]:
+        return "ok", {
+            "phase": "Degraded",
+            "conditions": [
+                {"type": "Ready", "status": "True", "reason": "Reconciled", "message": "ok"},
+                {"type": "Streaming", "status": "False", "reason": "Lagging", "message": "lag is over"},
+                {"type": "Drifted", "status": "True", "reason": "TargetTableMissing", "message": "held back"},
+            ],
+        }
+
+    await run_reconcile(
+        kind="PostgresReplication", plural=PLURAL_DATABASE, body=body, logger=_log, reconcile=degraded
+    )
+    assert events == [("Degraded", "lag is over"), ("Drifted", "held back")]
