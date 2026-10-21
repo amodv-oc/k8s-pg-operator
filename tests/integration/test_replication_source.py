@@ -446,3 +446,86 @@ async def test_a_partitioned_table_publishes_its_root(world: World) -> None:
     assert "public.readings" in status["publishedTables"]
     assert "public.readings_2026" not in status["publishedTables"]
 
+
+
+async def test_a_deferrable_primary_key_is_no_replica_identity(world: World) -> None:
+    """PostgreSQL never uses a DEFERRABLE key as the identity, so published, this UPDATE would fail."""
+    await world.on_source(
+        "CREATE TABLE public.deferred (id int PRIMARY KEY DEFERRABLE, v text)", as_owner=True
+    )
+    await world.on_target("CREATE TABLE public.deferred (id int PRIMARY KEY, v text)", as_owner=True)
+    status = await world.run()
+    assert world.excluded()["public.deferred"] == "NoReplicaIdentity"
+    assert "public.deferred" not in status["publishedTables"]
+    await world.on_source(
+        "INSERT INTO public.deferred VALUES (1, 'a')", "UPDATE public.deferred SET v = 'b'", as_owner=True
+    )
+
+
+async def test_a_deferrable_primary_key_on_the_target_identifies_no_row(world: World) -> None:
+    """The apply worker passes over it too, and would stop the whole subscription."""
+    await world.on_source("CREATE TABLE public.deferred (id int PRIMARY KEY, v text)", as_owner=True)
+    await world.on_target(
+        "CREATE TABLE public.deferred (id int PRIMARY KEY DEFERRABLE, v text)", as_owner=True
+    )
+    status = await world.run()
+    assert world.excluded()["public.deferred"] == "TargetNoReplicaIdentity"
+    assert "public.deferred" not in status["publishedTables"]
+
+
+async def test_replica_identity_full_takes_no_column_list(world: World) -> None:
+    """Even a list naming every column: the source would refuse the table's UPDATEs and DELETEs."""
+    table = "CREATE TABLE public.wholerow (id int, v text)"
+    await world.on_source(table, "ALTER TABLE public.wholerow REPLICA IDENTITY FULL", as_owner=True)
+    await world.on_target(table, as_owner=True)
+    world.replication["spec"]["tables"].append(
+        {"schema": "public", "name": "wholerow", "columns": ["id", "v"]}
+    )
+    status = await world.run()
+    assert world.excluded()["public.wholerow"] == "ColumnListMissesIdentity"
+    assert "public.wholerow" not in status["publishedTables"]
+    await world.on_source(
+        "INSERT INTO public.wholerow VALUES (1, 'a')", "UPDATE public.wholerow SET v = 'b'", as_owner=True
+    )
+
+    world.replication["spec"]["tables"].pop()
+    status = await world.run()
+    assert "public.wholerow" in status["publishedTables"]
+    await world.on_source("UPDATE public.wholerow SET v = 'c'", as_owner=True)
+
+
+async def test_an_unlogged_partition_holds_its_table_back(world: World) -> None:
+    """Its changes are never in the WAL, so they would never reach the target."""
+    root = "CREATE TABLE public.metrics (id int, at date, PRIMARY KEY (id, at)) PARTITION BY RANGE (at)"
+    leaf = "PARTITION OF public.metrics FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"
+    await world.on_source(root, f"CREATE UNLOGGED TABLE public.metrics_2026 {leaf}", as_owner=True)
+    await world.on_target(root, f"CREATE TABLE public.metrics_2026 {leaf}", as_owner=True)
+    status = await world.run()
+    assert world.excluded()["public.metrics"] == "NotPublishable"
+    assert "public.metrics" not in status["publishedTables"]
+
+    await world.on_source("ALTER TABLE public.metrics_2026 SET LOGGED", as_owner=True)
+    status = await world.run()
+    assert "public.metrics" in status["publishedTables"]
+
+
+async def test_a_generated_column_in_a_full_identity_is_held_back_on_18(world: World) -> None:
+    """PostgreSQL 18 refuses UPDATE and DELETE when the identity holds an unpublished generated column."""
+    async with world.pools.connection(world.source) as conn:
+        version = await fetch_scalar(conn, sql.SQL("SELECT current_setting('server_version_num')::int"))
+    await world.on_source(
+        "CREATE TABLE public.derived (id int, a int, g int GENERATED ALWAYS AS (a * 2) STORED)",
+        "ALTER TABLE public.derived REPLICA IDENTITY FULL",
+        as_owner=True,
+    )
+    await world.on_target("CREATE TABLE public.derived (id int PRIMARY KEY, a int, g int)", as_owner=True)
+    status = await world.run()
+    if version < 180000:
+        # Older publishers have no such check, and send whole rows without it.
+        assert "public.derived" in status["publishedTables"]
+        return
+    assert world.excluded()["public.derived"] == "GeneratedColumnInIdentity"
+    assert "public.derived" not in status["publishedTables"]
+    await world.on_source(
+        "INSERT INTO public.derived (id, a) VALUES (1, 1)", "UPDATE public.derived SET a = 2", as_owner=True
+    )

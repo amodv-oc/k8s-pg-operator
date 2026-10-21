@@ -172,6 +172,12 @@ _INDEX_KEY_COLUMNS = """
 
 #: The index a replica identity uses: the primary key by default, or the index
 #: chosen with REPLICA IDENTITY USING INDEX.
+#:
+#: A DEFERRABLE primary key is no replica identity at all. PostgreSQL's
+#: relcache passes over it when it picks the identity index (``indimmediate``
+#: is false), so the source refuses UPDATE and DELETE on a published table whose
+#: only key is deferrable. USING INDEX cannot name a deferrable index in the
+#: first place, so only the primary-key branch needs the test.
 _IDENTITY_COLUMNS = sql.SQL(
     """
     SELECT i.indrelid, a.attname
@@ -180,7 +186,7 @@ _IDENTITY_COLUMNS = sql.SQL(
     + """
       JOIN pg_class c ON c.oid = i.indrelid
      WHERE i.indrelid = ANY(%s::oid[]) AND i.indisvalid
-       AND ((c.relreplident = 'd' AND i.indisprimary)
+       AND ((c.relreplident = 'd' AND i.indisprimary AND i.indimmediate)
          OR (c.relreplident = 'i' AND i.indisreplident))
     """
 )
@@ -189,15 +195,16 @@ _IDENTITY_COLUMNS = sql.SQL(
 #: primary key whenever no replica-identity index applies, so REPLICA IDENTITY
 #: NOTHING or FULL on a target that has a primary key still identifies rows -
 #: while REPLICA IDENTITY FULL *without* one identifies nothing, because the
-#: fallback is to an index, never to the whole row.
+#: fallback is to an index, never to the whole row. The fallback skips a
+#: DEFERRABLE primary key, exactly as the publisher does.
 _TARGET_IDENTITY_COLUMNS = sql.SQL(
     """
-    SELECT i.indrelid, i.indisprimary, i.indisreplident, a.attname
+    SELECT i.indrelid, i.indisprimary AND i.indimmediate, i.indisreplident, a.attname
     """
     + _INDEX_KEY_COLUMNS
     + """
      WHERE i.indrelid = ANY(%s::oid[]) AND i.indisvalid
-       AND (i.indisprimary OR i.indisreplident)
+       AND ((i.indisprimary AND i.indimmediate) OR i.indisreplident)
     """
 )
 

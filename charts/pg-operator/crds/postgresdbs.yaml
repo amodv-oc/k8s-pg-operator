@@ -71,6 +71,12 @@ spec:
                   type: object
                   required: [name]
                   description: The cluster-scoped PostgresInstance to create this database on.
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: >-
+                        instanceRef is immutable. Changing it would orphan the
+                        existing database, and any replication slot or
+                        subscription on it; create a new PostgresDB instead.
                   properties:
                     name:
                       type: string

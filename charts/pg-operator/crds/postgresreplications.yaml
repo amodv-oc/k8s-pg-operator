@@ -223,9 +223,10 @@ spec:
                       columns:
                         type: array
                         description: >-
-                          Publish only these columns. Must include every
-                          replica-identity column when update or delete is
-                          published. Empty publishes all.
+                          Publish only these columns. When update or delete is
+                          published, must include every replica-identity column,
+                          and is not allowed at all on a table with REPLICA
+                          IDENTITY FULL. Empty publishes all.
                         x-kubernetes-list-type: set
                         items:
                           type: string
@@ -298,6 +299,17 @@ spec:
                 publishViaPartitionRoot:
                   type: boolean
                   default: false
+                  description: >-
+                    Publish a partitioned table's changes under its own name
+                    rather than its leaves'. Immutable: switching it swaps the
+                    relations the subscription carries, and the swapped-in ones
+                    would be copied over rows the target already holds.
+                  x-kubernetes-validations:
+                    - rule: "self == oldSelf"
+                      message: >-
+                        publishViaPartitionRoot is immutable. Switching it would
+                        copy every partitioned table again over the rows already
+                        replicated; create a new PostgresReplication instead.
                 copyData:
                   type: boolean
                   default: true

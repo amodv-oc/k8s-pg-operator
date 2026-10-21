@@ -198,9 +198,39 @@ async def resolve_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> Res
             f"server ({source.host}:{source.port}); replication within one server "
             "is not supported"
         )
+    _refuse_moved_ends(obj.get("status") or {}, source=source, target=target)
     _require_managed_schemas(spec, source, source_db)
     await _refuse_cycles(ctx, namespace, name, source, target)
     return Resolved(spec, source, target, source_db, source_instance)
+
+
+def _refuse_moved_ends(
+    existing: dict[str, Any], *, source: ReplicationEnd, target: ReplicationEnd
+) -> None:
+    """Refuse an end that now resolves to a different database from the one in status.
+
+    dbRef is immutable, but what it resolves to is not pinned by it: the
+    PostgresDB can be recreated under the same name on another instance (or
+    with another databaseName). Converging the new end would create a second
+    publication, login and slot there and overwrite status with them, and
+    teardown - which works from status alone - would never find the old slot
+    again, left retaining WAL on the old source. Refusing keeps status, and
+    with it observe_from_status's watch on that slot, exactly as it is.
+    """
+    if not any((existing.get("created") or {}).values()):
+        return
+    for side, end in (("source", source), ("target", target)):
+        recorded = existing.get(side) or {}
+        was = (recorded.get("instance"), recorded.get("database"))
+        if not all(was) or was == (end.instance, end.database):
+            continue
+        raise ConfigurationError(
+            f"the {side} PostgresDB {end.namespace}/{end.name} now resolves to "
+            f"{end.instance}/{end.database}, but this replication's objects are on "
+            f"{was[0]}/{was[1]}; converging would orphan them there. Point the PostgresDB "
+            "back, or delete this PostgresReplication - which removes them from where "
+            "status records them - and create a new one"
+        )
 
 
 async def reconcile_replication(
@@ -328,6 +358,7 @@ async def reconcile_replication(
                 copy_data=spec.copy_data,
                 subscribed=subscribed,
                 target_nonempty=nonempty,
+                source_major_version=source_instance.server.major_version,
             )
             for candidate in selected
         ]

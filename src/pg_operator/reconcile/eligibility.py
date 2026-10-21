@@ -9,10 +9,12 @@ apply for every other table.
 
 A reason is ``source``- or ``target``-sided, because they are handled
 differently once a table is already published (design D6): a source-side
-failure takes the table out of the publication immediately, since only that
-lets the source's writes through again; a target-side failure leaves it in,
-since the change that broke apply is already in the stream and removing the
-table cannot recall it.
+failure takes the table out of the publication immediately - for the
+replica-identity checks only that lets the source's writes through again, and
+a table the source cannot replicate whole (row security, an unlogged leaf) is
+not replicated at all rather than silently in part; a target-side failure
+leaves it in, since the change that broke apply is already in the stream and
+removing the table cannot recall it.
 """
 
 from __future__ import annotations
@@ -30,7 +32,13 @@ NOT_PUBLISHABLE = "NotPublishable"
 UNKNOWN_COLUMN = "UnknownColumn"
 NO_REPLICA_IDENTITY = "NoReplicaIdentity"
 ROW_FILTER_NOT_COVERED = "RowFilterNotCoveredByIdentity"
+#: Also given to a REPLICA IDENTITY FULL table with any column list: PostgreSQL
+#: allows none on such a table once UPDATE or DELETE is published.
 COLUMN_LIST_MISSES_IDENTITY = "ColumnListMissesIdentity"
+#: PostgreSQL 18 refuses UPDATE and DELETE on a table whose replica identity
+#: takes in a generated column the publication does not carry - and the
+#: operator never publishes generated columns.
+GENERATED_COLUMN_IN_IDENTITY = "GeneratedColumnInIdentity"
 FILTER_IGNORED_WITHOUT_ROOT = "FilterIgnoredWithoutPartitionRoot"
 SOURCE_TABLE_NOT_OWNED = "SourceTableNotOwned"
 SOURCE_TABLE_NOT_READABLE = "SourceTableNotReadable"
@@ -61,6 +69,10 @@ COLUMN_TYPE_MISMATCH = "ColumnTypeMismatch"
 
 #: pg_class.relkind values a publication can carry.
 PUBLISHABLE_KINDS = frozenset({"r", "p"})
+
+#: The first major version whose publisher refuses UPDATE and DELETE when the
+#: replica identity holds an unpublished generated column.
+GENERATED_IDENTITY_CHECK_VERSION = 18
 
 _KIND_NAMES = {"v": "a view", "m": "a materialised view", "f": "a foreign table"}
 
@@ -170,12 +182,14 @@ def judge(
     copy_data: bool = False,
     subscribed: frozenset[str] = frozenset(),
     target_nonempty: frozenset[str] = frozenset(),
+    source_major_version: int = 16,
 ) -> Verdict:
     """Decide one candidate. ``keyed`` means UPDATE or DELETE is published.
 
     ``subscribed`` is what the subscription already carries; with
     ``copy_data``, any other relation gets an initial copy, which must land in
-    an empty table.
+    an empty table. ``source_major_version`` is the source server's, since
+    what its publisher enforces differs by release.
     """
     q = candidate.qualified
     if source is None:
@@ -196,6 +210,30 @@ def judge(
         )
 
     issues: list[Issue] = []
+    # A partitioned table is always permanent, but its leaves need not be. An
+    # unlogged leaf writes no WAL, and a foreign one keeps its rows on another
+    # server, so neither is ever decoded: the table would replicate only in
+    # part, silently.
+    unlogged = [leaf.qualified for leaf in source.leaves if leaf.kind == "r" and not leaf.persistent]
+    if unlogged:
+        issues.append(
+            _source(
+                NOT_PUBLISHABLE,
+                f"{q} has unlogged partition(s) {', '.join(unlogged)}, whose changes are never "
+                "written to the WAL and so never replicated; make them permanent with "
+                "ALTER TABLE ... SET LOGGED",
+            )
+        )
+    foreign = [leaf.qualified for leaf in source.leaves if leaf.kind != "r"]
+    if foreign:
+        issues.append(
+            _source(
+                NOT_PUBLISHABLE,
+                f"{q} has foreign partition(s) {', '.join(foreign)}, whose rows live on another "
+                "server and are never replicated; replace them with local tables, or "
+                f"DETACH PARTITION them from {q}",
+            )
+        )
     filter_columns = candidate.row_filter.columns if candidate.row_filter else frozenset()
     unknown = sorted(
         column
@@ -221,8 +259,21 @@ def judge(
         )
 
     if keyed:
-        members = source.leaves if source.kind == "p" else (source,)
-        issues.extend(_identity_issues(candidate, members, filter_columns))
+        # Only what the publication carries is checked: a leaf held back above
+        # is never published, so the source enforces nothing on it.
+        members = (
+            tuple(leaf for leaf in source.leaves if _publishable(leaf))
+            if source.kind == "p"
+            else (source,)
+        )
+        issues.extend(
+            _identity_issues(
+                candidate,
+                members,
+                filter_columns,
+                generated_checked=source_major_version >= GENERATED_IDENTITY_CHECK_VERSION,
+            )
+        )
 
     if not source.owner_usable:
         issues.append(
@@ -341,6 +392,10 @@ def judge(
     return Verdict(candidate, tuple(issues), tuple(warnings))
 
 
+def _publishable(table: SourceTable) -> bool:
+    return table.kind in PUBLISHABLE_KINDS and table.persistent
+
+
 def _target_identity_issues(source: SourceTable, target: TargetTable) -> list[Issue]:
     """Whether the target can find the row an UPDATE or DELETE names.
 
@@ -360,10 +415,12 @@ def _target_identity_issues(source: SourceTable, target: TargetTable) -> list[Is
         return [
             _target(
                 TARGET_NO_REPLICA_IDENTITY,
-                f"{target.qualified} on the target has neither a primary key nor a REPLICA "  # noqa: S608 - status text, never executed
-                "IDENTITY index, so the apply worker could not find the rows to update or "
-                "delete and would stop the whole subscription; add a primary key there, or "
-                f"set REPLICA IDENTITY FULL on {source.qualified} at the source",
+                f"{target.qualified} on the target has no REPLICA IDENTITY index and no primary "  # noqa: S608 - status text, never executed
+                "key the apply worker can use (a DEFERRABLE one does not count), so it could "
+                "not find the rows to update or delete: it would stop the whole subscription, "
+                "or on PostgreSQL 18 skip those changes when the key is deferrable; add a "
+                f"primary key that is not DEFERRABLE there, or set REPLICA IDENTITY FULL on "
+                f"{source.qualified} at the source",
             )
         ]
     # The target may identify rows by fewer columns than the publisher sends,
@@ -384,9 +441,17 @@ def _target_identity_issues(source: SourceTable, target: TargetTable) -> list[Is
 
 
 def _identity_issues(
-    candidate: Candidate, members: tuple[SourceTable, ...], filter_columns: frozenset[str]
+    candidate: Candidate,
+    members: tuple[SourceTable, ...],
+    filter_columns: frozenset[str],
+    *,
+    generated_checked: bool,
 ) -> list[Issue]:
-    """Replica-identity checks; the source enforces each of them on every UPDATE and DELETE."""
+    """Replica-identity checks; the source enforces each of them on every UPDATE and DELETE.
+
+    ``generated_checked`` is whether the source is PostgreSQL 18 or later,
+    whose publisher also refuses an identity holding a generated column.
+    """
     issues: list[Issue] = []
     for member in members:
         identity = member.identity_columns
@@ -395,7 +460,8 @@ def _identity_issues(
                 _source(
                     NO_REPLICA_IDENTITY,
                     f"{member.qualified} has no replica identity: publishing it would make every "  # noqa: S608 - status text, never executed
-                    "UPDATE and DELETE on the source fail; add a primary key or set REPLICA IDENTITY",
+                    "UPDATE and DELETE on the source fail; add a primary key (one that is not "
+                    "DEFERRABLE, which PostgreSQL never uses as an identity) or set REPLICA IDENTITY",
                 )
             )
             continue
@@ -408,7 +474,38 @@ def _identity_issues(
                     "replica identity: the source would refuse UPDATE and DELETE on it",
                 )
             )
-        if candidate.columns:
+        if generated_checked and not candidate.columns:
+            # PostgreSQL 18's pub_contains_invalid_column: with FULL the whole
+            # row is the identity, so any generated column counts; otherwise
+            # only the identity index's own columns do. A stored one would need
+            # publish_generated_columns = stored, which the operator never
+            # sets, and a virtual one can never be published at all. With a
+            # column list the server checks coverage instead, which
+            # ColumnListMissesIdentity below already reports.
+            in_identity = (
+                member.generated if member.replica_identity == "f" else identity & member.generated
+            )
+            if in_identity:
+                issues.append(
+                    _source(
+                        GENERATED_COLUMN_IN_IDENTITY,
+                        f"{member.qualified}'s replica identity takes in generated column(s) "
+                        f"{', '.join(sorted(in_identity))}, which the publication does not carry: "
+                        "PostgreSQL 18 would refuse UPDATE and DELETE on it at the source; "
+                        "identify rows by an index without them (REPLICA IDENTITY USING INDEX)",
+                    )
+                )
+        if candidate.columns and member.replica_identity == "f":
+            issues.append(
+                _source(
+                    COLUMN_LIST_MISSES_IDENTITY,
+                    f"{member.qualified} has REPLICA IDENTITY FULL, which PostgreSQL allows no "
+                    "column list with: the source would refuse UPDATE and DELETE on it; drop "
+                    "the column list, or move it off FULL with REPLICA IDENTITY DEFAULT (given "
+                    "a primary key) or REPLICA IDENTITY USING INDEX",
+                )
+            )
+        elif candidate.columns:
             missing = sorted(identity - set(candidate.columns))
             if missing:
                 issues.append(

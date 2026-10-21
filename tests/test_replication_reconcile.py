@@ -94,6 +94,54 @@ async def test_both_ends_resolve(ctx, k8s) -> None:
     assert resolved.source_instance.host == "prod.rds"
 
 
+def _with_status(obj: dict[str, Any], **ends: str) -> dict[str, Any]:
+    """Status as a pass that created objects on ``ends`` (side -> instance/database) leaves it."""
+    status: dict[str, Any] = {"created": {"publication": True, "slot": True}}
+    for side, end in ends.items():
+        instance, database = end.split("/")
+        status[side] = {"instance": instance, "database": database}
+    obj["status"] = status
+    return obj
+
+
+async def test_an_end_that_moved_under_its_objects_is_refused(ctx, k8s) -> None:
+    """Converging the new end would orphan the old slot, which teardown finds only through status."""
+    obj = _store(k8s, _with_status(
+        _replication("to-reporting", "orders", "orders-copy"),
+        source="old-prod/orders",
+        target="reporting/orders_copy",
+    ))
+    with pytest.raises(ConfigurationError, match=r"now resolves to prod/orders.*old-prod/orders"):
+        await resolve_replication(ctx, obj)
+
+
+async def test_a_moved_target_database_is_refused(ctx, k8s) -> None:
+    obj = _store(k8s, _with_status(
+        _replication("to-reporting", "orders", "orders-copy"),
+        source="prod/orders",
+        target="reporting/orders_copy_v1",
+    ))
+    with pytest.raises(ConfigurationError, match="target PostgresDB team-a/orders-copy"):
+        await resolve_replication(ctx, obj)
+
+
+async def test_ends_matching_status_resolve(ctx, k8s) -> None:
+    obj = _store(k8s, _with_status(
+        _replication("to-reporting", "orders", "orders-copy"),
+        source="prod/orders",
+        target="reporting/orders_copy",
+    ))
+    assert (await resolve_replication(ctx, obj)).source.display == "prod/orders"
+
+
+async def test_an_end_may_move_before_anything_was_created(ctx, k8s) -> None:
+    """Nothing to orphan yet - e.g. every pass so far failed before the publication."""
+    obj = _with_status(_replication("to-reporting", "orders", "orders-copy"), source="old-prod/orders")
+    obj["status"]["created"] = {}
+    _store(k8s, obj)
+    assert (await resolve_replication(ctx, obj)).source.display == "prod/orders"
+
+
 async def _result(ctx, k8s, **fields: Any) -> ReplicationResult:
     resolved = await resolve_replication(ctx, _store(k8s, _replication("to-reporting", "orders", "orders-copy")))
     return ReplicationResult(
