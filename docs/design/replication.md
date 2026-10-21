@@ -442,9 +442,19 @@ names the cause. This is the same "report, don't abort" rule as
 | Table exists on the target with the same schema and name (and the same leaves, for a partitioned root published via leaves) | target | `TargetTableMissing` | Otherwise apply stops for every table |
 | Every published column exists on the target and is not generated there | target | `TargetColumnsMissing` | Same |
 | Managing role can `SET ROLE` to the target table's owner | target | `TargetOwnerNotSettable` | PostgreSQL 16 applies changes as the table owner |
+| The target can identify a row: a primary key, or a `REPLICA IDENTITY` index — unless the source publishes `REPLICA IDENTITY FULL` | target | `TargetNoReplicaIdentity` | "If a replica identity other than FULL is set on the publisher side, a replica identity comprising the same or fewer columns must also be set on the subscriber side." Without one, apply stops for every table. A target set to `FULL` does not count: the subscriber searches through an index, never the whole row |
+| The target's identity columns ⊆ the columns the source publishes *as its replica identity* | target | `TargetIdentityNotSent` | The publisher sends only its own identity as the key, however many columns it publishes. Same consequence |
+| Every `NOT NULL` column on the target that the publication does not carry has a default, or is an identity or generated column | target | `TargetColumnRequired` | Otherwise every `INSERT` the subscription applies fails the constraint, from the initial copy onwards |
 | No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict. The older replication keeps the table, by creation time and then namespace/name, so the two can never each defer to the other. It is the one target-side reason that takes an already-published table out |
 | With `copyData`, a table not yet subscribed is empty on the target | target | `TargetTableNotEmpty` | Its initial copy would collide with the rows already there and stall apply. The case D6 makes easy: a table unpublished when its replica identity went, then fixed, would otherwise be copied over its own replicated rows |
 | A partitioned table's column list or row filter is set only with `publishViaPartitionRoot: true` | source | `FilterIgnoredWithoutPartitionRoot` | Without it, each leaf is published under its own, empty filter and column list, so every row and column would flow, silently |
+
+A table's **replica-identity columns** are the *key* columns of the index
+concerned. A covering index — `PRIMARY KEY (id) INCLUDE (region)` — carries its
+non-key columns in `pg_index.indkey` too, and counting those would let a filter
+on `region` past the gate; the source would then refuse the table's `UPDATE`s
+and `DELETE`s, which is the failure the gate exists to prevent. Only the first
+`indnkeyatts` entries count, on both sides.
 
 `ColumnTypeMismatch` is reported as a **warning only**. The table is still
 published, because apply converts values through their text form and a
@@ -611,6 +621,17 @@ always true when a whole namespace is being deleted.
 4. **Source, login:** revoke `<db>_ro` and `rds_replication`, terminate the
    login's sessions, then `DROP ROLE`. This happens for a generated login only.
    A bring-your-own login loses only the memberships the operator granted.
+
+   `status.created.login` and `.secret` say which it is, and a pass that adopts
+   a provided login writes them **false** rather than leaving them out — status
+   is a JSON merge patch, so a key dropped here would keep an earlier pass's
+   `true` and teardown would drop a role and delete a Secret the operator never
+   made. Adding, removing or repointing `credentialsSecretRef` on a live
+   replication swaps one login for another: the one being replaced is removed
+   on that same pass, after the subscription carries the new connection string,
+   and only as far as it is the operator's — a generated login and its Secret
+   go, a provided one keeps both and loses only the memberships the operator
+   granted it.
 5. **Secret:** delete the credentials Secret, for a generated login only, and
    only once the source is cleared. It is the login's credential, and step 2
    may still need it.

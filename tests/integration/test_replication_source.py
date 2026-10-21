@@ -178,6 +178,101 @@ async def test_a_deleted_credentials_secret_is_regenerated_and_applied(world: Wo
         assert (await (await conn.execute("SELECT current_user")).fetchone()) == (login,)
 
 
+async def test_a_covering_index_does_not_widen_the_replica_identity(world: World) -> None:
+    """INCLUDE columns are in pg_index.indkey but not in the replica identity.
+
+    Counting them would let a filter on one past the gate, and the source would
+    then refuse every UPDATE and DELETE on the table - the failure the gate is
+    there to prevent.
+    """
+    table = (
+        "CREATE TABLE public.covering (id int, region text, note text, "
+        "PRIMARY KEY (id) INCLUDE (region))"
+    )
+    await world.on_source(table, as_owner=True)
+    await world.on_target(table, as_owner=True)
+    world.replication["spec"]["tables"].append(
+        {
+            "schema": "public",
+            "name": "covering",
+            "rowFilter": {"all": [{"column": "region", "op": "IsNotNull"}]},
+        }
+    )
+    status = await world.run()
+    assert world.excluded()["public.covering"] == "RowFilterNotCoveredByIdentity"
+    assert "public.covering" not in status["publishedTables"]
+    # Held back, so the source's own writes still work.
+    await world.on_source(
+        "INSERT INTO public.covering VALUES (1, 'AU', 'x')",
+        "UPDATE public.covering SET note = 'y'",
+        as_owner=True,
+    )
+
+    # A column list that leaves the INCLUDE column out is not missing the
+    # identity either, so this one is published and its rows copied.
+    world.replication["spec"]["tables"][-1] = {
+        "schema": "public",
+        "name": "covering",
+        "columns": ["id", "note"],
+    }
+    status = await world.run()
+    assert "public.covering" in status["publishedTables"]
+    await world.on_source("UPDATE public.covering SET note = 'z'", as_owner=True)
+    await world.eventually(
+        "SELECT note FROM public.covering WHERE id = 1", "z", "the update to reach the target"
+    )
+
+
+async def test_a_target_that_cannot_identify_rows_is_held_back(world: World) -> None:
+    """Apply is sequential: one such table stops every table the subscription carries."""
+    await world.on_source("CREATE TABLE public.keyed (id int PRIMARY KEY, v text)", as_owner=True)
+    await world.on_target("CREATE TABLE public.keyed (id int, v text)", as_owner=True)
+    status = await world.run()
+    assert world.excluded()["public.keyed"] == "TargetNoReplicaIdentity"
+    assert "public.keyed" not in status["publishedTables"]
+
+    await world.on_target("ALTER TABLE public.keyed ADD PRIMARY KEY (id)", as_owner=True)
+    status = await world.run()
+    assert "public.keyed" in status["publishedTables"]
+
+
+async def test_a_target_identity_the_publisher_never_sends_is_held_back(world: World) -> None:
+    await world.on_source(
+        "CREATE TABLE public.wide (id int PRIMARY KEY, region text NOT NULL, v text)", as_owner=True
+    )
+    await world.on_target(
+        "CREATE TABLE public.wide (id int, region text NOT NULL, v text, PRIMARY KEY (id, region))",
+        as_owner=True,
+    )
+    status = await world.run()
+    assert world.excluded()["public.wide"] == "TargetIdentityNotSent"
+    assert "public.wide" not in status["publishedTables"]
+
+
+async def test_a_not_null_target_column_the_publication_cannot_fill_is_held_back(
+    world: World,
+) -> None:
+    await world.on_source("CREATE TABLE public.audited (id int PRIMARY KEY, v text)", as_owner=True)
+    await world.on_target(
+        "CREATE TABLE public.audited (id int PRIMARY KEY, v text, tenant text NOT NULL)",
+        as_owner=True,
+    )
+    status = await world.run()
+    assert world.excluded()["public.audited"] == "TargetColumnRequired"
+    assert "public.audited" not in status["publishedTables"]
+
+    # A default is all the server needs to fill the column in by itself.
+    await world.on_target(
+        "ALTER TABLE public.audited ALTER COLUMN tenant SET DEFAULT 'house'", as_owner=True
+    )
+    status = await world.run()
+    assert "public.audited" in status["publishedTables"]
+    await world.on_source("INSERT INTO public.audited VALUES (1, 'a')", as_owner=True)
+    await world.eventually(
+        "SELECT tenant FROM public.audited WHERE id = 1", "house", "the insert to reach the target"
+    )
+
+
 async def test_a_provided_login_is_used_and_left_in_place(world: World, unique: str) -> None:
     login, password = f"rs_byo_{unique}", f"byo-{unique}-password"
     # Provisioned the way a DBA would: by someone who can grant REPLICATION.
@@ -189,7 +284,11 @@ async def test_a_provided_login_is_used_and_left_in_place(world: World, unique: 
         assert status["source"]["login"] == login
         assert status["credentialsSecret"] == {"namespace": NS, "name": "byo-login", "generated": False}
         assert status["grantedMemberships"] == [world.groups["readOnly"]]
-        assert "login" not in status["created"] and "secret" not in status["created"]
+        # Recorded false rather than left out: status is a JSON merge patch, so
+        # a key dropped here would keep an earlier pass's `true` and teardown
+        # would drop a login and a Secret the operator never made.
+        assert status["created"]["login"] is False
+        assert status["created"]["secret"] is False
 
         message = await teardown_replication(world.ctx, world.replication)
         assert f"{world.groups['readOnly']} membership of {login}" in message
@@ -201,6 +300,54 @@ async def test_a_provided_login_is_used_and_left_in_place(world: World, unique: 
             assert not await fetch_scalar(
                 conn, sql.SQL("SELECT pg_has_role(%s, %s, 'MEMBER')"), (login, world.groups["readOnly"])
             )
+    finally:
+        superuser_execute(f'DROP ROLE IF EXISTS "{login}"')
+
+
+async def test_switching_to_a_provided_login_spares_it_and_removes_the_generated_one(
+    world: World, unique: str
+) -> None:
+    """credentialsSecretRef can be added to a live replication; both logins must be handled.
+
+    The provided role and its Secret are the user's, whatever an earlier pass
+    with a generated login recorded - teardown must not reach for them - and
+    the generated pair this one replaces has to go rather than linger with a
+    live password and a grant on the source.
+    """
+    status = await world.run()
+    generated, secret = status["source"]["login"], status["credentialsSecret"]
+    assert status["created"]["login"] and status["created"]["secret"]
+    assert world.k8s.core.get(secret["namespace"], secret["name"]) is not None
+
+    login, password = f"rs_swap_{unique}", f"swap-{unique}-password"
+    superuser_execute(f"CREATE ROLE \"{login}\" LOGIN REPLICATION PASSWORD '{password}'")
+    try:
+        world.k8s.core.seed(NS, "swap-login", {"username": login, "password": password})
+        world.replication["spec"]["source"]["credentialsSecretRef"] = {"name": "swap-login"}
+        status = await world.run()
+
+        assert status["source"]["login"] == login
+        assert status["created"]["login"] is False and status["created"]["secret"] is False
+        # Only what this pass granted the new login, not what the old one held.
+        assert status["grantedMemberships"] == [world.groups["readOnly"]]
+        assert world.k8s.core.get(secret["namespace"], secret["name"]) is None
+        async with world.pools.connection(world.source) as conn:
+            assert not await fetch_scalar(
+                conn, sql.SQL("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"), (generated,)
+            )
+        # Streaming survived the swap.
+        await world.on_source("INSERT INTO audit.events VALUES (9, 'swapped')", as_owner=True)
+        await world.eventually(
+            "SELECT kind FROM audit.events WHERE id = 9", "swapped", "the insert to reach the target"
+        )
+
+        await teardown_replication(world.ctx, world.replication)
+        world.replication.pop("status")
+        async with world.pools.connection(world.source) as conn:
+            assert await fetch_scalar(
+                conn, sql.SQL("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = %s)"), (login,)
+            )
+        assert world.k8s.core.get(NS, "swap-login") is not None
     finally:
         superuser_execute(f'DROP ROLE IF EXISTS "{login}"')
 

@@ -580,7 +580,10 @@ Every `reconcile.replicationInterval` seconds (60 by default), a pass:
    it is granted `rds_replication` so it can stream, and the source's
    `<db>_ro` group so it can read. Its password is in a Secret in the
    operator's namespace. A login supplied with `credentialsSecretRef` is used
-   instead and never altered, apart from the `<db>_ro` membership.
+   instead and never altered, apart from the `<db>_ro` membership. Adding or
+   removing `credentialsSecretRef` later swaps the login: the one it replaces
+   is removed once the subscription uses the new one — a generated login and
+   its Secret are dropped, a supplied one keeps both.
 3. **Converges a publication that lists its tables explicitly.** A table is
    added only once *both* servers can take it. Every other table appears in
    `status.excludedTables` with its reason and remedy.
@@ -589,9 +592,14 @@ Every `reconcile.replicationInterval` seconds (60 by default), a pass:
      such a table would make PostgreSQL refuse that table's `UPDATE`s and
      `DELETE`s on the source itself. A published table that later loses its
      replica identity is removed on the next pass.
-   - **Reasons that wait for the target:** `TargetTableMissing` and
-     `TargetColumnsMissing`. Create the table there, and it is published on
-     the next pass.
+   - **Reasons that keep apply running:** `TargetTableMissing`,
+     `TargetColumnsMissing`, `TargetNoReplicaIdentity`, `TargetIdentityNotSent`
+     and `TargetColumnRequired`. Apply is sequential, so a single table the
+     target cannot receive stops *every* table the subscription carries. Fix
+     it on the target - create the table, add the missing columns, give it a
+     primary key, narrow its replica identity to what the source publishes as
+     its own, or give a `NOT NULL` column a default - and the table is
+     published on the next pass.
    - **The reason that protects the target:** `TargetTableNotEmpty`. A table's
      initial copy would collide with rows already on the target, so the
      table waits until it is emptied there, or until `copyData` is false.

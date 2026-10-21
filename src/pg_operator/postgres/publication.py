@@ -23,6 +23,19 @@ log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class Column:
+    """One column of a relation, as :data:`_COLUMNS` reads it."""
+
+    name: str
+    type: str
+    generated: bool
+    not_null: bool
+    #: The server can fill it in without the publisher: a default, an identity
+    #: or a generated expression.
+    supplied: bool
+
+
+@dataclass(frozen=True, slots=True)
 class SourceTable:
     """A relation in the source database, as a publication would see it."""
 
@@ -66,6 +79,13 @@ class TargetTable:
     owner_settable: bool
     columns: dict[str, str]
     generated: frozenset[str]
+    #: The columns the apply worker matches rows by - the replica-identity
+    #: index's key columns, or the primary key's. None when the target has
+    #: neither, which stops every UPDATE and DELETE the subscription carries.
+    identity_columns: frozenset[str] | None = None
+    #: NOT NULL columns the server cannot fill in by itself. One of these that
+    #: the publication does not carry fails every INSERT the subscription applies.
+    required_columns: frozenset[str] = frozenset()
 
     @property
     def qualified(self) -> str:
@@ -123,27 +143,61 @@ _BY_NAME = sql.SQL(
 
 _BY_OID = sql.SQL(_RELATIONS + " WHERE c.oid = ANY(%(oids)s::oid[])")
 
+#: ``supplied`` is true when the server can fill the column in by itself - it
+#: has a default, or is an identity or generated column - which is what decides
+#: whether a NOT NULL column the publication does not carry stops apply.
 _COLUMNS = sql.SQL(
     """
     SELECT a.attrelid, a.attname, format_type(a.atttypid, a.atttypmod),
-           a.attgenerated <> ''
+           a.attgenerated <> '', a.attnotnull,
+           a.atthasdef OR a.attidentity <> '' OR a.attgenerated <> ''
       FROM pg_attribute a
      WHERE a.attrelid = ANY(%s::oid[]) AND a.attnum > 0 AND NOT a.attisdropped
      ORDER BY a.attrelid, a.attnum
     """
 )
 
+#: An index's *key* columns only. ``indkey`` also carries the non-key columns of
+#: a covering index (``PRIMARY KEY (id) INCLUDE (region)``), which PostgreSQL
+#: does not count towards the replica identity - it reads the first
+#: ``indnkeyatts`` entries. Taking the whole vector would let a row filter on an
+#: INCLUDE column past the gate, and the source would then refuse every UPDATE
+#: and DELETE on the table. ``indkey`` is an int2vector, so the slice is
+#: zero-based.
+_INDEX_KEY_COLUMNS = """
+      FROM pg_index i
+      CROSS JOIN LATERAL unnest((i.indkey::int2[])[0:i.indnkeyatts - 1]) AS k(attnum)
+      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = k.attnum
+"""
+
 #: The index a replica identity uses: the primary key by default, or the index
 #: chosen with REPLICA IDENTITY USING INDEX.
 _IDENTITY_COLUMNS = sql.SQL(
     """
     SELECT i.indrelid, a.attname
-      FROM pg_index i
+    """
+    + _INDEX_KEY_COLUMNS
+    + """
       JOIN pg_class c ON c.oid = i.indrelid
-      JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-     WHERE i.indrelid = ANY(%s::oid[])
+     WHERE i.indrelid = ANY(%s::oid[]) AND i.indisvalid
        AND ((c.relreplident = 'd' AND i.indisprimary)
          OR (c.relreplident = 'i' AND i.indisreplident))
+    """
+)
+
+#: What a subscriber matches rows by. Unlike the publisher, it falls back to the
+#: primary key whenever no replica-identity index applies, so REPLICA IDENTITY
+#: NOTHING or FULL on a target that has a primary key still identifies rows -
+#: while REPLICA IDENTITY FULL *without* one identifies nothing, because the
+#: fallback is to an index, never to the whole row.
+_TARGET_IDENTITY_COLUMNS = sql.SQL(
+    """
+    SELECT i.indrelid, i.indisprimary, i.indisreplident, a.attname
+    """
+    + _INDEX_KEY_COLUMNS
+    + """
+     WHERE i.indrelid = ANY(%s::oid[]) AND i.indisvalid
+       AND (i.indisprimary OR i.indisreplident)
     """
 )
 
@@ -184,9 +238,7 @@ async def _assemble(
     by_oid = {int(row[0]): row for row in rows}
     if not by_oid:
         return []
-    columns: dict[int, list[tuple[str, str, bool]]] = {}
-    for relid, name, type_, generated in await fetch_all(conn, _COLUMNS, (list(by_oid),)):
-        columns.setdefault(int(relid), []).append((str(name), str(type_), bool(generated)))
+    columns = _columns_by_relation(await fetch_all(conn, _COLUMNS, (list(by_oid),)))
     identity: dict[int, set[str]] = {}
     for relid, name in await fetch_all(conn, _IDENTITY_COLUMNS, (list(by_oid),)):
         identity.setdefault(int(relid), set()).add(str(name))
@@ -207,11 +259,11 @@ async def _assemble(
 
 def _source_table(
     row: tuple[Any, ...],
-    columns: list[tuple[str, str, bool]],
+    columns: list[Column],
     identity: set[str] | None,
     leaves: tuple[SourceTable, ...],
 ) -> SourceTable:
-    publishable = {name: type_ for name, type_, generated in columns if not generated}
+    publishable = {column.name: column.type for column in columns if not column.generated}
     replica_identity = str(row[9])
     identity_columns: frozenset[str] | None
     if replica_identity == "f":
@@ -234,7 +286,7 @@ def _source_table(
         replica_identity=replica_identity,
         identity_columns=identity_columns,
         columns=publishable,
-        generated=frozenset(name for name, _, generated in columns if generated),
+        generated=frozenset(column.name for column in columns if column.generated),
         readable_by_login=bool(row[10]),
         leaves=leaves,
     )
@@ -247,7 +299,7 @@ def _source_table(
 _TARGET_RELATIONS = sql.SQL(
     """
     SELECT c.oid, n.nspname, c.relname, c.relkind, pg_get_userbyid(c.relowner),
-           pg_has_role(c.relowner, 'SET')
+           pg_has_role(c.relowner, 'SET'), c.relreplident
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
       JOIN unnest(%s::text[], %s::text[]) AS w(schema, name)
@@ -267,23 +319,72 @@ async def describe_target_tables(
         conn, _TARGET_RELATIONS, ([s for s, _ in names], [n for _, n in names])
     )
     oids = [int(row[0]) for row in rows]
-    columns: dict[int, list[tuple[str, str, bool]]] = {}
-    for relid, name, type_, generated in await fetch_all(conn, _COLUMNS, (oids,)):
-        columns.setdefault(int(relid), []).append((str(name), str(type_), bool(generated)))
+    columns = _columns_by_relation(await fetch_all(conn, _COLUMNS, (oids,)))
+    identity = await _target_identity_columns(conn, oids)
     found: dict[str, TargetTable] = {}
     for row in rows:
         oid = int(row[0])
+        of_relation = columns.get(oid, [])
+        replicated = [column for column in of_relation if not column.generated]
+        generated = [column for column in of_relation if column.generated]
         table = TargetTable(
             schema=str(row[1]),
             name=str(row[2]),
             kind=str(row[3]),
             owner=str(row[4]),
             owner_settable=bool(row[5]),
-            columns={n: t for n, t, generated in columns.get(oid, []) if not generated},
-            generated=frozenset(n for n, _, generated in columns.get(oid, []) if generated),
+            columns={column.name: column.type for column in replicated},
+            generated=frozenset(column.name for column in generated),
+            identity_columns=_subscriber_identity(str(row[6]), identity.get(oid, {})),
+            required_columns=frozenset(
+                column.name for column in replicated if column.not_null and not column.supplied
+            ),
         )
         found[table.qualified] = table
     return found
+
+
+async def _target_identity_columns(
+    conn: AsyncConnection, oids: Sequence[int]
+) -> dict[int, dict[str, frozenset[str]]]:
+    """Per relation, the key columns of its replica-identity index and of its primary key."""
+    gathered: dict[int, dict[str, set[str]]] = {}
+    rows = await fetch_all(conn, _TARGET_IDENTITY_COLUMNS, (list(oids),))
+    for relid, is_primary, is_replident, name in rows:
+        kinds = gathered.setdefault(int(relid), {})
+        # One index can be both, so it belongs in both buckets rather than
+        # whichever flag is tested first.
+        for kind, applies in (("primary", is_primary), ("replident", is_replident)):
+            if applies:
+                kinds.setdefault(kind, set()).add(str(name))
+    return {
+        relid: {kind: frozenset(names) for kind, names in kinds.items()}
+        for relid, kinds in gathered.items()
+    }
+
+
+def _subscriber_identity(
+    replica_identity: str, indexes: dict[str, frozenset[str]]
+) -> frozenset[str] | None:
+    """The columns the apply worker matches rows by, from a relation's indexes.
+
+    REPLICA IDENTITY USING INDEX names the index; everything else falls back to
+    the primary key, including NOTHING and FULL. FULL is not a fallback of its
+    own here: the subscriber searches through an index, so a target set to FULL
+    with no primary key identifies no row at all.
+    """
+    if replica_identity == "i" and indexes.get("replident"):
+        return indexes["replident"]
+    return indexes.get("primary")
+
+
+def _columns_by_relation(rows: Sequence[tuple[Any, ...]]) -> dict[int, list[Column]]:
+    by_relation: dict[int, list[Column]] = {}
+    for relid, name, type_, generated, not_null, supplied in rows:
+        by_relation.setdefault(int(relid), []).append(
+            Column(str(name), str(type_), bool(generated), bool(not_null), bool(supplied))
+        )
+    return by_relation
 
 
 # ---------------------------------------------------------------------------
