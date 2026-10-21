@@ -16,8 +16,9 @@
 # Deleting the PostgresReplication removes the subscription, slot, publication
 # and login, and keeps every replicated row. retentionPolicy does not apply.
 #
-# This operator version creates the publication, login and subscription, and
-# rows stream; lag and slot health are reported from a later release.
+# Health - lag, retained WAL, the slot and the apply worker - is observed every
+# reconcile.replicationInterval and reported in status.health and
+# status.replicationState. Lagging, Stalled or SlotLost turn the phase Degraded.
 ---
 apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance

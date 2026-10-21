@@ -2,17 +2,16 @@
 
 A Kubernetes operator that manages databases, roles and grants on **external**
 PostgreSQL servers — typically Amazon RDS. It does not run PostgreSQL. It points
-at a server you already have and reconciles objects inside it from three custom
+at a server you already have and reconciles objects inside it from four custom
 resources.
 
 ```
-PostgresInstance   a server + the credentials used to manage it   (cluster-scoped)
-PostgresDB         a database, its schemas, extensions, roles     (namespaced)
-PostgresUser       a login role and the access it holds           (namespaced)
+PostgresInstance     a server + the credentials used to manage it    (cluster-scoped)
+PostgresDB           a database, its schemas, extensions, roles      (namespaced)
+PostgresUser         a login role and the access it holds            (namespaced)
+PostgresReplication  selected tables, replicated from a database on  (namespaced)
+                     one instance into a database on another
 ```
-
-A fourth, `PostgresReplication`, replicates selected tables between instances;
-see [PostgresReplication](#postgresreplication-namespaced).
 
 ## Table of contents
 
@@ -33,7 +32,7 @@ see [PostgresReplication](#postgresreplication-namespaced).
 
 ## How it works
 
-The operator watches the three resources and, on every reconcile, makes the
+The operator watches these resources and, on every reconcile, makes the
 server match the spec. A `PostgresInstance` carries a reference to a Secret
 holding superuser credentials — on RDS, the master user. Those credentials are
 the only ones the operator uses to manage everything else.
@@ -54,6 +53,9 @@ the only ones the operator uses to manage everything else.
            ├─ orders_rw    ◀───── GRANT ───────────┤
            └─ orders_ro                            └─ PushSecret ──▶ external store
 ```
+
+A `PostgresReplication` joins two `PostgresDB`s on different instances; see
+[PostgresReplication](#postgresreplication-namespaced).
 
 The reconciler, a read-only FastAPI state API and a React dashboard run in one
 pod as three containers.
@@ -394,8 +396,9 @@ Applying a `PostgresUser` and its `PostgresDB` together is fine: a missing
 reference is a temporary error and retries until the database reconciles.
 
 See [`examples/`](examples/) for instances with TLS verification, role-name
-overrides, BYO passwords, expiring accounts and PushSecret configurations. Every
-example is validated against the models in CI.
+overrides, BYO passwords, expiring accounts, PushSecret configurations, and a
+replication between two instances (`04-replication.yaml`). Every example is
+validated against the models in CI.
 
 ## The state API
 
@@ -756,9 +759,8 @@ when they fire:
 ### Logical replication readiness
 
 Every instance reports, on each pass, whether its server could take part in
-logical replication. Replication between instances is designed in
-[`docs/design/replication.md`](docs/design/replication.md) and arrives in
-increments. None of this is the operator's to set: `wal_level` and the slot
+logical replication, as a source or a target. None of this is the operator's
+to set: `wal_level` and the slot
 limits live in the RDS parameter group, and the replication privilege is an
 AWS-managed role. So the operator reads it and reports it, and it never makes
 an instance unhealthy.
@@ -792,6 +794,37 @@ $ kubectl get postgresinstance prod-rds -o jsonpath='{.status.logicalReplication
 - **`maxSlotWalKeepSize: "-1"`** means a stalled subscriber can retain WAL until
   the disk fills. Setting it in the parameter group is the backstop the
   operator deliberately is not.
+
+### Running a replication
+
+- **Change schemas on the target first when adding, and on the source first
+  when removing.** A column the source sends and the target lacks stops the
+  apply worker, and with it every table. A column only the target has is
+  harmless. Rename in two steps: add and backfill, then drop.
+- **Set `max_slot_wal_keep_size`** in the source's parameter group. Without it
+  a stalled subscriber retains WAL until the source's disk fills. The operator
+  reports and alerts but never drops a slot to save the disk. With the
+  backstop set, a slot that falls too far behind is invalidated instead, and
+  the replication reports `SlotLost`.
+- **Open the network path between the two servers.** The target's security
+  group must allow egress to the source, and the source's must allow ingress
+  from the target. The operator reaching both servers proves nothing about it.
+- **Delete the replication before a major-version upgrade or a blue/green
+  deployment.** At the time of writing, AWS's upgrade precheck refuses an
+  instance with logical slots, and slots survive only upgrades from 17. The
+  blue environment of a blue/green deployment cannot publish or subscribe.
+  Recreate the replication afterwards; it copies every table afresh.
+- **Recovering from `SlotLost`** also means deleting and recreating the
+  resource, and so a full re-copy.
+- **Sequences are not replicated.** That does not matter for a read replica.
+  It would if the replica were ever promoted, which this does not support.
+- **`TRUNCATE` replicates.** On the target it fails if a table that is not
+  replicated references the truncated one by foreign key. Drop `truncate` from
+  `publish` in that case.
+- **The replication password lives on the target.** It is stored in the
+  target's `pg_subscription` catalog, and appears in the target's statement
+  log when `log_statement` is `ddl` or `all`. The login can read only what the
+  source's `<db>_ro` can.
 
 ### Pausing
 
@@ -844,12 +877,37 @@ exactly that constraint, which changes several things:
   that hint, not retried forever.
 
 TLS: use `sslMode: verify-full` with the AWS CA bundle for real server
-authentication.
+authentication of the operator's own connections.
 
 ```bash
 curl -o rds-ca.pem https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
 kubectl -n pg-operator create secret generic rds-ca-bundle --from-file=ca.pem=rds-ca.pem
 ```
+
+### Logical replication on RDS
+
+- **The source needs `rds.logical_replication = 1`** in its parameter group.
+  It is a static parameter, so it takes a reboot. The instance's
+  `status.logicalReplication` says whether it is set.
+- **Streaming goes through `rds_replication`.** The master user cannot confer
+  the `REPLICATION` attribute, so it grants the generated login
+  `rds_replication`, which RDS honours for streaming.
+- **The master user creates subscriptions.** AWS documents that it can, but
+  not how: `rds_superuser` is not a member of `pg_create_subscription`. The
+  readiness block reports this as `createSubscription: Assumed`.
+- **The replication's TLS defaults to `require`.** The target *server* opens
+  the connection to the source, and AWS documents no CA path an RDS subscriber
+  could verify against. `verify-full` needs an explicit
+  `source.connection.sslRootCertPath` on the target server.
+
+> **Not yet confirmed on real RDS.** `PostgresReplication` is tested against
+> PostgreSQL 16–18 servers that emulate the RDS master user, not against RDS
+> itself. The points above are what AWS documents or what the emulation
+> assumes. Before relying on replication between RDS instances, run the
+> [real-RDS verification gate](docs/design/replication.md#real-rds-verification-gate)
+> on an RDS 16 or 17 pair. It checks subscription and slot privileges,
+> streaming through `rds_replication` alone, TLS, what reaches the
+> CloudWatch statement log, and Multi-AZ failover.
 
 ## Development
 
@@ -1064,6 +1122,18 @@ Choices worth knowing about, and why:
   `psycopg.sql.Identifier` and every value through a bound parameter or
   `sql.Literal`. Names are validated at admission by CRD patterns and again in
   the models.
+- **Replication publishes an explicit table list.** `FOR TABLES IN SCHEMA`
+  would publish a table the moment it is created on the source, and its first
+  write would stop the whole subscription if the target lacked it. An explicit
+  list adds a table only once both servers can take it, and needs only table
+  ownership, which works the same on RDS.
+- **Replication teardown ignores `retentionPolicy`.** A slot left behind
+  retains WAL until the source's disk fills, so deleting a `PostgresReplication`
+  always removes the plumbing, and always keeps the replicated rows.
+- **Slot safety is reported, not enforced.** The operator alerts on lag,
+  retained WAL and an idle slot, but never drops a slot to protect the source.
+  `max_slot_wal_keep_size` is that backstop, and it belongs in the parameter
+  group.
 - **No password rotation in this iteration.** Deliberate: rotation under a
   running application needs an explicit, auditable trigger, which is the next
   increment rather than a default.
