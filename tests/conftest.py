@@ -11,6 +11,12 @@ operator actually has to work under.
       password=adminpw dbname=postgres"
 
 Without that variable the integration tests skip.
+
+Replication needs a second server, which ``make test-setup`` also starts
+(``hack/test-servers.sh``). Tests marked ``replication`` additionally need
+``PGOP_TEST_TARGET_DSN``, ``PGOP_TEST_SOURCE_FROM_TARGET`` - the source's
+address as the target *server* reaches it - and ``PGOP_TEST_SUPERUSER_DSN``,
+which is used for nothing but emulating RDS's ``rds_replication``.
 """
 
 from __future__ import annotations
@@ -20,13 +26,28 @@ import contextlib
 import os
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 
+import psycopg
 import pytest
 
 from pg_operator.config import Settings
 from pg_operator.postgres.connection import Endpoint, PoolRegistry
 
 TEST_DSN_ENV = "PGOP_TEST_DSN"
+TARGET_DSN_ENV = "PGOP_TEST_TARGET_DSN"
+SOURCE_FROM_TARGET_ENV = "PGOP_TEST_SOURCE_FROM_TARGET"
+SUPERUSER_DSN_ENV = "PGOP_TEST_SUPERUSER_DSN"
+
+REPLICATION_ENVS = (TEST_DSN_ENV, TARGET_DSN_ENV, SOURCE_FROM_TARGET_ENV, SUPERUSER_DSN_ENV)
+
+_SHIM = Path(__file__).resolve().parents[1] / "hack" / "rds-replication-shim.sql"
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line(
+        "markers", "replication: needs the two-server harness from `make test-setup`"
+    )
 
 
 def _dsn() -> str | None:
@@ -38,10 +59,29 @@ requires_postgres = pytest.mark.skipif(
     reason=f"set {TEST_DSN_ENV} to run integration tests against a live server",
 )
 
+requires_replication_harness = pytest.mark.skipif(
+    not all(os.environ.get(name) for name in REPLICATION_ENVS),
+    reason=f"set {', '.join(REPLICATION_ENVS)} (make test-setup) to run replication tests",
+)
+
 
 def _parse_dsn(dsn: str) -> dict[str, str]:
     return dict(
         part.split("=", 1) for part in dsn.split() if "=" in part
+    )
+
+
+def _endpoint_from(dsn: str, instance: str) -> Endpoint:
+    parts = _parse_dsn(dsn)
+    return Endpoint(
+        instance=instance,
+        host=parts.get("host", "localhost"),
+        port=int(parts.get("port", "5432")),
+        username=parts.get("user", "postgres"),
+        password=parts.get("password", ""),
+        maintenance_database=parts.get("dbname", "postgres"),
+        ssl_mode=parts.get("sslmode", "disable"),
+        connect_timeout=10,
     )
 
 
@@ -55,17 +95,50 @@ def endpoint(settings: Settings) -> Endpoint:
     dsn = _dsn()
     if dsn is None:
         pytest.skip(f"{TEST_DSN_ENV} is not set")
-    parts = _parse_dsn(dsn)
-    return Endpoint(
-        instance="test",
-        host=parts.get("host", "localhost"),
-        port=int(parts.get("port", "5432")),
-        username=parts.get("user", "postgres"),
-        password=parts.get("password", ""),
-        maintenance_database=parts.get("dbname", "postgres"),
-        ssl_mode=parts.get("sslmode", "disable"),
-        connect_timeout=10,
-    )
+    return _endpoint_from(dsn, "test")
+
+
+@pytest.fixture
+def target_endpoint() -> Endpoint:
+    """The second server: the replication target, as the managing role."""
+    dsn = os.environ.get(TARGET_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"{TARGET_DSN_ENV} is not set")
+    return _endpoint_from(dsn, "test-target")
+
+
+@pytest.fixture
+def source_from_target() -> dict[str, str]:
+    """``host``/``port`` of the source as the target server resolves it."""
+    value = os.environ.get(SOURCE_FROM_TARGET_ENV)
+    if not value:
+        pytest.skip(f"{SOURCE_FROM_TARGET_ENV} is not set")
+    return _parse_dsn(value)
+
+
+def emulate_rds_replication() -> None:
+    """Give direct LOGIN members of rds_replication the REPLICATION attribute.
+
+    The one superuser step in the suite. RDS lets a login granted
+    rds_replication stream from a slot; stock PostgreSQL checks only the
+    attribute, which the managing role cannot confer. Runs the same SQL as the
+    cluster harness's shim.
+    """
+    dsn = os.environ.get(SUPERUSER_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"{SUPERUSER_DSN_ENV} is not set")
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(_SHIM.read_text())
+
+
+def superuser_execute(statement: str, params: tuple[object, ...] = ()) -> list[tuple]:
+    """Run one statement as the source's superuser - for test cleanup only."""
+    dsn = os.environ.get(SUPERUSER_DSN_ENV)
+    if not dsn:
+        pytest.skip(f"{SUPERUSER_DSN_ENV} is not set")
+    with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
+        cur.execute(statement, params)
+        return cur.fetchall() if cur.description else []
 
 
 @pytest.fixture

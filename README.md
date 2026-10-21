@@ -600,6 +600,46 @@ pg_operator_resource_ready{kind,namespace,name}
 pg_operator_teardown_total{kind,outcome}
 ```
 
+### Logical replication readiness
+
+Every instance reports, on each pass, whether its server could take part in
+logical replication. Replication between instances is designed in
+[`docs/design/replication.md`](docs/design/replication.md) and arrives in
+increments. None of this is the operator's to set: `wal_level` and the slot
+limits live in the RDS parameter group, and the replication privilege is an
+AWS-managed role. So the operator reads it and reports it, and it never makes
+an instance unhealthy.
+
+```console
+$ kubectl get postgresinstance prod-rds -o jsonpath='{.status.logicalReplication}' | jq
+{
+  "walLevel": "replica",
+  "maxReplicationSlots": 20,
+  "replicationSlotsInUse": 0,
+  "maxWalSenders": 35,
+  "maxSlotWalKeepSize": "-1",
+  "createSubscription": "Assumed",
+  "replicationGrant": "rds_replication",
+  "issues": [
+    "wal_level is replica; set rds.logical_replication = 1 in the DB parameter group and reboot (static parameter)"
+  ]
+}
+```
+
+- **`createSubscription`** says whether the managing role may own a
+  subscription.
+  - `Granted`: it is a member of `pg_create_subscription`, or a superuser.
+  - `Assumed`: RDS. AWS documents the master user creating subscriptions but
+    not the mechanism, and `rds_superuser` is not a member of
+    `pg_create_subscription`.
+  - `Unavailable`: it may not. The server can still be a source.
+- **`replicationGrant`** says how the managing role can let a login stream: by
+  granting `rds_replication`, by conferring `REPLICATION` itself (`attribute`),
+  or not at all (`none`).
+- **`maxSlotWalKeepSize: "-1"`** means a stalled subscriber can retain WAL until
+  the disk fills. Setting it in the parameter group is the backstop the
+  operator deliberately is not.
+
 ### Pausing
 
 `spec.paused: true` on any resource suspends reconciliation before any
@@ -684,18 +724,41 @@ per-grant `INHERIT`/`SET` options arrive in 16, `pg_database_owner` ownership of
 `public` in 15, and `GRANT ... ON PARAMETER` in 15.
 
 ```bash
-docker run -d --name pgop-test -e POSTGRES_PASSWORD=testpw -p 15432:5432 postgres:16-alpine
+make test-setup         # two servers: a source on :15432, a target on :15433
+make test-integration   # the whole suite against them
+make test-teardown
 
-# An RDS-like managing role: member of rds_superuser, not a superuser.
-docker exec pgop-test psql -U postgres -c "CREATE ROLE rds_superuser NOLOGIN"
-docker exec pgop-test psql -U postgres -c "CREATE ROLE pgadmin LOGIN PASSWORD 'adminpw' CREATEDB CREATEROLE"
-docker exec pgop-test psql -U postgres -c "GRANT rds_superuser TO pgadmin"
-
-export PGOP_TEST_DSN="host=localhost port=15432 user=pgadmin password=adminpw dbname=postgres sslmode=disable"
-uv run pytest
+make test-setup PG_IMAGE=postgres:18-alpine PG_TARGET_IMAGE=postgres:16-alpine
 ```
 
+`make test-setup` runs `hack/test-servers.sh`, which bootstraps both servers
+with `hack/rds-like.sql`: an RDS-like managing role `pgadmin` that is a member
+of `rds_superuser` with `CREATEDB` and `CREATEROLE`, not a superuser. The same
+file bootstraps CI. Both servers run `wal_level=logical`, and they share a
+Docker network so the target's server can subscribe to the source's. It prints
+the variables the suite reads:
+
+| Variable | Used for |
+| --- | --- |
+| `PGOP_TEST_DSN` | The source, and every single-server test |
+| `PGOP_TEST_TARGET_DSN` | The replication target |
+| `PGOP_TEST_SOURCE_FROM_TARGET` | The source *as the target server reaches it* (`host=pgop-test port=5432`) |
+| `PGOP_TEST_SUPERUSER_DSN` | One thing only: emulating RDS's `rds_replication` (below) |
+
 Without `PGOP_TEST_DSN` the integration tests skip and the unit tests still run.
+Tests marked `replication` (`uv run pytest -m replication`) also need the
+other three, and skip below PostgreSQL 16. CI runs them in their own matrix of
+source → target pairs: 16→16, 17→17, 18→18, 16→18 and 18→16.
+
+**The one superuser step.** On RDS, a login granted `rds_replication` may
+stream from a replication slot. Stock PostgreSQL honours only the
+`REPLICATION` attribute, which a non-superuser cannot confer.
+`hack/rds-replication-shim.sql` bridges the two: run as the container
+superuser, it gives `REPLICATION` to every login that is a *direct* member of
+`rds_replication`. The managing role is only an indirect member, through
+`rds_superuser`, exactly as the RDS master user is. It therefore keeps
+`NOREPLICATION`, so the harness still surfaces the bug class that attribute
+causes. Everything else runs as `pgadmin`.
 `tests/integration/test_reconcile_end_to_end.py` drives the real reconcilers
 against real PostgreSQL with a faked Kubernetes API, so it covers ordering,
 status and retention decisions rather than SQL primitives alone.

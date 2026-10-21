@@ -2,6 +2,11 @@
 # the managing role is a member of rds_superuser with CREATEDB and CREATEROLE,
 # but is NOT a superuser. Storage is ephemeral - these exist to be reconciled
 # against, not to keep data.
+#
+# 16, 17 and 18 run wal_level=logical and carry the rds_replication shim, so
+# they can replicate between each other; 14 and 15 stay at the default, which
+# is below what replication supports anyway and exercises the instance's
+# "wal_level is replica" report.
 apiVersion: v1
 kind: Namespace
 metadata:
@@ -13,23 +18,95 @@ metadata:
   name: rds-bootstrap
   namespace: pg-instances
 data:
+  # hack/rds-like.sql, verbatim (tests/test_harness.py keeps the copies equal).
   10-rds-like.sql: |
-    -- Mirrors charts' documented RDS master user: rds_superuser member,
-    -- CREATEDB + CREATEROLE, no superuser, no REPLICATION, no BYPASSRLS.
+    -- Bootstraps a stock PostgreSQL server so its managing role looks like the RDS
+    -- master user: a member of rds_superuser with CREATEDB and CREATEROLE, but not a
+    -- superuser, and holding neither REPLICATION nor BYPASSRLS. Run once, as the
+    -- container superuser, by `make test-setup` and by CI.
+    --
+    -- hack/local/00-servers.yaml embeds this file verbatim and adds GRANT SET ON
+    -- PARAMETER in a second script. That grant is deliberately absent here: the
+    -- integration suite needs a server that still refuses a superuser-only GUC.
+
     CREATE ROLE rds_superuser NOLOGIN;
     CREATE ROLE pgadmin LOGIN PASSWORD 'adminpw' CREATEDB CREATEROLE;
     GRANT rds_superuser TO pgadmin;
 
-    -- RDS lets its master user set logging GUCs that are superuser-only on a
-    -- stock server. PostgreSQL 15 added GRANT ... ON PARAMETER, which is the
-    -- closest stock equivalent; on 14 there is no such mechanism, so that
-    -- server exercises the operator's "parameter refused" path instead.
+    -- RDS makes rds_superuser a member of pg_monitor, which is what lets the
+    -- master user read other roles' rows in pg_stat_replication.
+    GRANT pg_monitor TO rds_superuser;
+
+    -- On RDS, membership of rds_replication lets a login stream from a slot, and
+    -- rds_superuser holds it WITH ADMIN OPTION so the master user can grant it. A
+    -- stock server only honours the REPLICATION attribute, so here the role exists
+    -- for grants to be issued and read back, and hack/rds-replication-shim.sql
+    -- confers the attribute on its direct LOGIN members.
+    CREATE ROLE rds_replication NOLOGIN;
+    GRANT rds_replication TO rds_superuser WITH ADMIN OPTION;
+
+    -- RDS lets its master user create subscriptions; PostgreSQL 16 added
+    -- pg_create_subscription as the stock equivalent. There is none before 16.
+    DO $$
+    BEGIN
+      IF current_setting('server_version_num')::int >= 160000 THEN
+        EXECUTE 'GRANT pg_create_subscription TO rds_superuser';
+      END IF;
+    END $$;
+
+  20-set-parameter.sql: |
+    -- Cluster harness only. RDS lets its master user set logging GUCs that are
+    -- superuser-only on a stock server. PostgreSQL 15 added GRANT ... ON PARAMETER,
+    -- which is the closest stock equivalent; on 14 there is no such mechanism, so
+    -- that server exercises the operator's "parameter refused" path instead. The
+    -- integration suite leaves this out on purpose: it needs a server that refuses.
     DO $$
     BEGIN
       IF current_setting('server_version_num')::int >= 150000 THEN
         EXECUTE 'GRANT SET ON PARAMETER log_min_duration_statement TO pgadmin';
       END IF;
     END $$;
+
+---
+# Test-only: emulates RDS's rds_replication rule, run in a loop by a sidecar on
+# the servers that support replication. hack/rds-replication-shim.sql, verbatim.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rds-replication-shim
+  namespace: pg-instances
+data:
+  rds-replication-shim.sql: |
+    -- Emulates RDS's rds_replication rule on a stock server. Test-only; run as the
+    -- container superuser.
+    --
+    -- On RDS a login granted rds_replication may open a walsender connection and
+    -- stream from a slot. Stock PostgreSQL checks only the REPLICATION attribute,
+    -- which a non-superuser managing role cannot confer, so this gives it to every
+    -- LOGIN role that is a *direct* member of rds_replication.
+    --
+    -- Direct only: the managing role is an indirect member through rds_superuser,
+    -- exactly as on RDS, and must keep NOREPLICATION - otherwise the harness would
+    -- hide the "ALTER ROLE ... NOREPLICATION is refused" class of bug.
+    --
+    -- Revocation is not emulated: a login that leaves rds_replication keeps the
+    -- attribute until it is dropped.
+    DO $$
+    DECLARE
+      login name;
+    BEGIN
+      FOR login IN
+        SELECT m.rolname
+          FROM pg_auth_members am
+          JOIN pg_roles g ON g.oid = am.roleid AND g.rolname = 'rds_replication'
+          JOIN pg_roles m ON m.oid = am.member
+         WHERE m.rolcanlogin AND NOT m.rolreplication AND NOT m.rolsuper
+      LOOP
+        EXECUTE format('ALTER ROLE %I REPLICATION', login);
+        RAISE NOTICE 'emulated rds_replication: % now has REPLICATION', login;
+      END LOOP;
+    END $$;
+
 ---
 apiVersion: v1
 kind: Service
@@ -171,11 +248,14 @@ spec:
       labels:
         app: pg16
         pg-major: "16"
+      annotations:
+        # `kubectl exec deploy/pg16` (verify.sh, the README) means the server.
+        kubectl.kubernetes.io/default-container: postgres
     spec:
       containers:
         - name: postgres
           image: postgres:16-alpine
-          args: ["-c", "max_connections=200"]
+          args: ["-c", "max_connections=200", "-c", "wal_level=logical"]
           env:
             - name: POSTGRES_PASSWORD
               value: rootpw
@@ -194,10 +274,34 @@ spec:
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits: { memory: 512Mi }
+        - name: rds-replication-shim
+          # Test-only; see the rds-replication-shim ConfigMap.
+          image: postgres:16-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
+              while true; do
+                psql -q -h 127.0.0.1 -U postgres -d postgres \
+                  -f /shim/rds-replication-shim.sql || true
+                sleep 2
+              done
+          env:
+            - name: PGPASSWORD
+              value: rootpw
+          volumeMounts:
+            - name: shim
+              mountPath: /shim
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
       volumes:
         - name: bootstrap
           configMap:
             name: rds-bootstrap
+        - name: shim
+          configMap:
+            name: rds-replication-shim
 ---
 apiVersion: v1
 kind: Service
@@ -227,11 +331,14 @@ spec:
       labels:
         app: pg17
         pg-major: "17"
+      annotations:
+        # `kubectl exec deploy/pg17` (verify.sh, the README) means the server.
+        kubectl.kubernetes.io/default-container: postgres
     spec:
       containers:
         - name: postgres
           image: postgres:17-alpine
-          args: ["-c", "max_connections=200"]
+          args: ["-c", "max_connections=200", "-c", "wal_level=logical"]
           env:
             - name: POSTGRES_PASSWORD
               value: rootpw
@@ -250,10 +357,34 @@ spec:
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits: { memory: 512Mi }
+        - name: rds-replication-shim
+          # Test-only; see the rds-replication-shim ConfigMap.
+          image: postgres:17-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
+              while true; do
+                psql -q -h 127.0.0.1 -U postgres -d postgres \
+                  -f /shim/rds-replication-shim.sql || true
+                sleep 2
+              done
+          env:
+            - name: PGPASSWORD
+              value: rootpw
+          volumeMounts:
+            - name: shim
+              mountPath: /shim
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
       volumes:
         - name: bootstrap
           configMap:
             name: rds-bootstrap
+        - name: shim
+          configMap:
+            name: rds-replication-shim
 ---
 apiVersion: v1
 kind: Service
@@ -283,11 +414,14 @@ spec:
       labels:
         app: pg18
         pg-major: "18"
+      annotations:
+        # `kubectl exec deploy/pg18` (verify.sh, the README) means the server.
+        kubectl.kubernetes.io/default-container: postgres
     spec:
       containers:
         - name: postgres
           image: postgres:18-alpine
-          args: ["-c", "max_connections=200"]
+          args: ["-c", "max_connections=200", "-c", "wal_level=logical"]
           env:
             - name: POSTGRES_PASSWORD
               value: rootpw
@@ -306,7 +440,31 @@ spec:
           resources:
             requests: { cpu: 50m, memory: 128Mi }
             limits: { memory: 512Mi }
+        - name: rds-replication-shim
+          # Test-only; see the rds-replication-shim ConfigMap.
+          image: postgres:18-alpine
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until pg_isready -q -h 127.0.0.1 -U postgres; do sleep 1; done
+              while true; do
+                psql -q -h 127.0.0.1 -U postgres -d postgres \
+                  -f /shim/rds-replication-shim.sql || true
+                sleep 2
+              done
+          env:
+            - name: PGPASSWORD
+              value: rootpw
+          volumeMounts:
+            - name: shim
+              mountPath: /shim
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits: { memory: 64Mi }
       volumes:
         - name: bootstrap
           configMap:
             name: rds-bootstrap
+        - name: shim
+          configMap:
+            name: rds-replication-shim

@@ -42,7 +42,7 @@ distinguishable from one on a real cluster, and the poll interval is dropped to
 
 | File | Contents |
 |---|---|
-| `00-servers.yaml` | The five servers, plus the RDS-like bootstrap SQL |
+| `00-servers.yaml` | The five servers, the RDS-like bootstrap SQL, and the `rds_replication` shim |
 | `01-instances.yaml` | Namespaces, credential Secrets, one `PostgresInstance` per server |
 | `02-workload.yaml` | The same `PostgresDB` + three `PostgresUser` shapes on every server |
 | `verify.sh` | Connects as each generated user and asserts what it may and may not do |
@@ -89,6 +89,43 @@ kubectl -n team-a get postgresdb orders-16 -o \
 `Drifted` becomes `True` with reason `RetainedOrphans` while `Synced` stays
 `True`: a retained orphan is a deliberate outcome, not a failure to converge.
 Add the schema back to restore the steady state.
+
+## Logical replication
+
+`pg16`, `pg17` and `pg18` run `wal_level=logical`, so they can replicate
+between each other. `pg14` and `pg15` stay at `replica`: replication needs
+PostgreSQL 16 anyway, and leaving them alone exercises the instance's "not
+ready" report.
+
+`make local-status` prints what each instance reports:
+
+```
+INSTANCE   WAL LEVEL   SUBSCRIBE     REPLICATION GRANT   SLOTS
+pg14       replica     Assumed       rds_replication     0
+pg15       replica     Assumed       rds_replication     0
+pg16       logical     Granted       rds_replication     0
+pg17       logical     Granted       rds_replication     0
+pg18       logical     Granted       rds_replication     0
+```
+
+`Assumed` on 14 and 15 is the RDS answer. Those servers have no
+`pg_create_subscription`, so the probe falls back to what `rds_superuser` is
+documented to do.
+
+The bootstrap SQL in `00-servers.yaml` is `hack/rds-like.sql` verbatim, plus
+one local-only script for `GRANT SET ON PARAMETER`. `tests/test_harness.py`
+keeps the copies equal, so this cluster and the integration suite emulate the
+same RDS.
+
+Each logical server also runs an `rds-replication-shim` sidecar. Every two
+seconds, as the container superuser, it applies `hack/rds-replication-shim.sql`.
+That gives `REPLICATION` to any login that is a direct member of
+`rds_replication`, which emulates RDS's rule that such a login may stream. Its
+log names each role it changes:
+
+```sh
+kubectl -n pg-instances logs deploy/pg16 -c rds-replication-shim
+```
 
 ## Notes
 

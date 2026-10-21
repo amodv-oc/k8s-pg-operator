@@ -237,6 +237,38 @@ spec:
                 sslMode: { type: string }
                 retentionPolicy: { type: string }
                 pushSecretsAvailable: { type: boolean }
+                logicalReplication:
+                  type: object
+                  description: |
+                    What a PostgresReplication on this server would need, read
+                    from the server on every pass. Informational: an instance
+                    no replication uses is never marked unhealthy by it.
+                  properties:
+                    walLevel: { type: string }
+                    maxReplicationSlots: { type: integer }
+                    replicationSlotsInUse: { type: integer }
+                    maxWalSenders: { type: integer }
+                    maxSlotWalKeepSize:
+                      type: string
+                      description: -1 means a slot may retain WAL without limit.
+                    createSubscription:
+                      type: string
+                      enum: [Granted, Assumed, Unavailable]
+                      description: >-
+                        Whether the managing role may create subscriptions.
+                        Assumed means RDS, which permits it for rds_superuser
+                        through a mechanism AWS does not document.
+                    replicationGrant:
+                      type: string
+                      enum: [rds_replication, attribute, none]
+                      description: >-
+                        How the managing role can let a replication login
+                        stream: by granting rds_replication, by conferring the
+                        REPLICATION attribute itself, or not at all.
+                    issues:
+                      type: array
+                      items: { type: string }
+                      description: What stops this server taking part, with remedies.
                 databases: { type: integer }
                 users: { type: integer }
                 lastConnectedAt: { type: string }

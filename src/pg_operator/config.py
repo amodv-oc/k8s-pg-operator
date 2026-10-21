@@ -98,9 +98,7 @@ class Settings:
             application_name=_env("PG_OPERATOR_APPLICATION_NAME", "pg-operator"),
             default_password_length=_env_int("PG_OPERATOR_PASSWORD_LENGTH", 32),
             pushsecret_enabled=_env_bool("PG_OPERATOR_PUSHSECRET_ENABLED", True),
-            pushsecret_api_version=_env(
-                "PG_OPERATOR_PUSHSECRET_API_VERSION", "external-secrets.io/v1alpha1"
-            ),
+            pushsecret_api_version=_env("PG_OPERATOR_PUSHSECRET_API_VERSION", "external-secrets.io/v1alpha1"),
             log_level=_env("PG_OPERATOR_LOG_LEVEL", "INFO").upper(),
             log_format=_env("PG_OPERATOR_LOG_FORMAT", "json").lower(),
             metrics_enabled=_env_bool("PG_OPERATOR_METRICS_ENABLED", True),

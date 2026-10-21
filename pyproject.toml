@@ -38,13 +38,13 @@ module-name = "pg_operator"
 module-root = "src"
 
 [tool.ruff]
-line-length = 100
+line-length = 130
 target-version = "py314"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "BLE", "C4", "SIM", "RUF", "ASYNC", "S"]
-ignore = ["S101", "N818"]
+ignore = ["S101", "N818", "E501"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S105", "S106", "S108"]

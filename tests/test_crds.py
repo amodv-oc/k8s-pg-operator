@@ -137,6 +137,36 @@ def test_access_levels_match_the_operator_constants() -> None:
     assert access["items"]["properties"]["role"]["enum"] == list(ACCESS_LEVELS)
 
 
+def test_logical_replication_status_matches_the_probe() -> None:
+    """Every key the probe writes is declared, and the enums agree with its types."""
+    from typing import get_args
+
+    from pg_operator.postgres.replication import (
+        LogicalReplicationInfo,
+        ReplicationGrant,
+        SubscriptionPrivilege,
+    )
+
+    block = load("postgresinstances.yaml")["spec"]["versions"][0]["schema"][
+        "openAPIV3Schema"
+    ]["properties"]["status"]["properties"]["logicalReplication"]["properties"]
+    written = LogicalReplicationInfo(
+        major_version=16,
+        current_user="pgadmin",
+        wal_level="logical",
+        max_replication_slots=10,
+        replication_slots_in_use=0,
+        max_wal_senders=10,
+        max_slot_wal_keep_size="-1",
+        create_subscription="Granted",
+        replication_grant="rds_replication",
+        is_rds=True,
+    ).as_status()
+    assert set(written) == set(block)
+    assert block["createSubscription"]["enum"] == list(get_args(SubscriptionPrivilege))
+    assert block["replicationGrant"]["enum"] == list(get_args(ReplicationGrant))
+
+
 def test_immutable_fields_carry_a_cel_rule() -> None:
     """Renaming a database or role would orphan the object it points at."""
     database_name = crd_spec_properties(load("postgresdbs.yaml"))["databaseName"]

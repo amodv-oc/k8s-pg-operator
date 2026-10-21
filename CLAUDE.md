@@ -48,14 +48,22 @@ surface under RDS's real constraint. Always test as a non-superuser, matching
 production.
 
 ```bash
-make test-setup        # starts postgres:16-alpine with an RDS-like managing role
-make test-integration   # runs the full suite against it
+make test-setup        # a source and a target, postgres:16-alpine, RDS-like (hack/rds-like.sql)
+make test-integration   # runs the full suite against them
 make test-teardown
+make test-setup PG_IMAGE=postgres:18-alpine PG_TARGET_IMAGE=postgres:16-alpine
 ```
 
 CI runs the matrix against PostgreSQL 14/15/16/17/18 — they take different
 code paths (per-grant `INHERIT`/`SET` options arrive in 16, `pg_database_owner`
 ownership of `public` in 15, `GRANT ... ON PARAMETER` in 15).
+
+Logical replication (`docs/design/replication.md`) needs the second server.
+Tests marked `replication` run in their own CI matrix of 16+ source → target
+pairs. Their one superuser step, `emulate_rds_replication()`, stands in for
+RDS's rule that a login granted `rds_replication` may stream. It gives
+`REPLICATION` only to *direct* members, so `pgadmin` keeps `NOREPLICATION` as
+the RDS master user does. Don't widen it, and don't add other superuser steps.
 
 ### The local cluster harness (`hack/local/`)
 
