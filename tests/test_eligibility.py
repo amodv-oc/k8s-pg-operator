@@ -152,6 +152,53 @@ def test_a_column_list_must_include_the_identity() -> None:
     assert reasons(verdict) == [el.COLUMN_LIST_MISSES_IDENTITY]
 
 
+def test_replica_identity_full_allows_no_column_list() -> None:
+    """PostgreSQL refuses UPDATE/DELETE on a FULL table with any column list, even one naming every column."""
+    full = source(identity=frozenset({"id", "region", "total"}), replica_identity="f")
+    verdict = judge(candidate(columns=("id", "region", "total")), full)
+    assert reasons(verdict) == [el.COLUMN_LIST_MISSES_IDENTITY]
+    assert "REPLICA IDENTITY FULL" in verdict.issues[0].message
+    assert judge(candidate(columns=("id", "region", "total")), full, keyed=False).publishable
+
+
+GENERATED = {"id": "integer", "region": "text"}
+
+
+def test_pg18_refuses_a_full_identity_with_a_generated_column() -> None:
+    full = source(
+        columns=GENERATED,
+        identity=frozenset(GENERATED),
+        replica_identity="f",
+        generated=frozenset({"total"}),
+    )
+    verdict = judge(candidate(), full, source_major_version=18)
+    assert reasons(verdict) == [el.GENERATED_COLUMN_IN_IDENTITY]
+    assert "total" in verdict.issues[0].message
+    # Before 18 the publisher has no such check; insert-only publications never do.
+    assert judge(candidate(), full, source_major_version=17).publishable
+    assert judge(candidate(), full, source_major_version=18, keyed=False).publishable
+
+
+def test_pg18_refuses_an_identity_index_over_a_generated_column() -> None:
+    keyed_on_generated = source(
+        columns=GENERATED, identity=frozenset({"id", "total"}), generated=frozenset({"total"})
+    )
+    verdict = judge(candidate(), keyed_on_generated, source_major_version=18)
+    assert reasons(verdict) == [el.GENERATED_COLUMN_IN_IDENTITY]
+    # A generated column outside the key is no concern of the identity's.
+    keyed_beside_generated = source(columns=GENERATED, generated=frozenset({"total"}))
+    assert judge(candidate(), keyed_beside_generated, source_major_version=18).publishable
+
+
+def test_pg18_generated_identity_with_a_column_list_is_reported_once() -> None:
+    """With a column list the server checks coverage instead - one reason, not two."""
+    keyed_on_generated = source(
+        columns=GENERATED, identity=frozenset({"id", "total"}), generated=frozenset({"total"})
+    )
+    verdict = judge(candidate(columns=("id", "region")), keyed_on_generated, source_major_version=18)
+    assert reasons(verdict) == [el.COLUMN_LIST_MISSES_IDENTITY]
+
+
 def test_identity_is_irrelevant_to_filters_without_keyed_changes() -> None:
     assert judge(candidate(row_filter=filter_on("region")), source(), keyed=False).publishable
 
@@ -338,6 +385,46 @@ def test_each_leaf_needs_a_replica_identity() -> None:
     )
     assert reasons(verdict) == [el.NO_REPLICA_IDENTITY]
     assert "events_2026" in verdict.issues[0].message
+
+
+@pytest.mark.parametrize(
+    ("overrides", "remedy"),
+    [
+        ({"persistent": False}, "SET LOGGED"),
+        # A foreign table has no indexes, hence no identity either - which is
+        # no concern of a publication that never carries it.
+        ({"kind": "f", "replica_identity": "n", "identity": None}, "DETACH PARTITION"),
+    ],
+    ids=["unlogged", "foreign"],
+)
+@pytest.mark.parametrize("via_root", [False, True])
+def test_a_leaf_whose_changes_are_never_decoded_holds_its_table_back(
+    overrides: dict[str, Any], remedy: str, via_root: bool
+) -> None:
+    """The table would replicate only in part, silently."""
+    root = partitioned(leaf("events_2025"), leaf("events_2026", **overrides))
+    targets = [target("events"), target("events_2025"), target("events_2026")]
+    verdict = judge(candidate("events"), root, targets=targets, via_root=via_root)
+    assert reasons(verdict) == [el.NOT_PUBLISHABLE]
+    assert verdict.issues[0].side == "source"
+    assert "public.events_2026" in verdict.issues[0].message
+    assert "public.events_2025" not in verdict.issues[0].message
+    assert remedy in verdict.issues[0].message
+
+
+def test_a_full_leaf_takes_no_column_list_under_its_root() -> None:
+    """The root's column list is checked against each leaf's own replica identity."""
+    full_leaf = leaf("events_2026", replica_identity="f", identity=frozenset({"id", "region", "total"}))
+    root = partitioned(leaf("events_2025"), full_leaf)
+    verdict = judge(candidate("events", columns=("id", "region")), root, targets=[target("events")], via_root=True)
+    assert reasons(verdict) == [el.COLUMN_LIST_MISSES_IDENTITY]
+    assert "public.events_2026" in verdict.issues[0].message
+
+
+def test_a_full_root_over_keyed_leaves_may_take_a_column_list() -> None:
+    """A partitioned root's own setting is never what the source checks."""
+    root = replace(partitioned(leaf("events_2025")), replica_identity="f")
+    assert judge(candidate("events", columns=("id", "region")), root, targets=[target("events")], via_root=True).publishable
 
 
 def test_a_filter_on_a_partitioned_table_needs_publish_via_root() -> None:

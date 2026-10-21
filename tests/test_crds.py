@@ -183,6 +183,15 @@ def test_immutable_fields_carry_a_cel_rule() -> None:
     )
 
 
+def test_database_instance_is_immutable() -> None:
+    """Moving a PostgresDB would orphan its database - and re-point every replication of it."""
+    instance_ref = crd_spec_properties(load("postgresdbs.yaml"))["instanceRef"]
+    assert any(
+        rule["rule"] == "self == oldSelf"
+        for rule in instance_ref["x-kubernetes-validations"]
+    )
+
+
 def test_identifier_fields_are_pattern_constrained() -> None:
     """Defence in depth: the API server rejects unquotable names too."""
     pattern = "^[a-z_][a-z0-9_$]*$"
@@ -309,6 +318,13 @@ def test_replication_ends_are_immutable() -> None:
     for side in ("source", "target"):
         db_ref = spec[side]["properties"]["dbRef"]
         assert any(rule["rule"] == "self == oldSelf" for rule in db_ref["x-kubernetes-validations"])
+
+
+def test_publish_via_partition_root_is_immutable() -> None:
+    """Switching it swaps the relations subscribed, and the newcomers are copied over replicated rows."""
+    via_root = replication_spec_schema()["properties"]["publishViaPartitionRoot"]
+    assert via_root["default"] is False
+    assert any(rule["rule"] == "self == oldSelf" for rule in via_root["x-kubernetes-validations"])
 
 
 def test_replication_selections_are_keyed_maps() -> None:

@@ -217,7 +217,7 @@ spec:
 | `tables[]` | `[]` | `schema`, `name`, optional `columns[]` and `rowFilter`. An explicit entry overrides the table's `schemas[]` membership. A table both listed here and excluded in `schemas[]` is refused as contradictory |
 | `rowFilter` | — | `all:` (AND) or `any:` (OR), one level deep. Each predicate is `{column, op, value \| values}`. `op` is one of `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. See D2 |
 | `publish` | all four | Subset of `insert`, `update`, `delete`, `truncate` |
-| `publishViaPartitionRoot` | `false` | Passed through to the publication |
+| `publishViaPartitionRoot` | `false` | Passed through to the publication. **Immutable**: switching it swaps the relations the subscription carries (the root for its leaves, or back), and the next refresh would copy the newcomers over rows the target already holds |
 | `copyData` | `true` | Used on create and on every refresh that adds tables |
 | `enabled` | `true` | `false` disables the subscription. The slot keeps retaining WAL while it is disabled, so this is a maintenance lever, not a parking state |
 | `subscription.streaming`, `subscription.binary` | server default | Passed through to `CREATE`/`ALTER SUBSCRIPTION` |
@@ -233,7 +233,10 @@ non-superuser owner.
 
 ### Admission rules (CEL)
 
-- `source.dbRef` and `target.dbRef` are immutable (`self == oldSelf`).
+- `source.dbRef`, `target.dbRef` and `publishViaPartitionRoot` are immutable
+  (`self == oldSelf`).
+- A `PostgresDB`'s `instanceRef` is immutable too. `dbRef` alone does not pin
+  an end: moving the `PostgresDB` would move every replication of it.
 - At least one entry in `schemas` or `tables`.
 - No `(schema, name)` appears twice in `tables`. No schema appears twice in
   `schemas`.
@@ -250,6 +253,13 @@ These are reported as **permanent** errors:
 - Source and target resolve to the same instance, or to two instances with the
   same `host:port`.
 - Either server is older than PostgreSQL 16.
+- An end resolves to a different instance or database from the one status
+  records objects on, for example because its `PostgresDB` was deleted under
+  `RETAIN` and recreated elsewhere under the same name. Converging there would
+  create a second publication, login and slot and overwrite status with them,
+  and teardown, which works from status alone, would never find the old slot
+  again. Refusing keeps status intact, so the old slot stays watched and
+  deleting the replication still removes it.
 - A `schemas[]` or `tables[]` entry names a schema that is not managed by the
   source `PostgresDB`. The replication login reads through `<db>_ro`, which
   holds grants only on managed schemas.
@@ -432,9 +442,11 @@ names the cause. This is the same "report, don't abort" rule as
 
 | Check | Side | Reason | Why it is a gate |
 | --- | --- | --- | --- |
-| Usable replica identity (primary key, `USING INDEX`, or `FULL`) when `publish` includes `update` or `delete` | source | `NoReplicaIdentity` | Without it, every `UPDATE` and `DELETE` on the source fails |
+| Usable replica identity (primary key, `USING INDEX`, or `FULL`) when `publish` includes `update` or `delete`. A `DEFERRABLE` primary key does not count: PostgreSQL never picks one as the identity | source | `NoReplicaIdentity` | Without it, every `UPDATE` and `DELETE` on the source fails |
 | Row-filter columns ⊆ replica-identity columns (unless `FULL`), under the same condition | source | `RowFilterNotCoveredByIdentity` | Same failure on the source |
-| Column list ⊇ replica-identity columns | source | `ColumnListMissesIdentity` | Same failure on the source |
+| Column list ⊇ replica-identity columns, and no column list at all on a `FULL` table, under the same condition | source | `ColumnListMissesIdentity` | Same failure on the source. PostgreSQL allows no column list with `REPLICA IDENTITY FULL`, even one naming every column |
+| On a PostgreSQL 18+ source, the replica identity holds no generated column (`FULL` counts every column), under the same condition | source | `GeneratedColumnInIdentity` | PostgreSQL 18 refuses `UPDATE` and `DELETE` when the identity takes in a generated column the publication does not carry. The operator never publishes generated columns, and a virtual one cannot be published at all |
+| Every leaf of a partitioned table is a permanent, local table | source | `NotPublishable` | An unlogged leaf writes no WAL and a foreign one keeps its rows elsewhere, so neither's changes are ever decoded and the table would replicate only in part, silently. Like `RowSecurityEnabled`, this is source-side for completeness rather than for the source's writes: a published table that gains such a leaf is taken out, so all its leaves stop replicating, and coming back means an initial copy into a target that must be empty (or `copyData: false`) |
 | Listed columns exist and are not generated | source | `UnknownColumn` | Otherwise `ALTER PUBLICATION` fails |
 | Managing role has privileges of the table owner | source | `SourceTableNotOwned` | `ALTER PUBLICATION … ADD TABLE` needs ownership. The remedy names `ALTER TABLE … OWNER TO <db>_owner` |
 | Replication login can `SELECT` the table | source | `SourceTableNotReadable` | The initial copy runs as that login |
@@ -442,7 +454,7 @@ names the cause. This is the same "report, don't abort" rule as
 | Table exists on the target with the same schema and name (and the same leaves, for a partitioned root published via leaves) | target | `TargetTableMissing` | Otherwise apply stops for every table |
 | Every published column exists on the target and is not generated there | target | `TargetColumnsMissing` | Same |
 | Managing role can `SET ROLE` to the target table's owner | target | `TargetOwnerNotSettable` | PostgreSQL 16 applies changes as the table owner |
-| The target can identify a row: a primary key, or a `REPLICA IDENTITY` index — unless the source publishes `REPLICA IDENTITY FULL` | target | `TargetNoReplicaIdentity` | "If a replica identity other than FULL is set on the publisher side, a replica identity comprising the same or fewer columns must also be set on the subscriber side." Without one, apply stops for every table. A target set to `FULL` does not count: the subscriber searches through an index, never the whole row |
+| The target can identify a row: a primary key that is not `DEFERRABLE`, or a `REPLICA IDENTITY` index — unless the source publishes `REPLICA IDENTITY FULL` | target | `TargetNoReplicaIdentity` | "If a replica identity other than FULL is set on the publisher side, a replica identity comprising the same or fewer columns must also be set on the subscriber side." Without one, apply stops for every table. A target set to `FULL` does not count: the subscriber searches through an index, never the whole row. Nor does a deferrable primary key, which the apply worker never searches by. Before PostgreSQL 18 apply then stops; 18 instead skips each `UPDATE` and `DELETE` as a missing row, which is worse, because it is silent |
 | The target's identity columns ⊆ the columns the source publishes *as its replica identity* | target | `TargetIdentityNotSent` | The publisher sends only its own identity as the key, however many columns it publishes. Same consequence |
 | Every `NOT NULL` column on the target that the publication does not carry has a default, or is an identity or generated column | target | `TargetColumnRequired` | Otherwise every `INSERT` the subscription applies fails the constraint, from the initial copy onwards |
 | No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict. The older replication keeps the table, by creation time and then namespace/name, so the two can never each defer to the other. It is the one target-side reason that takes an already-published table out |

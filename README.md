@@ -529,7 +529,7 @@ neither it nor the API authenticates. Gate it at the ingress.
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `instanceRef.name` | — | Required |
+| `instanceRef.name` | — | Required. Immutable |
 | `databaseName` | sanitised `metadata.name` | Immutable |
 | `retentionPolicy` | inherits instance | `RETAIN` or `DROP` |
 | `schemas[]` | `[public]` | `name`, `comment`. `public` always managed |
@@ -588,10 +588,18 @@ Every `reconcile.replicationInterval` seconds (60 by default), a pass:
    added only once *both* servers can take it. Every other table appears in
    `status.excludedTables` with its reason and remedy.
    - **Reasons that protect the source:** `NoReplicaIdentity`,
-     `RowFilterNotCoveredByIdentity` and `ColumnListMissesIdentity`. Publishing
-     such a table would make PostgreSQL refuse that table's `UPDATE`s and
-     `DELETE`s on the source itself. A published table that later loses its
-     replica identity is removed on the next pass.
+     `RowFilterNotCoveredByIdentity`, `ColumnListMissesIdentity` and, on a
+     PostgreSQL 18 source, `GeneratedColumnInIdentity`. Publishing such a table
+     would make PostgreSQL refuse that table's `UPDATE`s and `DELETE`s on the
+     source itself. A `DEFERRABLE` primary key is no replica identity, and a
+     table with `REPLICA IDENTITY FULL` takes no column list at all. A
+     published table that later loses its replica identity is removed on the
+     next pass.
+   - **The reason that protects the replica:** `NotPublishable` also holds back
+     a partitioned table with an unlogged or foreign partition, whose changes
+     logical replication never carries. A published table that gains such a
+     partition is taken out rather than left replicating in part, so coming
+     back needs an empty target table, or `copyData: false`.
    - **Reasons that keep apply running:** `TargetTableMissing`,
      `TargetColumnsMissing`, `TargetNoReplicaIdentity`, `TargetIdentityNotSent`
      and `TargetColumnRequired`. Apply is sequential, so a single table the
@@ -670,7 +678,7 @@ replication uses it, in either direction.
 | `tables[]` | — | `schema`, `name`, `columns`, `rowFilter`. At least one of `schemas`/`tables` |
 | `rowFilter` | — | `all` (AND) or `any` (OR) of `{column, op, value \| values}`; `op` is `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. Never SQL text |
 | `publish` | all four | `insert`, `update`, `delete`, `truncate` |
-| `publishViaPartitionRoot`, `copyData`, `enabled` | `false`, `true`, `true` | |
+| `publishViaPartitionRoot`, `copyData`, `enabled` | `false`, `true`, `true` | `publishViaPartitionRoot` is immutable |
 | `subscription` | server defaults | `streaming` (`"off"`/`"on"`/`"parallel"` — quote them), `binary` |
 | `alerting` | `1Gi`, `10Gi`, `10m` | `maxLag`, `maxRetainedWal`, `maxSlotInactive` |
 | `paused` | `false` | |
