@@ -32,8 +32,12 @@ variables() {
   # The source as the *target server* reaches it: by container name, on the
   # container port. Subscriptions connect server to server, not via the host.
   echo "PGOP_TEST_SOURCE_FROM_TARGET=host=$source_name port=5432"
-  # Used only to emulate rds_replication (hack/rds-replication-shim.sql).
+  # ...and the other way, for replications that run target -> source.
+  echo "PGOP_TEST_TARGET_FROM_SOURCE=host=$target_name port=5432"
+  # Used only to emulate rds_replication (hack/rds-replication-shim.sql), and
+  # for test cleanup that must not strand a slot.
   echo "PGOP_TEST_SUPERUSER_DSN=$(dsn "$source_port" postgres testpw)"
+  echo "PGOP_TEST_TARGET_SUPERUSER_DSN=$(dsn "$target_port" postgres testpw)"
 }
 
 start() { # name image port

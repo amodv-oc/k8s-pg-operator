@@ -105,35 +105,54 @@ async def _result(ctx, k8s, **fields: Any) -> ReplicationResult:
     )
 
 
-async def test_a_converged_source_side_is_pending_until_the_subscription_exists(ctx, k8s) -> None:
-    status = build_status(await _result(ctx, k8s, published=["public.a", "public.b"]), None, 2)
-    assert status["phase"] == "Pending"
+async def test_a_subscribed_replication_is_ready(ctx, k8s) -> None:
+    result = await _result(
+        ctx, k8s, published=["public.a", "public.b"], subscribed={"public.a": "r", "public.b": "d"}
+    )
+    status = build_status(result, None, 2)
+    assert status["phase"] == "Ready"
     conditions = {c["type"]: c for c in status["conditions"]}
-    assert (conditions["Ready"]["status"], conditions["Ready"]["reason"]) == ("Unknown", "AwaitingSubscription")
+    assert conditions["Ready"]["status"] == "True"
     assert conditions["Drifted"]["status"] == "False"
     assert conditions["Synced"]["status"] == "True"
-    assert status["tables"] == {"published": 2, "excluded": 0, "display": "2/2"}
+    assert status["tables"] == {
+        "published": 2, "subscribed": 2, "ready": 1, "syncing": 1, "excluded": 0, "display": "1/2",
+    }
     assert status["source"]["slot"] == status["target"]["subscription"]
+    assert "1 of 2 subscribed table(s) ready" in conditions["Ready"]["message"]
 
 
 async def test_held_back_tables_name_their_cause(ctx, k8s) -> None:
     one = {"table": "public.c", "reason": "TargetTableMissing", "message": "public.c does not exist"}
-    status = build_status(await _result(ctx, k8s, published=["public.a"], excluded=[one]), None, 2)
+    result = await _result(ctx, k8s, published=["public.a"], subscribed={"public.a": "r"}, excluded=[one])
+    status = build_status(result, None, 2)
     conditions = {c["type"]: c for c in status["conditions"]}
     assert (conditions["Drifted"]["status"], conditions["Drifted"]["reason"]) == ("True", "TargetTableMissing")
     assert conditions["Synced"]["status"] == "False"
     assert "public.c: public.c does not exist" in conditions["Drifted"]["message"]
-    assert status["tables"]["display"] == "1/2"
+    assert status["phase"] == "Drifted"
+    assert status["tables"]["excluded"] == 1
 
     two = {"table": "public.d", "reason": "NoReplicaIdentity", "message": "no identity"}
     status = build_status(await _result(ctx, k8s, excluded=[one, two]), None, 2)
     assert {c["type"]: c for c in status["conditions"]}["Drifted"]["reason"] == "MultipleIssues"
 
 
-async def test_pending_replaces_a_failure_from_an_earlier_pass(ctx, k8s) -> None:
-    """Once the spec is fixed, a Ready=False left by the failed pass must go."""
+async def test_ready_replaces_a_failure_from_an_earlier_pass(ctx, k8s) -> None:
+    """Once the cause is fixed, a Ready=False left by the failed pass must go."""
     earlier = {"conditions": [{"type": "Ready", "status": "False", "reason": "Configuration", "message": "x"}]}
-    assert build_status(await _result(ctx, k8s), earlier, 2)["phase"] == "Pending"
+    assert build_status(await _result(ctx, k8s), earlier, 2)["phase"] == "Ready"
+
+
+async def test_the_password_never_reaches_status() -> None:
+    from pg_operator.reconcile.replication import ReplicationEnd
+
+    end = ReplicationEnd("team-a", "orders", "prod", "orders", "prod.rds", 5432)
+    result = ReplicationResult(
+        source=end, target=end, names=replication_names("team-a", "x"), password="s3cret-value"
+    )
+    assert "s3cret-value" not in repr(result)
+    assert "s3cret-value" not in repr(build_status(result, None, 1))
 
 
 async def test_a_missing_target_is_temporary_and_named(ctx, k8s) -> None:
@@ -264,3 +283,47 @@ async def test_only_replications_into_the_same_physical_database_claim(ctx, k8s)
     newer = _store(k8s, _publishing("newer", "2026-10-02T00:00:00Z", []))
     resolved = await resolve_replication(ctx, newer)
     assert await _claims_elsewhere(ctx, newer, resolved.target) == {}
+
+
+# --- what the target server's connection errors mean ----------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "expected"),
+    [
+        (
+            "could not connect to the publisher: connection to server at \"src\" failed: "
+            "FATAL:  permission denied to start WAL sender",
+            "ReplicationRefused",
+        ),
+        (
+            "could not connect to the publisher: FATAL:  must be superuser or replication role "
+            "to start walsender",
+            "ReplicationRefused",
+        ),
+        (
+            "could not connect to the publisher: connection to server at \"src\" failed: "
+            "Connection timed out",
+            "SourceUnreachableFromTarget",
+        ),
+        (
+            "could not connect to the publisher: connection to server at \"src\" failed: "
+            "server does not support SSL, but SSL was required",
+            "SourceUnreachableFromTarget",
+        ),
+        ("some other failure", "ReconcileFailure"),
+    ],
+)
+async def test_connection_errors_name_their_cause(message: str, expected: str) -> None:
+    from pg_operator.errors import ReconcileFailure
+    from pg_operator.reconcile.replication import ReplicationEnd, _explain
+
+    end = ReplicationEnd("team-a", "orders", "prod", "orders", "prod.rds", 5432)
+    result = ReplicationResult(source=end, target=end, names=replication_names("team-a", "x"), login="l")
+    explained = _explain(ReconcileFailure(message), result, "prod.internal", 5432)
+    assert type(explained).__name__ == expected
+    if expected == "SourceUnreachableFromTarget":
+        assert "prod.internal:5432" in str(explained) and "source.connection" in str(explained)
+        # A TLS mismatch names sslMode, not the network.
+        assert ("sslMode" in str(explained)) == ("SSL" in message)
+        assert ("security groups" in str(explained)) == ("SSL" not in message)

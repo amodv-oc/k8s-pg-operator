@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | Accepted 2026-10-21, D1–D11 included. PRs 1–2 merged; PR 3 (the source side) in progress |
+| Status | Accepted 2026-10-21, D1–D11 included. PRs 1–3 merged; PR 4 (the subscription) in progress |
 | Date | 2026-10-21 |
 | Scope | Long-lived, one-way logical replication from a database on one `PostgresInstance` into a database on another |
 
@@ -269,7 +269,7 @@ These are reported as **permanent** errors:
 | Replication login | source server | `{rolePrefix}pgop_repl_{ns}_{name}_{hash}` | operator, unless `credentialsSecretRef` is set |
 | Credentials Secret | operator namespace | `pgop-repl.{ns}.{name}` | operator, for a generated login only |
 | Publication | source database | `pgop_{rolePrefix}{ns}_{name}_{hash}` | operator |
-| Slot | source server | same as the subscription | `CREATE SUBSCRIPTION` |
+| Slot | source server | same as the subscription | operator, from the source, before the subscription — never `CREATE SUBSCRIPTION` itself (see step 6) |
 | Subscription | target database | `pgop_{rolePrefix}{ns}_{name}_{hash}` | operator |
 
 Naming rules:
@@ -311,10 +311,13 @@ resume or the timer. Steady state issues no DDL.
    - The source must report `wal_level = logical`. If it does not, the
      replication fails permanently with `LogicalReplicationDisabled` and the
      remedy "set `rds.logical_replication = 1` and reboot".
-   - Free replication slots and WAL senders on the source are checked against
-     what this subscription needs: one slot, plus temporary slots for its
-     table-sync workers during an initial copy. Too few is reported up front,
-     rather than surfacing later as an opaque `CREATE SUBSCRIPTION` failure.
+   - Before a subscription is created, the source must have a free
+     replication slot. If it does not, the pass fails with
+     `InsufficientCapacity` (temporary) rather than an opaque `CREATE
+     SUBSCRIPTION` failure. Its table-sync workers briefly want more slots
+     during the initial copy, but PostgreSQL retries those itself.
+   - The target's managing role must be able to create subscriptions
+     (`status.logicalReplication.createSubscription` is not `Unavailable`).
 3. **Replication login** (source).
    - **Generated login:**
      - Create it as `LOGIN` with a generated password.
@@ -370,8 +373,26 @@ resume or the timer. Steady state issues no DDL.
   successful pass. A test fails a pass mid-way and proves teardown still finds
   everything.
 6. **Converge the subscription** (target).
-   - Create it if it is missing: `CREATE SUBSCRIPTION … CONNECTION … PUBLICATION
-     … WITH (copy_data, streaming, binary, enabled)`.
+   - Create it if it is missing, in two steps:
+     1. **The slot.** It is created from the source with
+        `pg_create_logical_replication_slot`, in a transaction of its own and
+        connected to the source database, since a logical slot belongs to one
+        database. An idle slot of this name, in that database, is this
+        replication's own leftover and is adopted. One in use, or in another
+        database, is reported and never touched.
+     2. **The subscription.** `CREATE SUBSCRIPTION … CONNECTION … PUBLICATION
+        … WITH (create_slot = false, slot_name, copy_data, streaming, binary,
+        enabled)`.
+   - **Why the slot is never made by `CREATE SUBSCRIPTION`.** `CREATE
+     SUBSCRIPTION` would create the slot inside its own transaction *on the
+     target*, and creating a slot waits for every transaction already running
+     on the source. Two replications created at once in opposite directions
+     between two servers would then each wait on the other until the
+     statement timeout, and retry into the same deadlock. Three replications
+     round a ring of servers do the same. The local cluster harness found
+     this: 16→17, 17→18 and 18→16 deadlocked on every retry. Made from the
+     source, the slot waits only for that server's own transactions. A test
+     creates two opposite subscriptions at once, and fails on the old path.
    - Otherwise:
      - Apply `ENABLE`/`DISABLE` from `spec.enabled`.
      - Apply `SET (streaming, binary)`.
@@ -422,6 +443,7 @@ names the cause. This is the same "report, don't abort" rule as
 | Every published column exists on the target and is not generated there | target | `TargetColumnsMissing` | Same |
 | Managing role can `SET ROLE` to the target table's owner | target | `TargetOwnerNotSettable` | PostgreSQL 16 applies changes as the table owner |
 | No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict. The older replication keeps the table, by creation time and then namespace/name, so the two can never each defer to the other. It is the one target-side reason that takes an already-published table out |
+| With `copyData`, a table not yet subscribed is empty on the target | target | `TargetTableNotEmpty` | Its initial copy would collide with the rows already there and stall apply. The case D6 makes easy: a table unpublished when its replica identity went, then fixed, would otherwise be copied over its own replicated rows |
 | A partitioned table's column list or row filter is set only with `publishViaPartitionRoot: true` | source | `FilterIgnoredWithoutPartitionRoot` | Without it, each leaf is published under its own, empty filter and column list, so every row and column would flow, silently |
 
 `ColumnTypeMismatch` is reported as a **warning only**. The table is still
@@ -488,6 +510,9 @@ Column lists work the same way: the operator compares them against
     routing and `source.connection.host`.
   - The operator failing to reach either server is the ordinary `Reachable`
     condition.
+  - A source that is reached but refuses the login a replication connection
+    is `ReplicationRefused`. On RDS the login lacks `rds_replication`; on a
+    stock server it lacks the `REPLICATION` attribute.
 
 ### Steady state
 
@@ -542,31 +567,39 @@ not plumbing. It works from the names and instances **recorded in status**, not
 from the `dbRef`s, because those `PostgresDB`s may already be gone. That is
 always true when a whole namespace is being deleted.
 
-1. **Target:**
+1. **Target, subscription:**
    1. `ALTER SUBSCRIPTION … DISABLE`.
-   2. `DROP SUBSCRIPTION`, which also drops the slot on the source.
-   3. If the drop fails because the target cannot reach the source, run `SET
-      (slot_name = NONE)` and then `DROP SUBSCRIPTION`. Step 2 handles the slot.
-2. **Source, slot:**
-   1. If the slot still exists, terminate its walsender (`active_pid`).
-   2. Drop the slot with `pg_drop_replication_slot`, connecting as the
-      replication login.
-   3. Repeat until the slot is gone. **The finalizer is held until the slot is
-      confirmed absent.**
+   2. `DROP SUBSCRIPTION`. Through the target's own connection to the
+      source, this also drops the slot and any table-sync slots.
+   3. If that fails, because the target cannot reach the source or a walsender
+      still holds the slot, the subscription is detached (`SET (slot_name =
+      NONE)`) and dropped anyway. That is safe because the slot's name and the
+      subscription's oid are recorded in status: step 2 finds the slot, and
+      the table-sync slots by their `pg_<oid>_sync_*` names.
+2. **Source, slots:**
+   1. Any slot still held has its walsender ended (`active_pid`). Its
+      subscriber is gone or detached.
+   2. The slots are dropped by the managing role where it holds the
+      replication privilege (on RDS, through `rds_replication`). Otherwise the
+      replication login drops them, since it was created to use exactly these
+      slots.
+   3. **The finalizer is held until no slot remains.**
 3. **Source, publication:** `DROP PUBLICATION`, if `status.created` says the
    operator made it.
 4. **Source, login:** revoke `<db>_ro` and `rds_replication`, terminate the
    login's sessions, then `DROP ROLE`. This happens for a generated login only.
    A bring-your-own login loses only the memberships the operator granted.
-5. **Secret:** delete the credentials Secret, for a generated login only.
+5. **Secret:** delete the credentials Secret, for a generated login only, and
+   only once the source is cleared. It is the login's credential, and step 2
+   may still need it.
 6. **Target data:** never touched.
 
-Steps 2 to 5 do not depend on step 1. If the **target is unreachable**, the
-source-side steps run first, because the slot is the dangerous part. The
-subscription is then retried as a temporary error. If the **source is
-unreachable**, the subscription is disabled, the operator does not set
-`slot_name = NONE`, and the source is retried. Setting `NONE` would orphan the
-slot.
+Each server is handled independently. If the **target is unreachable**, the
+source is cleared anyway, because the slot is the dangerous part. The
+subscription is then retried as a temporary error, and when it can be reached
+it is dropped detached. If the **source is unreachable**, the subscription is
+still dropped; the target can usually reach the source even when the operator
+cannot. The source is then retried until its slots are confirmed gone.
 
 `run_teardown`'s `InstanceNotFound` shortcut, which releases the finalizer, is
 wrong for a resource with two sides. If the target `PostgresInstance` is gone,
@@ -798,7 +831,7 @@ Each PR updates `README.md` for what it ships.
 | 1 | Prerequisites: the instance's `logicalReplication` status block; harness and CI changes (second server, `wal_level`, bootstrap grants, shim) | Capabilities reported correctly on 14–18; existing suites green, unchanged |
 | 2 | CRD, models, naming, row-filter DSL, chart (CRD, RBAC, aggregation), example. Handlers registered; step 1 (Resolve) implemented in full, including the cycle check; status `Pending` via `Ready=Unknown` | `test_crds`/`test_examples`, spec and reconcile unit tests; CEL rules verified with `make local-up` |
 | 3 | Source side: login, Secret, table resolution, eligibility, publication convergence, and the teardown of all of it. Teardown was planned for PR 4, but PR 3 is the first PR to *create* objects, so shipping removal later would strand them | Integration: publication contents and exclusions, steady-state no-op, teardown (including after a failed pass) proven against real servers |
-| 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; the slot and subscription half of teardown; `PostgresDB` teardown ordering | Integration: end-to-end flow, steady-state no-op, all teardown scenarios |
+| 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; the slot and subscription half of teardown; `PostgresDB` teardown ordering; `TargetTableNotEmpty` | Integration: rows stream through filters and column lists; steady-state no-op; teardown with both servers, with either unreachable, and leaving no table-sync slots |
 | 5 | Health: observation, `status.health`, `Streaming` condition, `Degraded` phase, metrics, `PrometheusRule` | Integration: lag, stall and lost-slot states produced on demand |
 | 6 | State API | Projection tests; credential-leak test extended |
 | 7 | Dashboard | `make ui-check`, `make ui-image-check`, exercised on `make local-ui` |
@@ -822,7 +855,7 @@ eleven were accepted on 2026-10-21**, as recommended below.
 | D7 | A `PostgresDB` `DROP` teardown waits for replications that reference it | Adopt. Otherwise the failure is either a raw SQL error on the target, or a silently killed slot on the source |
 | D8 | The harness emulates RDS's `rds_replication` walsender rule with one superuser step | Adopt. It is the same pattern as the existing `GRANT SET ON PARAMETER` emulation. Everything else stays non-superuser |
 | D9 | Support a bring-your-own replication login (`credentialsSecretRef`) | Adopt. It covers non-RDS servers where the operator cannot grant replication |
-| D10 | Reject replication within one server | Adopt for v1. Same-server subscriptions need a manually created slot and `create_slot = false`, which is a different lifecycle |
+| D10 | Reject replication within one server | Adopt for v1. The slot is now always created separately with `create_slot = false` (step 6), which removes the main obstacle; same-server support is a candidate follow-up |
 | D11 | Default `sslMode: require`, with `verify-*` only through an explicit server-local `sslRootCertPath` | Adopt, pending the RDS gate. AWS documents no usable CA path on an RDS subscriber |
 
 ## Operating guidance

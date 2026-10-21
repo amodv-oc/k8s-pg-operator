@@ -160,6 +160,7 @@ Synced   False   ImmutableFieldDrift   encoding is UTF8, spec requests LATIN1
 | Extension removed from spec | kept and reported | `DROP EXTENSION ... CASCADE` |
 | `PostgresUser` deleted | role and credentials Secret kept | sessions terminated, privileges cleared, role dropped, Secret and PushSecret removed |
 | `PostgresInstance` deleted | connections closed; **the server is never touched** | same — the operator does not own the server |
+| `PostgresReplication` deleted | subscription, slots, publication, generated login and Secret removed; replicated rows kept | same — `retentionPolicy` does not apply |
 
 A `RETAIN` teardown never opens a connection, so deleting a retained resource
 completes even while its server is unreachable or its credentials Secret is
@@ -550,16 +551,19 @@ One-way logical replication of selected tables from a `PostgresDB` on one
 instance into a `PostgresDB` on another. The design is
 [`docs/design/replication.md`](docs/design/replication.md).
 
-**Preview: the source side only.** This version converges everything on the
-source. It does not yet create the subscription, so nothing replicates and the
-phase stays `Pending`. A pass:
+**Preview: replication without health reporting.** This version creates and
+converges everything a replication needs, and rows stream. Lag, retained WAL
+and apply errors are reported from a later version. Until then, watch
+`pg_replication_slots` on the source. A pass:
 
 1. **Refuses a replication that can never work.** It checks that both
    `PostgresDB`s exist on different servers, and that both instances admit the
    replication's namespace. Every selected schema must be managed by the
    source. The replication must not close a loop of any length, because a
    subscription republishes what it applies. Both servers must run PostgreSQL
-   16 or later, and the source must have `wal_level = logical`.
+   16 or later. The source must have `wal_level = logical` and a free
+   replication slot, and the target's managing role must be able to create
+   subscriptions.
 2. **Ensures a replication login on the source.** By default this is generated:
    it is granted `rds_replication` so it can stream, and the source's
    `<db>_ro` group so it can read. Its password is in a Secret in the
@@ -567,21 +571,49 @@ phase stays `Pending`. A pass:
    instead and never altered, apart from the `<db>_ro` membership.
 3. **Converges a publication that lists its tables explicitly.** A table is
    added only once *both* servers can take it. Every other table appears in
-   `status.excludedTables` with its reason and remedy. The most important
-   reasons protect the **source**:
-   - `NoReplicaIdentity`, `RowFilterNotCoveredByIdentity` and
-     `ColumnListMissesIdentity` hold a table back because publishing it would
-     make PostgreSQL refuse that table's `UPDATE`s and `DELETE`s on the source
-     itself. A published table that later loses its replica identity is
-     removed on the next pass.
-   - `TargetTableMissing` and `TargetColumnsMissing` hold a table back until
-     the target has it. Create it there, and it is published on the next pass.
+   `status.excludedTables` with its reason and remedy.
+   - **Reasons that protect the source:** `NoReplicaIdentity`,
+     `RowFilterNotCoveredByIdentity` and `ColumnListMissesIdentity`. Publishing
+     such a table would make PostgreSQL refuse that table's `UPDATE`s and
+     `DELETE`s on the source itself. A published table that later loses its
+     replica identity is removed on the next pass.
+   - **Reasons that wait for the target:** `TargetTableMissing` and
+     `TargetColumnsMissing`. Create the table there, and it is published on
+     the next pass.
+   - **The reason that protects the target:** `TargetTableNotEmpty`. A table's
+     initial copy would collide with rows already on the target, so the
+     table waits until it is emptied there, or until `copyData` is false.
+4. **Converges the subscription on the target.** It is created with the slot,
+   and kept enabled or disabled as the spec says. Its connection is updated
+   when the login's password changes. It is refreshed when the publication's
+   tables change, so a new table is copied and then streams.
+   `status.tables` counts subscribed tables and how many have finished their
+   initial copy; the `TABLES` column shows ready/subscribed.
+
+The target server, not the operator, connects to the source. If it cannot, the
+replication reports `SourceUnreachableFromTarget`. Set `source.connection.host`
+if the target resolves the source differently from the operator.
 
 Every object the operator creates carries an ownership comment and is recorded
 in status the moment it exists. An existing object with the same name is never
-taken over. Deleting the `PostgresReplication` removes the publication, the
-generated login and its Secret, whatever the `retentionPolicy`, and never
-touches the target.
+taken over. An idle slot left by an earlier incarnation is adopted. The slot is
+always created from the source before the subscription, never by `CREATE
+SUBSCRIPTION` itself. That avoids a deadlock between replications created at
+the same time in opposite directions.
+
+Deleting a `PostgresReplication` removes, whatever the `retentionPolicy`:
+
+- the subscription;
+- every slot on the source, including table-sync slots;
+- the publication;
+- the generated login and its Secret.
+
+The finalizer holds until the source's slots are confirmed gone. A slot left
+behind retains WAL until the disk fills. If either server is unreachable, the
+other is cleared first. The replicated rows on the target are never touched.
+
+A `PostgresDB` with `retentionPolicy: DROP` waits to be dropped while a
+replication uses it, in either direction.
 
 | Field | Default | Notes |
 | --- | --- | --- |

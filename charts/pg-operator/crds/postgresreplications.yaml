@@ -62,9 +62,8 @@ spec:
             retentionPolicy does not apply.
 
             The design is docs/design/replication.md. This operator version
-            converges the source side - the replication login and the
-            publication - and reports Pending; it does not yet create the
-            subscription, so nothing replicates.
+            creates and converges the publication, the login and the
+            subscription; lag and slot health are reported from a later one.
           required: [spec]
           properties:
             apiVersion: { type: string }
@@ -388,10 +387,20 @@ spec:
                     postgresDB: { type: string }
                     display: { type: string }
                     subscription: { type: string }
+                    subscriptionOid:
+                      type: integer
+                      description: Names the table-sync slots (pg_<oid>_sync_*) a detached subscription can leave on the source.
+                connectionFingerprint:
+                  type: string
+                  description: >-
+                    A hash of the subscription's connection string, which a
+                    non-superuser cannot read back; the connection is updated
+                    only when this changes.
                 tables:
                   type: object
                   properties:
                     published: { type: integer }
+                    subscribed: { type: integer }
                     ready: { type: integer }
                     syncing: { type: integer }
                     excluded: { type: integer }
@@ -412,6 +421,8 @@ spec:
                     login: { type: boolean }
                     secret: { type: boolean }
                     publication: { type: boolean }
+                    slot: { type: boolean }
+                    subscription: { type: boolean }
                 grantedMemberships:
                   type: array
                   description: Roles the operator granted the login; only these are revoked on deletion.

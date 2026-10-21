@@ -38,6 +38,9 @@ ROW_SECURITY_ENABLED = "RowSecurityEnabled"
 TARGET_TABLE_MISSING = "TargetTableMissing"
 TARGET_COLUMNS_MISSING = "TargetColumnsMissing"
 TARGET_OWNER_NOT_SETTABLE = "TargetOwnerNotSettable"
+#: The initial copy of a newly subscribed table would collide with rows the
+#: target already holds - most often a table unpublished (D6) and re-added.
+TARGET_TABLE_NOT_EMPTY = "TargetTableNotEmpty"
 TABLE_TARGETED_TWICE = "TableTargetedTwice"
 #: The server refused the table's ADD TABLE - most often an operand that does
 #: not convert to its column's type.
@@ -155,8 +158,16 @@ def judge(
     read_group: str,
     login: str,
     claimed_by: str | None = None,
+    copy_data: bool = False,
+    subscribed: frozenset[str] = frozenset(),
+    target_nonempty: frozenset[str] = frozenset(),
 ) -> Verdict:
-    """Decide one candidate. ``keyed`` means UPDATE or DELETE is published."""
+    """Decide one candidate. ``keyed`` means UPDATE or DELETE is published.
+
+    ``subscribed`` is what the subscription already carries; with
+    ``copy_data``, any other relation gets an initial copy, which must land in
+    an empty table.
+    """
     q = candidate.qualified
     if source is None:
         return Verdict(
@@ -256,6 +267,19 @@ def judge(
                     TARGET_COLUMNS_MISSING,
                     f"{relation.qualified} on the target lacks published column(s) "
                     f"{', '.join(missing)} (or has them generated)",
+                )
+            )
+        if (
+            copy_data
+            and relation.qualified not in subscribed
+            and relation.qualified in target_nonempty
+        ):
+            issues.append(
+                _target(
+                    TARGET_TABLE_NOT_EMPTY,
+                    f"{relation.qualified} already has rows on the target, and its initial copy "
+                    "would collide with them; empty it there, or set copyData: false if they "
+                    "are already in step with the source",
                 )
             )
         if not target.owner_settable:

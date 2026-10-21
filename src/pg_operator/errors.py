@@ -56,3 +56,29 @@ class InsufficientPrivilege(ReconcileFailure):
     that can degrade gracefully catch this specifically, so that an unrelated
     error is never mistaken for a permission problem.
     """
+
+
+class SourceUnreachableFromTarget(ReconcileFailure):
+    """The target *server* could not connect to the source.
+
+    Distinct from :class:`ConnectionFailure`, which is the operator failing to
+    reach a server. Here the operator reached both; what is broken is the path
+    between them - security groups, routing, or the address in
+    ``source.connection`` - which is a different fix entirely.
+    """
+
+
+class ReplicationRefused(ReconcileFailure):
+    """The source refused the replication login a walsender connection.
+
+    On RDS the login streams through rds_replication; on a stock server it needs
+    the REPLICATION attribute. Retried, because both can be granted out of band.
+    """
+
+
+class InsufficientCapacity(ReconcileFailure):
+    """The source has no free replication slot for a new subscription.
+
+    Temporary: slots are freed by other subscriptions going away, or by raising
+    max_replication_slots in the parameter group.
+    """

@@ -1,237 +1,32 @@
 """The source side of a PostgresReplication, against two real servers.
 
-Drives the real reconcilers - PostgresDB for both databases, then
-PostgresReplication - as the RDS-like managing role, with tables created as the
-owner group exactly as setRoleForOwners makes migrations create them. Proves
-what reaches the publication, what is held back and why, and that a converged
-pass changes nothing.
-
-No subscription exists yet, so nothing streams and no superuser emulation is
-needed: every statement here runs as pgadmin.
+What reaches the publication, what is held back and why, how the replication
+login is made and removed, and that a converged pass changes nothing. The
+subscription these feed is exercised in test_replication_subscription.py.
 """
 
 from __future__ import annotations
-
-from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from typing import Any
 
 import psycopg
 import pytest
 from psycopg import sql
 
-from pg_operator.config import Settings
-from pg_operator.constants import (
-    PLURAL_DATABASE,
-    PLURAL_INSTANCE,
-    PLURAL_REPLICATION,
-)
-from pg_operator.errors import ConfigurationError
-from pg_operator.naming import group_role_names
-from pg_operator.postgres.connection import Endpoint, PoolRegistry
-from pg_operator.postgres.server import describe_server
-from pg_operator.postgres.sql import execute, fetch_all, fetch_scalar
-from pg_operator.reconcile.context import ReconcileContext
-from pg_operator.reconcile.database import reconcile_database
-from pg_operator.reconcile.replication import (
-    build_status,
-    ownership_marker,
-    reconcile_replication,
-    teardown_replication,
-)
+from pg_operator.errors import ConfigurationError, ReplicationRefused
+from pg_operator.postgres.connection import Endpoint
+from pg_operator.postgres.sql import fetch_scalar
+from pg_operator.reconcile.replication import ownership_marker, teardown_replication
 
-from ..conftest import (
-    drop_database_hard,
-    drop_roles_hard,
-    requires_replication_harness,
-    superuser_execute,
-)
-from ..fakes import FakeK8sClient
+from ..conftest import requires_replication_harness, superuser_execute
+from .conftest import NS, OPERATOR_NS, World
 
 pytestmark = [requires_replication_harness, pytest.mark.replication, pytest.mark.asyncio]
-
-NS = "team-a"
-OPERATOR_NS = "pg-operator"
-
-
-@dataclass(slots=True)
-class World:
-    ctx: ReconcileContext
-    k8s: FakeK8sClient
-    pools: PoolRegistry
-    source: Endpoint
-    target: Endpoint
-    source_db: str
-    target_db: str
-    replication: dict[str, Any]
-    last_changes: list[str] = field(default_factory=list)
-
-    @property
-    def groups(self) -> dict[str, str]:
-        return group_role_names(self.source_db)
-
-    async def run(self) -> dict[str, Any]:
-        """One reconcile pass, with status written back as the handler does."""
-        result = await reconcile_replication(self.ctx, self.replication)
-        self.replication["status"] = build_status(result, self.replication.get("status"), 1)
-        self.last_changes = result.changes
-        return self.replication["status"]
-
-    async def on_source(self, *statements: str, as_owner: bool = False) -> None:
-        async with self.pools.connection(self.source, self.source_db) as conn:
-            await _run(conn, statements, self.groups["owner"] if as_owner else None)
-
-    async def on_target(self, *statements: str, as_owner: bool = False) -> None:
-        owner = group_role_names(self.target_db)["owner"] if as_owner else None
-        async with self.pools.connection(self.target, self.target_db) as conn:
-            await _run(conn, statements, owner)
-
-    async def publication(self) -> dict[str, tuple[list[str] | None, str | None]]:
-        """``schema.table -> (columns, row filter)`` as the server holds them."""
-        name = self.replication["status"]["source"]["publication"]
-        async with self.pools.connection(self.source, self.source_db) as conn:
-            rows = await fetch_all(
-                conn,
-                sql.SQL(
-                    """
-                    SELECT n.nspname || '.' || c.relname, pg_get_expr(pr.prqual, pr.prrelid),
-                           (SELECT array_agg(a.attname ORDER BY a.attnum) FROM pg_attribute a
-                             WHERE a.attrelid = pr.prrelid AND a.attnum = ANY(pr.prattrs::int2[]))
-                      FROM pg_publication p
-                      JOIN pg_publication_rel pr ON pr.prpubid = p.oid
-                      JOIN pg_class c ON c.oid = pr.prrelid
-                      JOIN pg_namespace n ON n.oid = c.relnamespace
-                     WHERE p.pubname = %s
-                    """
-                ),
-                (name,),
-            )
-        return {str(table): (columns, row_filter) for table, row_filter, columns in rows}
-
-    def excluded(self) -> dict[str, str]:
-        return {e["table"]: e["reason"] for e in self.replication["status"]["excludedTables"]}
-
-
-async def _run(conn: psycopg.AsyncConnection, statements: tuple[str, ...], role: str | None) -> None:
-    if role:
-        await execute(conn, sql.SQL("SET ROLE {}").format(sql.Identifier(role)))
-    try:
-        for statement in statements:
-            await execute(conn, sql.SQL(statement))  # type: ignore[arg-type]
-    finally:
-        if role:
-            await execute(conn, sql.SQL("RESET ROLE"))
-
-
-def _instance(name: str, endpoint: Endpoint) -> dict[str, Any]:
-    return {
-        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
-        "kind": "PostgresInstance",
-        "metadata": {"name": name, "generation": 1},
-        "spec": {
-            "host": endpoint.host,
-            "port": endpoint.port,
-            "maintenanceDatabase": endpoint.maintenance_database,
-            "sslMode": endpoint.ssl_mode,
-            "credentialsSecretRef": {"name": f"{name}-superuser", "namespace": OPERATOR_NS},
-        },
-    }
-
-
-def _database(name: str, instance: str, database: str) -> dict[str, Any]:
-    return {
-        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
-        "kind": "PostgresDB",
-        "metadata": {"name": name, "namespace": NS, "generation": 1, "uid": f"{name}-uid"},
-        "spec": {
-            "instanceRef": {"name": instance},
-            "databaseName": database,
-            "schemas": [{"name": "public"}, {"name": "audit"}],
-        },
-    }
-
-
-SOURCE_TABLES = (
-    "CREATE TABLE public.orders (id int PRIMARY KEY, region text, total numeric)",
-    "CREATE TABLE public.nokey (v text)",
-    "CREATE TABLE public.only_source (id int PRIMARY KEY)",
-    "CREATE TABLE audit.events (id int PRIMARY KEY, kind text)",
-)
-TARGET_TABLES = (
-    "CREATE TABLE public.orders (id int PRIMARY KEY, region text, total numeric)",
-    "CREATE TABLE public.nokey (v text)",
-    "CREATE TABLE audit.events (id int PRIMARY KEY, kind text)",
-)
-
-
-@pytest.fixture
-async def world(
-    pools: PoolRegistry, endpoint: Endpoint, target_endpoint: Endpoint, unique: str
-) -> AsyncIterator[World]:
-    for side in (endpoint, target_endpoint):
-        async with pools.connection(side) as conn:
-            server = await describe_server(conn)
-        if server.major_version < 16:
-            pytest.skip(f"replication needs PostgreSQL 16+, {side.instance} is {server.version}")
-    k8s = FakeK8sClient()
-    for name, side in (("src", endpoint), ("dst", target_endpoint)):
-        k8s.core.seed(
-            OPERATOR_NS, f"{name}-superuser", {"username": side.username, "password": side.password}
-        )
-        k8s.custom.add(_instance(name, side), PLURAL_INSTANCE)
-    source_db, target_db = f"rs_src_{unique}", f"rs_dst_{unique}"
-    databases = [_database("orders", "src", source_db), _database("orders-copy", "dst", target_db)]
-    for obj in databases:
-        k8s.custom.add(obj, PLURAL_DATABASE)
-
-    ctx = ReconcileContext(k8s, settings=Settings(operator_namespace=OPERATOR_NS))  # type: ignore[arg-type]
-    for obj in databases:
-        await reconcile_database(ctx, obj)
-    replication = {
-        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
-        "kind": "PostgresReplication",
-        "metadata": {"name": f"rs-{unique}", "namespace": NS, "generation": 1},
-        "spec": {
-            "source": {"dbRef": {"name": "orders"}},
-            "target": {"dbRef": {"name": "orders-copy"}},
-            "schemas": [{"name": "public"}, {"name": "audit"}],
-            "tables": [
-                {
-                    "schema": "public",
-                    "name": "orders",
-                    "columns": ["id", "region"],
-                    "rowFilter": {"all": [{"column": "id", "op": "Gt", "value": 0}]},
-                }
-            ],
-        },
-    }
-    k8s.custom.add(replication, PLURAL_REPLICATION)
-    world = World(ctx, k8s, pools, endpoint, target_endpoint, source_db, target_db, replication)
-    await world.on_source(*SOURCE_TABLES, as_owner=True)
-    await world.on_target(*TARGET_TABLES, as_owner=True)
-    try:
-        yield world
-    finally:
-        login = (replication.get("status") or {}).get("source", {}).get("login")
-        if replication.get("status"):
-            await teardown_replication(ctx, replication)
-        # The reconciler's own pools count as open connections and block the drops.
-        await ctx.close()
-        await drop_database_hard(pools, endpoint, source_db)
-        await drop_database_hard(pools, target_endpoint, target_db)
-        await drop_roles_hard(pools, endpoint, list(group_role_names(source_db).values()))
-        await drop_roles_hard(pools, target_endpoint, list(group_role_names(target_db).values()))
-        if login:
-            superuser_execute(f'DROP ROLE IF EXISTS "{login}"')
-
-
-# ---------------------------------------------------------------------------
 
 
 async def test_the_publication_carries_what_both_servers_can_take(world: World) -> None:
     status = await world.run()
 
-    assert status["phase"] == "Pending"
+    # Held-back tables are divergence the spec asks for but cannot have.
+    assert status["phase"] == "Drifted"
     assert status["publishedTables"] == ["audit.events", "public.orders"]
     assert world.excluded() == {
         "public.nokey": "NoReplicaIdentity",
@@ -259,9 +54,20 @@ async def test_a_held_back_table_keeps_the_sources_writes_working(world: World) 
 
 
 async def test_the_login_streams_through_rds_replication_and_reads_through_ro(world: World) -> None:
+    # Before the harness emulates rds_replication, the login holds membership
+    # only: the attribute is RDS's to confer, never the operator's.
+    with pytest.raises(ReplicationRefused):
+        await world.run(emulate=False)
+    login = world.status["source"]["login"]
+    async with world.pools.connection(world.source) as conn:
+        assert await fetch_scalar(
+            conn, sql.SQL("SELECT rolreplication FROM pg_roles WHERE rolname = %s"), (login,)
+        ) is False
+
     status = await world.run()
-    login = status["source"]["login"]
-    assert status["created"] == {"login": True, "secret": True, "publication": True}
+    assert status["created"] == {
+        "login": True, "secret": True, "publication": True, "slot": True, "subscription": True,
+    }
     assert set(status["grantedMemberships"]) == {"rds_replication", world.groups["readOnly"]}
 
     async with world.pools.connection(world.source) as conn:
@@ -271,10 +77,6 @@ async def test_the_login_streams_through_rds_replication_and_reads_through_ro(wo
             (login,),
         )
         assert marker == ownership_marker(NS, world.replication["metadata"]["name"])
-        # Membership only: the attribute is RDS's to confer, never the operator's.
-        assert await fetch_scalar(
-            conn, sql.SQL("SELECT rolreplication FROM pg_roles WHERE rolname = %s"), (login,)
-        ) is False
 
     credentials = status["credentialsSecret"]
     assert credentials["namespace"] == OPERATOR_NS and credentials["generated"] is True
@@ -429,13 +231,12 @@ async def test_objects_from_a_failed_pass_are_still_torn_down(world: World) -> N
     """A pass that fails after creating objects must not hide them from teardown.
 
     A failed pass publishes only its conditions, so each object is recorded the
-    moment it exists. Here the target database vanishes mid-pass: the publication,
-    login and Secret already exist on the source when the pass fails.
+    moment it exists. Here the source refuses the new login a walsender - the
+    harness has not yet emulated rds_replication - after the publication, login
+    and Secret already exist.
     """
-    await world.ctx.pools.close_database("dst", world.target_db)
-    await drop_database_hard(world.pools, world.target, world.target_db)
-    with pytest.raises(Exception):  # noqa: B017 - any failure will do; what it leaves is the point
-        await world.run()
+    with pytest.raises(ReplicationRefused):
+        await world.run(emulate=False)
 
     recorded = world.replication["status"]
     assert recorded["created"] == {"publication": True, "login": True, "secret": True}
