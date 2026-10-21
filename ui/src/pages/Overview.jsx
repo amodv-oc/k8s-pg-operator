@@ -1,5 +1,12 @@
 import { Anchor, Group, SimpleGrid, Stack, Text } from '@mantine/core'
-import { IconAlertTriangle, IconChecks, IconDatabase, IconServer2, IconUsers } from '@tabler/icons-react'
+import {
+  IconAlertTriangle,
+  IconArrowsRightLeft,
+  IconChecks,
+  IconDatabase,
+  IconServer2,
+  IconUsers,
+} from '@tabler/icons-react'
 import { Link } from 'react-router-dom'
 
 import { ErrorState } from '../components/ErrorState'
@@ -25,7 +32,10 @@ import { parseAttention } from '../lib/resources'
  */
 function headline(data) {
   if (!data) return 'Reading resource status…'
-  const total = (data.instances?.total ?? 0) + (data.databases?.total ?? 0) + (data.users?.total ?? 0)
+  const total = ['instances', 'databases', 'users', 'replications'].reduce(
+    (sum, kind) => sum + (data[kind]?.total ?? 0),
+    0,
+  )
   if (!total) return 'Nothing is registered yet.'
   if (data.healthy) {
     return total === 1
@@ -61,7 +71,7 @@ export function Overview() {
 
         {data && (
           <Stack gap="lg">
-            <SimpleGrid cols={{ base: 1, sm: 2, md: 3 }} spacing="md">
+            <SimpleGrid cols={{ base: 1, sm: 2, lg: 4 }} spacing="md">
               <PhaseSummaryCard
                 title="Instances"
                 icon={<IconServer2 size={17} />}
@@ -80,11 +90,17 @@ export function Overview() {
                 counts={data.users}
                 to="/users"
               />
+              <PhaseSummaryCard
+                title="Replications"
+                icon={<IconArrowsRightLeft size={17} />}
+                counts={data.replications}
+                to="/replications"
+              />
             </SimpleGrid>
 
             <Panel
               title="Needs attention"
-              description="Anything not Ready or Paused, plus databases retaining orphaned objects."
+              description="Anything not Ready or Paused - a Degraded replication included - plus databases retaining orphaned objects."
               bleed={!data.healthy}
             >
               {data.healthy ? (

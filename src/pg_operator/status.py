@@ -12,12 +12,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from .constants import COND_DRIFTED, COND_REACHABLE, COND_READY, COND_SYNCED
+from .constants import COND_DRIFTED, COND_REACHABLE, COND_READY, COND_STREAMING, COND_SYNCED
 
 ConditionStatus = Literal["True", "False", "Unknown"]
 
 #: Order conditions are rendered in, so kubectl output stays predictable.
-_CONDITION_ORDER = (COND_READY, COND_REACHABLE, COND_SYNCED, COND_DRIFTED)
+_CONDITION_ORDER = (COND_READY, COND_REACHABLE, COND_STREAMING, COND_SYNCED, COND_DRIFTED)
+
+#: Streaming=False reasons that mean replication is unhealthy - phase Degraded.
+#: Initializing and Disabled are also Streaming=False but healthy: a copy in
+#: progress, and a subscription switched off on purpose.
+DEGRADING_REASONS = frozenset({"Lagging", "Stalled", "SlotLost"})
 
 
 def now() -> str:
@@ -141,6 +146,14 @@ def phase_from_conditions(conditions: list[dict[str, Any]]) -> str:
     if ready_cond is None:
         return "Pending"
     if ready_cond.get("status") == "True":
+        streaming = by_type.get(COND_STREAMING)
+        if (
+            streaming is not None
+            and streaming.get("status") == "False"
+            and streaming.get("reason") in DEGRADING_REASONS
+        ):
+            # Ahead of Drifted: data not flowing outranks a table held back.
+            return "Degraded"
         drift = by_type.get(COND_DRIFTED)
         if drift is not None and drift.get("status") == "True":
             return "Drifted"

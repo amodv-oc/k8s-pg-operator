@@ -21,7 +21,7 @@ from ..config import get_settings
 from ..errors import OperatorError
 from ..logging_setup import configure_logging
 from .provider import ClientProvider
-from .routers import databases, health, instances, overview, users
+from .routers import databases, health, instances, overview, replications, users
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +82,7 @@ def create_app() -> FastAPI:
     app.include_router(instances.router, prefix="/api/v1")
     app.include_router(databases.router, prefix="/api/v1")
     app.include_router(users.router, prefix="/api/v1")
+    app.include_router(replications.router, prefix="/api/v1")
     app.include_router(overview.router, prefix="/api/v1")
 
     @app.exception_handler(OperatorError)

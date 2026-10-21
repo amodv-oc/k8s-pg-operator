@@ -1,4 +1,5 @@
-import { Anchor, Code, Grid, Stack, Table, Text } from '@mantine/core'
+import { Alert, Anchor, Code, Grid, List, Stack, Table, Text } from '@mantine/core'
+import { IconInfoCircle } from '@tabler/icons-react'
 import { Link, useParams } from 'react-router-dom'
 
 import { ConditionsTable } from '../components/ConditionsTable'
@@ -11,9 +12,67 @@ import { Panel } from '../components/Panel'
 import { PhaseBadge } from '../components/PhaseBadge'
 import { Pill } from '../components/Pill'
 import { RelativeTime } from '../components/RelativeTime'
+import { ReplicationsTable } from '../components/ReplicationsTable'
 import { TableSkeleton } from '../components/TableSkeleton'
 import { accessTone, retentionTone } from '../lib/phase'
 import { useInstance } from '../lib/queries'
+
+/**
+ * What a replication on this server would need, read from it on every pass.
+ * Informational: nothing here makes the instance itself unhealthy.
+ */
+function ReplicationReadiness({ readiness }) {
+  if (!readiness) {
+    return <Text c="dimmed" fz="sm">Not reported yet.</Text>
+  }
+  const unlimited = readiness.max_slot_wal_keep_size === '-1'
+  return (
+    <Stack gap="md">
+      <DetailGrid
+        labelWidth={190}
+        items={[
+          {
+            label: 'wal_level',
+            value: (
+              <Pill
+                tone={readiness.wal_level === 'logical' ? 'Ready' : 'Drifted'}
+                label={readiness.wal_level}
+                ff="monospace"
+              />
+            ),
+          },
+          { label: 'Can create subscriptions', value: readiness.create_subscription },
+          { label: 'Can grant streaming', value: readiness.replication_grant },
+          {
+            label: 'Replication slots',
+            value:
+              readiness.max_replication_slots != null &&
+              `${readiness.replication_slots_in_use} of ${readiness.max_replication_slots} in use`,
+          },
+          { label: 'max_wal_senders', value: readiness.max_wal_senders },
+          {
+            label: 'max_slot_wal_keep_size',
+            value: (
+              <Text fz="sm">
+                <Code fz="xs">{readiness.max_slot_wal_keep_size}</Code>
+                {unlimited && ' — unlimited: a stalled subscriber can fill the disk'}
+              </Text>
+            ),
+          },
+        ]}
+      />
+      {readiness.issues.length > 0 && (
+        <Alert color="amber" icon={<IconInfoCircle size={18} />} title="Before this server can replicate">
+          <List fz="xs" spacing={4}>
+            {readiness.issues.map((issue) => (
+              <List.Item key={issue}>{issue}</List.Item>
+            ))}
+          </List>
+        </Alert>
+      )}
+    </Stack>
+  )
+}
 
 export function InstanceDetail() {
   const { name } = useParams()
@@ -119,6 +178,15 @@ export function InstanceDetail() {
         </Grid.Col>
 
         <Grid.Col span={12}>
+          <Panel
+            title="Logical replication"
+            description="What a PostgresReplication on this server would need. On RDS these live in the parameter group, not here."
+          >
+            <ReplicationReadiness readiness={instance.logical_replication} />
+          </Panel>
+        </Grid.Col>
+
+        <Grid.Col span={12}>
           <Panel title="Conditions">
             <ConditionsTable conditions={instance.conditions} />
           </Panel>
@@ -185,6 +253,20 @@ export function InstanceDetail() {
               </Table>
             ) : (
               <NoRows title="No users on this instance" />
+            )}
+          </Panel>
+        </Grid.Col>
+
+        <Grid.Col span={12}>
+          <Panel
+            title={`Replications (${instance.replication_list.length})`}
+            description="From or into a database on this instance."
+            bleed={instance.replication_list.length > 0}
+          >
+            {instance.replication_list.length ? (
+              <ReplicationsTable rows={instance.replication_list} />
+            ) : (
+              <NoRows title="No replications use this instance" />
             )}
           </Panel>
         </Grid.Col>

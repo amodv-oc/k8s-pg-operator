@@ -13,6 +13,7 @@ import { Panel } from '../components/Panel'
 import { PhaseBadge } from '../components/PhaseBadge'
 import { Pill } from '../components/Pill'
 import { RelativeTime } from '../components/RelativeTime'
+import { ReplicationsTable } from '../components/ReplicationsTable'
 import { SchemaTable } from '../components/SchemaTable'
 import { TableSkeleton } from '../components/TableSkeleton'
 import { accessTone, retentionTone } from '../lib/phase'
@@ -234,6 +235,20 @@ export function DatabaseDetail() {
                 title="No users have access"
                 description="Create a PostgresUser with an access entry naming this PostgresDB."
               />
+            )}
+          </Panel>
+        </Grid.Col>
+
+        <Grid.Col span={12}>
+          <Panel
+            title={`Replications (${db.replications.length})`}
+            description="From or into this database. With retentionPolicy DROP, deleting it waits until these are gone."
+            bleed={db.replications.length > 0}
+          >
+            {db.replications.length ? (
+              <ReplicationsTable rows={db.replications} />
+            ) : (
+              <NoRows title="No replications use this database" />
             )}
           </Panel>
         </Grid.Col>

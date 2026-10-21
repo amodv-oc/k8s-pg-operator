@@ -23,7 +23,7 @@ async def list_instances(
 
 @router.get("/{name}", summary="Get one instance", response_model=InstanceDetail)
 async def get_instance(name: str, store: StoreDep) -> InstanceDetail:
-    """An instance plus every database and user that references it."""
+    """An instance plus every database, user and replication that references it."""
     instance = await store.instance(name)
     if instance is None:
         raise HTTPException(
@@ -32,8 +32,12 @@ async def get_instance(name: str, store: StoreDep) -> InstanceDetail:
         )
     databases = [db for db in await store.databases() if db.instance == name]
     users = [user for user in await store.users() if user.instance == name]
+    replications = [
+        r for r in await store.replications() if name in (r.source.instance, r.target.instance)
+    ]
     return InstanceDetail(
         **instance.model_dump(),
         database_list=sorted(databases, key=lambda d: (d.namespace, d.name)),
         user_list=sorted(users, key=lambda u: (u.namespace, u.name)),
+        replication_list=sorted(replications, key=lambda r: (r.namespace, r.name)),
     )

@@ -1,11 +1,10 @@
 """PostgresReplication reconciliation.
 
 The design (``docs/design/replication.md``, "Reconciliation") converges a
-replication in eight steps. This module implements the first six - resolve
-both ends, check both servers' prerequisites, the replication login, the table
-set, the publication and the subscription - and the teardown of everything
-they create, on both servers. Health (lag, retained WAL, apply errors) is the
-seventh step, and arrives in a later version.
+replication in eight steps, all of them here: resolve both ends, check both
+servers' prerequisites, the replication login, the table set, the publication,
+the subscription, health, and status - and the teardown of everything they
+create, on both servers.
 """
 
 from __future__ import annotations
@@ -21,13 +20,14 @@ from typing import Any
 from psycopg import AsyncConnection, sql
 
 from .. import status as st
-from ..constants import KIND_REPLICATION, PLURAL_REPLICATION
+from ..constants import COND_STREAMING, KIND_REPLICATION, PLURAL_REPLICATION
 from ..errors import (
     ConfigurationError,
     ConnectionFailure,
     InstanceNotFound,
     InsufficientCapacity,
     InsufficientPrivilege,
+    OperatorError,
     ReconcileFailure,
     ReferenceNotFound,
     ReplicationRefused,
@@ -36,6 +36,7 @@ from ..errors import (
 from ..k8s.resources import get_database, list_replications, patch_status
 from ..k8s.secrets import apply_secret, delete_secret, generate_password, managed_labels, read_secret
 from ..models import (
+    AlertingSpec,
     CredentialsSecretRef,
     DatabaseSpec,
     InstanceSpec,
@@ -65,6 +66,7 @@ from .eligibility import (
     judge,
     target_relations,
 )
+from .health import Assessment, Observation, assess
 
 log = logging.getLogger(__name__)
 
@@ -142,6 +144,7 @@ class ReplicationResult:
     connection_fingerprint: str = ""
     #: ``schema.table -> srsubstate`` for every table the subscription carries.
     subscribed: dict[str, str] = field(default_factory=dict)
+    assessment: Assessment | None = None
 
     @property
     def ready_tables(self) -> int:
@@ -336,7 +339,75 @@ async def reconcile_replication(
             ctx, obj, src, dst, spec, result, subscription, published,
             source_instance=source_instance, existing=existing, marker=marker,
         )
+
+        # 7. Health.
+        observation = Observation(
+            slot=await sub.slot_health(src, result.names.subscription),
+            subscription=(
+                await sub.subscription_health(dst, result.subscription_oid)
+                if result.subscription_oid is not None
+                else None
+            ),
+            tables=result.subscribed,
+        )
+        result.assessment = assess(
+            observation,
+            previous=existing.get("health") or {},
+            previous_state=existing.get("replicationState"),
+            enabled=spec.enabled,
+            alerting=spec.alerting,
+            # A published table with a target-side problem is the likeliest
+            # reason apply has stopped.
+            suspects=[f"{entry['table']} ({entry['reason']})" for entry in result.kept],
+        )
     return result
+
+
+async def observe_from_status(ctx: ReconcileContext, obj: dict[str, Any]) -> Assessment | None:
+    """Health from what status records, for a pass that failed before step 7.
+
+    A replication whose PostgresDB was deleted under RETAIN no longer resolves,
+    but its slot is still on the source pinning WAL - so it is still watched.
+    None when there is no slot to watch, or the source cannot be read: saying
+    nothing beats reporting a slot lost because it could not be seen.
+    """
+    status = obj.get("status") or {}
+    source = status.get("source") or {}
+    target = status.get("target") or {}
+    if not (status.get("created") or {}).get("slot") or not source.get("instance") or not source.get("slot"):
+        return None
+    spec = obj.get("spec") or {}
+    try:
+        alerting = parse_replication_spec(spec).alerting
+    except ValueError:
+        alerting = AlertingSpec()
+
+    try:
+        instance = await ctx.resolve_instance(str(source["instance"]))
+        async with ctx.connect(instance) as conn:
+            slot = await sub.slot_health(conn, str(source["slot"]))
+    except OperatorError as exc:
+        log.debug("cannot observe the source: %s", exc)
+        return None
+
+    subscription, tables = None, {}
+    oid = target.get("subscriptionOid")
+    if oid and target.get("instance") and target.get("database"):
+        try:
+            instance = await ctx.resolve_instance(str(target["instance"]))
+            async with ctx.connect(instance, str(target["database"])) as conn:
+                subscription = await sub.subscription_health(conn, int(oid))
+                tables = await sub.subscribed_tables(conn, int(oid))
+        except OperatorError as exc:
+            log.debug("cannot observe the target: %s", exc)
+    return assess(
+        Observation(slot, subscription, tables),
+        previous=status.get("health") or {},
+        previous_state=status.get("replicationState"),
+        enabled=bool(spec.get("enabled", True)),
+        alerting=alerting,
+        suspects=[],
+    )
 
 
 def _parse_spec(obj: dict[str, Any]) -> ReplicationSpec:
@@ -1070,12 +1141,15 @@ async def _ensure_slot(
         result.changes.append(f"adopted idle slot {name}")
     else:
         try:
+            async def known_password() -> str | None:
+                return result.password
+
             await _with_slot_privilege(
                 ctx,
                 instance,
                 result.source.database,
                 result.login,
-                result.password,
+                known_password,
                 lambda conn: sub.create_slot(conn, name),
             )
         except ReconcileFailure as exc:
@@ -1097,7 +1171,7 @@ async def _with_slot_privilege(
     instance: ResolvedInstance,
     database: str,
     login: str | None,
-    password: str | None,
+    credential: Callable[[], Awaitable[str | None]],
     operation: Callable[[AsyncConnection], Awaitable[None]],
 ) -> None:
     """Run a slot operation as the managing role or, failing that, as the replication login.
@@ -1106,14 +1180,21 @@ async def _with_slot_privilege(
     through rds_replication; a stock non-superuser managing role does not, but
     the replication login - which exists to use exactly these slots - does.
     Connected to ``database``, because a logical slot belongs to one database.
+    ``credential`` is asked for the login's password only if it is needed.
     """
     async with ctx.connect(instance, database) as conn:
         try:
             await operation(conn)
             return
         except InsufficientPrivilege:
-            if not (login and password):
+            if not login:
                 raise
+    password = await credential()
+    if not password:
+        raise ReplicationRefused(
+            f"the managing role may not use replication slots on {instance.name}, and no "
+            f"password for {login} is available to do it as the replication login"
+        )
     as_login = replace(
         instance.endpoint,
         instance=f"{instance.name}#{login}",
@@ -1262,13 +1343,24 @@ async def _remove_slots(
                 "that could not be ended; retrying"
             )
     names = [s.name for s in found]
-    password = await _login_password(ctx, obj)
+
+    async def credential() -> str | None:
+        if not ((obj.get("status") or {}).get("created") or {}).get("login"):
+            return await _login_password(ctx, obj)
+        # The operator's own login, about to be dropped: give it a fresh password
+        # rather than trust the Secret's, which may no longer match - a password
+        # changed out of band would otherwise leave the slot undroppable.
+        password = generate_password()
+        async with ctx.connect(instance) as conn:
+            await pgroles.set_password(conn, login, password)
+        return password
+
     await _with_slot_privilege(
         ctx,
         instance,
         str(source.get("database") or instance.spec.maintenance_database),
         login or None,
-        password,
+        credential,
         lambda conn: sub.drop_slots(conn, names),
     )
     return [f"slot {name}" for name in names]
@@ -1355,6 +1447,17 @@ def build_status(
         conditions.append(st.no_drift(generation))
         conditions.append(st.synced(result.message, generation))
     conditions.append(st.ready(result.message, generation))
+    assessment = result.assessment
+    if assessment is not None:
+        conditions.append(
+            st.condition(
+                COND_STREAMING,
+                "True" if assessment.streaming else "False",
+                assessment.state,
+                assessment.message,
+                observed_generation=generation,
+            )
+        )
     merged = st.merge_conditions((existing or {}).get("conditions"), conditions)
 
     excluded = len({entry["table"] for entry in result.excluded})
@@ -1363,6 +1466,8 @@ def build_status(
         "observedGeneration": generation,
         "conditions": merged,
         "phase": st.phase_from_conditions(merged),
+        "replicationState": assessment.state if assessment else None,
+        "health": assessment.health if assessment else None,
         "source": {
             **result.source.as_status(),
             "publication": result.names.publication,
@@ -1379,6 +1484,9 @@ def build_status(
         "created": result.created,
         "grantedMemberships": sorted(set(result.granted)),
         "publishedTables": result.published,
+        "subscribedTables": [
+            {"table": table, "state": state} for table, state in sorted(result.subscribed.items())
+        ],
         "excludedTables": result.excluded,
         "tableWarnings": result.kept + result.warnings,
         "rowFilters": result.row_filters,

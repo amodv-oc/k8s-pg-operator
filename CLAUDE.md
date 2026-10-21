@@ -6,13 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Kubernetes operator that manages databases, roles and grants on **external**
 PostgreSQL servers (typically Amazon RDS) — it does not run PostgreSQL itself.
-Three CRDs: `PostgresInstance` (cluster-scoped: a server + superuser
+Four CRDs: `PostgresInstance` (cluster-scoped: a server + superuser
 credentials), `PostgresDB` (namespaced: a database, its schemas/extensions/group
-roles), `PostgresUser` (namespaced: a login role and its access). A fourth,
-`PostgresReplication` (logical replication between instances), is being built
-in increments per `docs/design/replication.md` — its delivery-plan table says
-how far it has got. The reconciler, a read-only FastAPI state API, and a React
-dashboard run as three containers in one pod. Full architecture, the access model, and every CRD
+roles), `PostgresUser` (namespaced: a login role and its access), and
+`PostgresReplication` (namespaced: one-way logical replication between two
+PostgresDBs on different instances — designed in `docs/design/replication.md`).
+The reconciler, a read-only FastAPI state API, and a React dashboard run as
+three containers in one pod. Full architecture, the access model, and every CRD
 field are documented in `README.md` — read it before making non-trivial
 changes; this file only covers what you need to build, test, and navigate.
 
@@ -75,7 +75,7 @@ RDS-like non-superuser managing role.
 
 ```bash
 make local-up       # build both images, start the servers, install the operator
-make local-status   # phases for all three kinds
+make local-status   # phases for all four kinds
 make local-verify   # connect as each generated user, assert privileges
 make local-test     # full pytest suite against each server version
 make local-ui       # port-forward the dashboard to localhost:8081
@@ -140,9 +140,15 @@ postgres/
   database.py      databases, schemas, extensions, parameters
   privileges.py    the OWNER/RW/RO grant matrix
   settings.py      pg_db_role_setting parsing
+  replication.py   logical-replication readiness of a server
+  publication.py   source/target catalog facts; publication DDL
+  subscription.py  subscriptions, slots (created from the source, never by
+                   CREATE SUBSCRIPTION — see the design doc), their health
+  filters.py       row-filter DSL → SQL
 k8s/               client, cross-namespace Secrets, PushSecret, CR access
-reconcile/         instance/database/user convergence + teardown (context.py holds
-                   the shared ReconcileContext: instance resolution, connections, events)
+reconcile/         convergence + teardown per kind (context.py holds the shared
+                   ReconcileContext: instance resolution, connections, events);
+                   eligibility.py and health.py are pure, for replication
 handlers/          kopf registration; every handler funnels through
                    handlers/common.py's run_reconcile for uniform retry
                    mapping, status writes and metrics

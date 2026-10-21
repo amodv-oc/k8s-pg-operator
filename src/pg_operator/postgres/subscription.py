@@ -294,3 +294,89 @@ async def drop_slots(conn: AsyncConnection, names: Sequence[str]) -> None:
 
 async def terminate(conn: AsyncConnection, pid: int) -> bool:
     return bool(await fetch_scalar(conn, sql.SQL("SELECT pg_terminate_backend(%s)"), (pid,)))
+
+
+# ---------------------------------------------------------------------------
+# health
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SlotHealth:
+    """The slot, read on the source: how far its consumer is behind, and what it pins."""
+
+    active: bool
+    #: reserved / extended / unreserved / lost (max_slot_wal_keep_size invalidated it).
+    wal_status: str | None
+    safe_wal_size: int | None
+    #: WAL the subscriber has not yet confirmed.
+    lag_bytes: int | None
+    #: WAL the slot keeps on the source's disk.
+    retained_bytes: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class SubscriptionHealth:
+    """The subscription, read on the target."""
+
+    worker_running: bool
+    last_message_at: str | None
+    apply_error_count: int
+    sync_error_count: int
+    #: PostgreSQL 18's per-kind conflict counters; empty before 18.
+    conflicts: dict[str, int]
+
+
+_SLOT_HEALTH = sql.SQL(
+    """
+    SELECT active, wal_status, safe_wal_size,
+           pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)::bigint,
+           pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint
+      FROM pg_replication_slots
+     WHERE slot_name = %s
+    """
+)
+
+#: The leader apply worker's row: there is one per subscription, with a null
+#: pid while the worker is not running. Table-sync and parallel-apply workers
+#: have rows of their own, told apart by relid and leader_pid.
+_APPLY_WORKER = sql.SQL(
+    """
+    SELECT pid IS NOT NULL,
+           to_char(last_msg_receipt_time AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+      FROM pg_stat_subscription
+     WHERE subid = %s AND relid IS NULL AND leader_pid IS NULL
+    """
+)
+
+#: As JSON, so PostgreSQL 18's conflict counters come through without naming them.
+_SUBSCRIPTION_STATS = sql.SQL("SELECT to_jsonb(s) FROM pg_stat_subscription_stats s WHERE subid = %s")
+
+
+async def slot_health(conn: AsyncConnection, name: str) -> SlotHealth | None:
+    row = await fetch_one(conn, _SLOT_HEALTH, (name,))
+    if row is None:
+        return None
+    return SlotHealth(
+        active=bool(row[0]),
+        wal_status=row[1],
+        safe_wal_size=row[2],
+        lag_bytes=row[3],
+        retained_bytes=row[4],
+    )
+
+
+async def subscription_health(conn: AsyncConnection, oid: int) -> SubscriptionHealth:
+    worker = await fetch_one(conn, _APPLY_WORKER, (oid,))
+    stats = await fetch_scalar(conn, _SUBSCRIPTION_STATS, (oid,)) or {}
+    return SubscriptionHealth(
+        worker_running=bool(worker and worker[0]),
+        last_message_at=worker[1] if worker else None,
+        apply_error_count=int(stats.get("apply_error_count") or 0),
+        sync_error_count=int(stats.get("sync_error_count") or 0),
+        conflicts={
+            key.removeprefix("confl_"): int(value or 0)
+            for key, value in stats.items()
+            if key.startswith("confl_")
+        },
+    )

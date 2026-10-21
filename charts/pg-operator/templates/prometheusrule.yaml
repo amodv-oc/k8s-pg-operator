@@ -1,0 +1,60 @@
+{{- if and .Values.metrics.enabled .Values.metrics.prometheusRule.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pg-operator.fullname" . }}-replication
+  namespace: {{ .Values.metrics.prometheusRule.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "pg-operator.labels" . | nindent 4 }}
+    {{- with .Values.metrics.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: pg-operator.replication
+      rules:
+        - alert: PostgresReplicationSlotLost
+          expr: pg_operator_replication_state{state="SlotLost"} == 1
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgresReplication {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} lost its slot"
+            description: >-
+              The slot is gone or was invalidated by max_slot_wal_keep_size. The
+              replica can only be rebuilt: delete and recreate the PostgresReplication.
+        - alert: PostgresReplicationStalled
+          expr: pg_operator_replication_state{state="Stalled"} == 1
+          for: {{ .Values.metrics.prometheusRule.for }}
+          labels:
+            severity: critical
+          annotations:
+            summary: "PostgresReplication {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} has stalled"
+            description: >-
+              Changes are not being applied, while the slot keeps retaining WAL on
+              the source. Its status names the cause; the error itself is in the
+              target server's log.
+        - alert: PostgresReplicationLagging
+          expr: pg_operator_replication_state{state="Lagging"} == 1
+          for: {{ .Values.metrics.prometheusRule.for }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "PostgresReplication {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} is over its lag thresholds"
+            description: Lag or retained WAL exceeds its spec.alerting thresholds.
+        - alert: PostgresReplicationErrorsRising
+          expr: delta(pg_operator_replication_errors[15m]) > 0
+          labels:
+            severity: warning
+          annotations:
+            summary: "PostgresReplication {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} is hitting {{ "{{" }} $labels.kind {{ "}}" }} errors"
+            description: The error text is in the target server's log (CloudWatch on RDS).
+        - alert: PostgresReplicationUnobserved
+          expr: time() - pg_operator_replication_observed_timestamp_seconds > {{ mul 3 .Values.reconcile.replicationInterval }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Nothing has observed PostgresReplication {{ "{{" }} $labels.namespace {{ "}}" }}/{{ "{{" }} $labels.name {{ "}}" }} lately"
+            description: >-
+              Its health has not been read for three intervals; the operator, or
+              its access to the servers, is down - and the slot is unwatched.
+{{- end }}

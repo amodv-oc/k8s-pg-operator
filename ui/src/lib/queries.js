@@ -96,3 +96,25 @@ export function useUser(namespace, name) {
     staleTime: STALE_MS,
   })
 }
+
+export function useReplications(params) {
+  const refetchInterval = useRefetchInterval()
+  return useQuery({
+    queryKey: ['replications', params ?? {}],
+    queryFn: () => apiGet('/api/v1/replications', params),
+    refetchInterval,
+    ...LIST_OPTIONS,
+  })
+}
+
+export function useReplication(namespace, name) {
+  const refetchInterval = useRefetchInterval()
+  return useQuery({
+    queryKey: ['replication', namespace, name],
+    queryFn: () =>
+      apiGet(`/api/v1/replications/${encodeURIComponent(namespace)}/${encodeURIComponent(name)}`),
+    enabled: Boolean(namespace && name),
+    refetchInterval,
+    staleTime: STALE_MS,
+  })
+}
