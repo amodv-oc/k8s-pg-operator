@@ -365,8 +365,13 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # semver only matches a full x.y.z tag and silently skips anything
+          # else (v0.1 published nothing but sha-<sha>), so match carries
+          # every v* tag through as its name minus the v. For a full semver
+          # tag it yields the same value as {{version}}, which dedupes.
           tags: |
             type=ref,event=branch
+            type=match,pattern=^v(.+)$,group=1
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long
@@ -382,6 +387,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.UI_IMAGE_NAME }}
           tags: |
             type=ref,event=branch
+            type=match,pattern=^v(.+)$,group=1
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=long

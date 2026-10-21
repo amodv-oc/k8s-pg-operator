@@ -1089,11 +1089,13 @@ should not be able to publish.
 | --- | --- |
 | push to `main` | `main`, `sha-<full sha>`, `latest` |
 | tag `v1.2.3` | `1.2.3`, `1.2`, `sha-<full sha>` |
+| tag `v0.1` (not full semver) | `0.1`, `sha-<full sha>` |
 | pull request | none — built and tested only |
 
 A `v*` tag drops its `v`, so tagging `v0.1.0` publishes `:0.1.0` — which is
 exactly what the chart resolves to when `image.tag` is empty and `appVersion`
-is `0.1.0`. Keep `Chart.yaml`'s `version` and `appVersion` in step with the git
+is `0.1.0`. Any `v*` tag publishes its version this way; only a full `x.y.z`
+tag also gets the moving `x.y` alias. Keep `Chart.yaml`'s `version` and `appVersion` in step with the git
 tag and the chart's defaults stay correct with no override.
 
 Both images are published for `linux/amd64` and `linux/arm64`, so the same tag
