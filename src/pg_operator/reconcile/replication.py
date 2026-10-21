@@ -1,26 +1,38 @@
 """PostgresReplication reconciliation.
 
 The design (``docs/design/replication.md``, "Reconciliation") converges a
-replication in eight steps. This module implements the first five - resolve
-both ends, check the servers' prerequisites, the replication login, the table
-set, and the publication - and the teardown of everything they create. The
-subscription arrives in a later version, so status reads ``Pending``: the
-source side is converged, but nothing replicates yet.
+replication in eight steps. This module implements the first six - resolve
+both ends, check both servers' prerequisites, the replication login, the table
+set, the publication and the subscription - and the teardown of everything
+they create, on both servers. Health (lag, retained WAL, apply errors) is the
+seventh step, and arrives in a later version.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from psycopg import AsyncConnection, sql
 
 from .. import status as st
 from ..constants import KIND_REPLICATION, PLURAL_REPLICATION
-from ..errors import ConfigurationError, ReconcileFailure, ReferenceNotFound
+from ..errors import (
+    ConfigurationError,
+    ConnectionFailure,
+    InstanceNotFound,
+    InsufficientCapacity,
+    InsufficientPrivilege,
+    ReconcileFailure,
+    ReferenceNotFound,
+    ReplicationRefused,
+    SourceUnreachableFromTarget,
+)
 from ..k8s.resources import get_database, list_replications, patch_status
 from ..k8s.secrets import apply_secret, delete_secret, generate_password, managed_labels, read_secret
 from ..models import (
@@ -36,6 +48,7 @@ from ..naming import ReplicationNames, replication_names
 from ..postgres import database as pgdb
 from ..postgres import publication as pub
 from ..postgres import roles as pgroles
+from ..postgres import subscription as sub
 from ..postgres.filters import fingerprint, render_row_filter
 from ..postgres.replication import (
     MIN_REPLICATION_VERSION,
@@ -122,18 +135,31 @@ class ReplicationResult:
     warnings: list[dict[str, str]] = field(default_factory=list)
     row_filters: list[dict[str, str]] = field(default_factory=list)
     changes: list[str] = field(default_factory=list)
+    #: The login's password, for the subscription's connection string. Never in status.
+    password: str = field(default="", repr=False)
+    subscription_oid: int | None = None
+    subscription_enabled: bool = True
+    connection_fingerprint: str = ""
+    #: ``schema.table -> srsubstate`` for every table the subscription carries.
+    subscribed: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def ready_tables(self) -> int:
+        return sum(1 for state in self.subscribed.values() if state == "r")
 
     @property
     def message(self) -> str:
         summary = (
-            f"{self.source.display} -> {self.target.display}: publication "
-            f"{self.names.publication} carries {len(self.published)} table(s)"
+            f"{self.source.display} -> {self.target.display}: {self.ready_tables} of "
+            f"{len(self.subscribed)} subscribed table(s) ready"
         )
+        if not self.subscription_enabled:
+            summary += "; the subscription is disabled"
         if self.excluded:
-            summary += f", {len(self.excluded)} held back"
+            summary += f"; {len({e['table'] for e in self.excluded})} held back"
         if self.changes:
             return f"{summary}; " + "; ".join(self.changes[:6])
-        return f"{summary}; this operator version does not create the subscription yet"
+        return summary
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,7 +203,7 @@ async def resolve_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> Res
 async def reconcile_replication(
     ctx: ReconcileContext, obj: dict[str, Any]
 ) -> ReplicationResult:
-    """Converge the source side of a PostgresReplication."""
+    """Converge a PostgresReplication: the source's login and publication, the target's subscription."""
     meta = obj.get("metadata") or {}
     namespace = str(meta.get("namespace"))
     name = str(meta.get("name"))
@@ -196,7 +222,8 @@ async def reconcile_replication(
         granted=list(existing.get("grantedMemberships") or []),
     )
 
-    # 2. Prerequisites: both servers new enough, the source logging logically.
+    # 2. Prerequisites: both servers new enough, the source logging logically,
+    # the target able to own a subscription.
     source_instance = await ctx.resolve_instance(source.instance, for_namespace=namespace)
     target_instance = await ctx.resolve_instance(target.instance, for_namespace=namespace)
     for side, instance in (("source", source_instance), ("target", target_instance)):
@@ -210,15 +237,27 @@ async def reconcile_replication(
 
     groups = source_db.resolve_role_names(source.database, source_instance.spec.role_prefix)
     marker = ownership_marker(namespace, name)
-    async with ctx.connect(source_instance, source.database) as src:
+    async with (
+        ctx.connect(source_instance, source.database) as src,
+        ctx.connect(target_instance, target.database) as dst,
+    ):
         info = await describe_logical_replication(src, source_instance.server)
         if not info.wal_is_logical:
             (remedy,) = (issue for issue in info.issues() if issue.startswith("wal_level"))
             raise ConfigurationError(f"source {source.display}: {remedy}")
+        target_info = await describe_logical_replication(dst, target_instance.server)
+        if target_info.create_subscription == "Unavailable":
+            raise ConfigurationError(
+                f"the managing role on {target.instance} cannot create subscriptions; it needs "
+                "membership of pg_create_subscription (or, on RDS, rds_superuser)"
+            )
 
         # Nothing is created until every name is known to be free: a pass that
         # can never succeed must not leave objects behind it.
-        await _refuse_foreign_objects(src, spec, result, marker=marker)
+        subscription = await sub.get_subscription(dst, result.names.subscription)
+        await _refuse_foreign_objects(src, spec, result, subscription, marker=marker)
+        if subscription is None:
+            _require_free_slot(info, source)
 
         # 3. The publication (empty for now) and the replication login. Each is
         # recorded in status the moment it exists, so a pass that fails later
@@ -247,8 +286,28 @@ async def reconcile_replication(
             if (table := catalog.get(candidate.qualified)) is not None
             for relation in target_relations(table, via_root=spec.publish_via_partition_root)
         }
-        async with ctx.connect(target_instance, target.database) as dst:
-            targets = await pub.describe_target_tables(dst, wanted)
+        targets = await pub.describe_target_tables(dst, wanted)
+        subscribed = (
+            frozenset(await sub.subscribed_tables(dst, subscription.oid))
+            if subscription is not None
+            else frozenset()
+        )
+        # Only a table about to get an initial copy needs an empty target; the
+        # rest are not even looked at.
+        nonempty = (
+            frozenset(
+                await pub.nonempty_tables(
+                    dst,
+                    (
+                        (relation.schema, relation.name)
+                        for relation in targets.values()
+                        if relation.owner_settable and relation.qualified not in subscribed
+                    ),
+                )
+            )
+            if spec.copy_data
+            else frozenset()
+        )
         claims = await _claims_elsewhere(ctx, obj, target)
         verdicts = [
             judge(
@@ -261,12 +320,22 @@ async def reconcile_replication(
                 read_group=groups["readOnly"],
                 login=result.login,
                 claimed_by=claims.get(candidate.qualified),
+                copy_data=spec.copy_data,
+                subscribed=subscribed,
+                target_nonempty=nonempty,
             )
             for candidate in selected
         ]
 
         # 5. The publication's tables.
         await _converge_tables(src, verdicts, existing, result)
+
+        # 6. The subscription.
+        published = await pub.published_relations(src, result.names.publication)
+        await _converge_subscription(
+            ctx, obj, src, dst, spec, result, subscription, published,
+            source_instance=source_instance, existing=existing, marker=marker,
+        )
     return result
 
 
@@ -485,6 +554,7 @@ async def _adopt_provided_login(
             "rds_replication, so the target server could not stream as it"
         )
     result.login = login
+    result.password = data[ref.password_key].decode()
     result.credentials = {"namespace": secret_namespace, "name": ref.name, "generated": False}
 
 
@@ -529,6 +599,7 @@ async def _ensure_generated_login(
         result.changes.append("credentials Secret was missing; generated and applied a new password")
     result.created["login"] = True
     result.login = login
+    result.password = password
 
     if info.replication_grant == "rds_replication":
         await _grant(conn, "rds_replication", login, result, privilege="MEMBER")
@@ -638,7 +709,12 @@ async def _claims_elsewhere(
 
 
 async def _refuse_foreign_objects(
-    conn: AsyncConnection, spec: ReplicationSpec, result: ReplicationResult, *, marker: str
+    conn: AsyncConnection,
+    spec: ReplicationSpec,
+    result: ReplicationResult,
+    subscription: sub.SubscriptionState | None,
+    *,
+    marker: str,
 ) -> None:
     """Refuse to proceed if a name this replication needs belongs to someone else.
 
@@ -646,6 +722,16 @@ async def _refuse_foreign_objects(
     replication's marker - or recorded in status as created - is its own; any
     other object of that name is never taken over.
     """
+    if (
+        subscription is not None
+        and subscription.comment != marker
+        and not result.created.get("subscription")
+    ):
+        raise ConfigurationError(
+            f"a subscription named {subscription.name} already exists in "
+            f"{result.target.display} and was not created for this replication (its comment "
+            f"is {subscription.comment!r}); the operator will not take it over"
+        )
     name = result.names.publication
     state = await pub.get_publication(conn, name)
     if state is not None and state.comment != marker and not result.created.get("publication"):
@@ -708,6 +794,11 @@ async def _record_created(ctx: ReconcileContext, obj: dict[str, Any], result: Re
                 "publication": result.names.publication,
                 "slot": result.names.subscription,
                 "login": result.login,
+            },
+            "target": {
+                **result.target.as_status(),
+                "subscription": result.names.subscription,
+                "subscriptionOid": result.subscription_oid,
             },
             "credentialsSecret": result.credentials,
             "created": result.created,
@@ -812,37 +903,393 @@ def _member_matches(
 
 
 # ---------------------------------------------------------------------------
+# the subscription
+# ---------------------------------------------------------------------------
+
+
+def _require_free_slot(info: LogicalReplicationInfo, source: ReplicationEnd) -> None:
+    """A new subscription needs a slot on the source: say so before trying.
+
+    Its initial copy briefly wants more - a table-sync slot per sync worker -
+    but PostgreSQL retries those itself, so only the subscription's own slot
+    is a precondition.
+    """
+    if info.max_replication_slots - info.replication_slots_in_use < 1:
+        raise InsufficientCapacity(
+            f"all {info.max_replication_slots} replication slots on {source.instance} are in "
+            "use, so the subscription's slot cannot be created; free one, or raise "
+            "max_replication_slots in the parameter group (a static parameter)"
+        )
+
+
+async def _converge_subscription(
+    ctx: ReconcileContext,
+    obj: dict[str, Any],
+    src: AsyncConnection,
+    dst: AsyncConnection,
+    spec: ReplicationSpec,
+    result: ReplicationResult,
+    subscription: sub.SubscriptionState | None,
+    published: set[str],
+    *,
+    source_instance: ResolvedInstance,
+    existing: dict[str, Any],
+    marker: str,
+) -> None:
+    """Create the subscription, or converge its connection, state, options and tables."""
+    name = result.names.subscription
+    connection = spec.source.connection
+    host = connection.host or source_instance.spec.host
+    port = connection.port or source_instance.spec.port
+    conninfo = sub.build_conninfo(
+        host=host,
+        port=port,
+        database=result.source.database,
+        user=result.login,
+        password=result.password,
+        ssl_mode=connection.ssl_mode,
+        ssl_root_cert=connection.ssl_root_cert_path,
+    )
+    fingerprint = sub.conninfo_fingerprint(conninfo)
+
+    if subscription is None:
+        await _ensure_slot(ctx, obj, src, source_instance, result)
+        try:
+            await sub.create_subscription(
+                dst,
+                name,
+                conninfo=conninfo,
+                publication=result.names.publication,
+                copy_data=spec.copy_data,
+                enabled=spec.enabled,
+                binary=spec.subscription.binary,
+                streaming=spec.subscription.streaming,
+                comment=marker,
+            )
+        except ReconcileFailure as exc:
+            raise _explain(exc, result, host, port) from exc
+        subscription = await sub.get_subscription(dst, name)
+        if subscription is None:  # pragma: no cover - it was created a statement ago
+            raise ReconcileFailure(f"subscription {name} was created but cannot be found")
+        result.created["subscription"] = True
+        result.subscription_oid = subscription.oid
+        result.changes.append(f"created subscription {name}")
+        await _record_created(ctx, obj, result)
+    else:
+        result.created["subscription"] = True
+        result.subscription_oid = subscription.oid
+        if existing.get("connectionFingerprint") != fingerprint:
+            await sub.set_connection(dst, name, conninfo)
+            result.changes.append("updated the subscription's connection")
+        if subscription.enabled != spec.enabled:
+            await sub.set_enabled(dst, name, spec.enabled)
+            result.changes.append(f"{'enabled' if spec.enabled else 'disabled'} the subscription")
+        binary = spec.subscription.binary
+        streaming = spec.subscription.streaming
+        binary = binary if binary is not None and binary != subscription.binary else None
+        streaming = streaming if streaming is not None and streaming != subscription.streaming else None
+        if binary is not None or streaming is not None:
+            await sub.set_options(dst, name, binary=binary, streaming=streaming)
+            result.changes.append("updated the subscription's options")
+    result.connection_fingerprint = fingerprint
+    result.subscription_enabled = spec.enabled
+
+    subscribed = await sub.subscribed_tables(dst, subscription.oid)
+    # A disabled subscription cannot refresh; the tables catch up once it is enabled.
+    if spec.enabled and set(subscribed) != published:
+        try:
+            await sub.refresh(dst, name, copy_data=spec.copy_data)
+        except ReconcileFailure as exc:
+            raise _explain(exc, result, host, port) from exc
+        result.changes.append("refreshed the subscription's tables")
+        subscribed = await sub.subscribed_tables(dst, subscription.oid)
+    result.subscribed = subscribed
+
+
+def _explain(exc: ReconcileFailure, result: ReplicationResult, host: str, port: int) -> ReconcileFailure:
+    """Name what failed when the *target server* connected to the source.
+
+    The operator reached both servers; this is the path between them, so the
+    remedy is about that path - not about the operator's own connections.
+    """
+    text = str(exc)
+    if "WAL sender" in text or "replication role" in text:
+        return ReplicationRefused(
+            f"the source refused {result.login} a replication connection ({text}); on RDS the "
+            "login needs rds_replication, on a stock server the REPLICATION attribute"
+        )
+    if "could not connect to the publisher" in text and ("SSL" in text or "certificate" in text):
+        # The path works; the two ends disagree about TLS. Security groups are
+        # not the fix, so do not send the reader there.
+        return SourceUnreachableFromTarget(
+            f"{result.target.instance} reached the source at {host}:{port} but could not agree "
+            f"on TLS ({text}); set source.connection.sslMode to what the source offers - "
+            "verify-ca and verify-full also need sslRootCertPath on the target server"
+        )
+    if "could not connect to the publisher" in text:
+        return SourceUnreachableFromTarget(
+            f"{result.target.instance} could not connect to the source at {host}:{port} "
+            f"({text}); check that the source admits connections from the target server "
+            "(security groups, routing, pg_hba), and that source.connection names the source "
+            "as the target server resolves it"
+        )
+    return exc
+
+
+async def _ensure_slot(
+    ctx: ReconcileContext,
+    obj: dict[str, Any],
+    src: AsyncConnection,
+    instance: ResolvedInstance,
+    result: ReplicationResult,
+) -> None:
+    """The subscription's slot, created from the source before the subscription.
+
+    Never by CREATE SUBSCRIPTION itself - see :func:`sub.create_subscription`
+    for the cross-server deadlock that avoids. A slot of this name that already
+    exists is this replication's own: names carry a hash of its identity. One
+    left idle by an earlier pass, or an earlier incarnation, is adopted - its
+    position predates the subscription's initial copy, which is all apply
+    needs. One in use belongs to some live subscriber and is never touched.
+    """
+    name = result.names.subscription
+    found = await sub.slots(src, name, subscription_oid=None)
+    if found:
+        if found[0].database != result.source.database:
+            raise ReconcileFailure(
+                f"replication slot {name} already exists on {result.source.instance} but for "
+                f"database {found[0].database!r}, not {result.source.database}; a logical slot "
+                "streams one database's changes only, so it cannot be adopted - drop it"
+            )
+        if found[0].active:
+            raise ReconcileFailure(
+                f"replication slot {name} already exists on {result.source.instance} and is in "
+                f"use (pid {found[0].active_pid}), but this replication has no subscription to "
+                "hold it; it is left alone"
+            )
+        result.changes.append(f"adopted idle slot {name}")
+    else:
+        try:
+            await _with_slot_privilege(
+                ctx,
+                instance,
+                result.source.database,
+                result.login,
+                result.password,
+                lambda conn: sub.create_slot(conn, name),
+            )
+        except ReconcileFailure as exc:
+            if "statement timeout" not in str(exc):
+                raise
+            raise ReconcileFailure(
+                f"creating slot {name} waits for every transaction already running on "
+                f"{result.source.instance} to finish, and one outlasted the statement timeout; "
+                "look for long-running transactions in pg_stat_activity there"
+            ) from exc
+        result.changes.append(f"created slot {name}")
+    if not result.created.get("slot"):
+        result.created["slot"] = True
+        await _record_created(ctx, obj, result)
+
+
+async def _with_slot_privilege(
+    ctx: ReconcileContext,
+    instance: ResolvedInstance,
+    database: str,
+    login: str | None,
+    password: str | None,
+    operation: Callable[[AsyncConnection], Awaitable[None]],
+) -> None:
+    """Run a slot operation as the managing role or, failing that, as the replication login.
+
+    Creating or dropping a slot takes REPLICATION. On RDS the master user has it
+    through rds_replication; a stock non-superuser managing role does not, but
+    the replication login - which exists to use exactly these slots - does.
+    Connected to ``database``, because a logical slot belongs to one database.
+    """
+    async with ctx.connect(instance, database) as conn:
+        try:
+            await operation(conn)
+            return
+        except InsufficientPrivilege:
+            if not (login and password):
+                raise
+    as_login = replace(
+        instance.endpoint,
+        instance=f"{instance.name}#{login}",
+        username=login,
+        password=password,
+        maintenance_database=database,
+    )
+    try:
+        async with ctx.pools.connection(as_login) as conn:
+            await operation(conn)
+    except InsufficientPrivilege as exc:
+        raise ReplicationRefused(
+            f"neither the managing role nor {login} may use replication slots on "
+            f"{instance.name} ({exc}); on RDS the login needs rds_replication, on a stock "
+            "server the REPLICATION attribute"
+        ) from exc
+    finally:
+        await ctx.pools.close_instance(as_login.instance)
+
+
+# ---------------------------------------------------------------------------
 # teardown
 # ---------------------------------------------------------------------------
 
 
 async def teardown_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> str:
-    """Remove what this replication created, whatever its retention policy.
+    """Remove what this replication created, on both servers, whatever its retention policy.
 
-    Works from status - the names and instance recorded when the objects were
+    Works from status - the names, instances and objects recorded as they were
     created - not from the dbRefs, whose PostgresDBs may already be gone. The
     replicated data on the target is never touched.
+
+    Each server is handled on its own, because each may be gone or unreachable
+    independently; the finalizer is released only when both are done. The
+    target goes first, so nothing consumes the slot by the time it is dropped;
+    if the target cannot be reached, the source is cleared anyway - its slot is
+    the part that does damage when left behind.
     """
     status = obj.get("status") or {}
     created = status.get("created") or {}
     granted = list(status.get("grantedMemberships") or [])
     source = status.get("source") or {}
-    if not (any(created.values()) or granted) or not source.get("instance"):
+    target = status.get("target") or {}
+    if not (any(created.values()) or granted):
         return "nothing to remove; this replication created no objects"
 
     removed: list[str] = []
-    if created.get("publication") or created.get("login") or granted:
-        instance = await ctx.resolve_instance(str(source["instance"]))
-        removed.extend(await _remove_source_objects(ctx, instance, source, created, granted))
+    unreachable: list[str] = []
 
+    if created.get("subscription") and target.get("instance") and target.get("subscription"):
+        try:
+            instance = await ctx.resolve_instance(str(target["instance"]))
+            removed.extend(await _remove_subscription(ctx, instance, target))
+        except InstanceNotFound as exc:
+            log.warning("target instance gone; its subscription goes with the server: %s", exc)
+        except ConnectionFailure as exc:
+            unreachable.append(f"target {target['instance']} ({exc})")
+
+    source_cleared = False
+    if source.get("instance"):
+        try:
+            instance = await ctx.resolve_instance(str(source["instance"]))
+            if created.get("subscription") or created.get("slot"):
+                removed.extend(await _remove_slots(ctx, instance, obj, source, target))
+            removed.extend(await _remove_source_objects(ctx, instance, source, created, granted))
+            source_cleared = True
+        except InstanceNotFound as exc:
+            log.warning("source instance gone; nothing left on it to remove: %s", exc)
+            source_cleared = True
+        except ConnectionFailure as exc:
+            unreachable.append(f"source {source['instance']} ({exc})")
+
+    # The Secret is the login's credential: it goes only once the login has.
     credentials = status.get("credentialsSecret") or {}
     if (
-        created.get("secret")
+        source_cleared
+        and created.get("secret")
         and credentials.get("name")
         and await delete_secret(ctx.k8s, str(credentials["namespace"]), str(credentials["name"]))
     ):
         removed.append(f"Secret {credentials['namespace']}/{credentials['name']}")
+
+    if unreachable:
+        done = f"; removed so far: {', '.join(removed)}" if removed else ""
+        raise ConnectionFailure(f"cannot reach {' and '.join(unreachable)}; will retry{done}")
     return "removed " + ", ".join(removed) if removed else "nothing left to remove"
+
+
+async def _remove_subscription(
+    ctx: ReconcileContext, instance: ResolvedInstance, target: dict[str, Any]
+) -> list[str]:
+    database = str(target.get("database") or "")
+    name = str(target["subscription"])
+    async with ctx.connect(instance) as conn:
+        # DROP DATABASE refuses a database with a subscription, so a database
+        # that is gone took no subscription of ours with it unnoticed.
+        if not database or await pgdb.get_database(conn, database) is None:
+            return []
+    async with ctx.connect(instance, database) as conn:
+        if await sub.get_subscription(conn, name) is None:
+            return []
+        took_slot = await sub.drop_subscription(conn, name)
+    return [f"subscription {name}" + ("" if took_slot else " (detached from its slot)")]
+
+
+async def _remove_slots(
+    ctx: ReconcileContext,
+    instance: ResolvedInstance,
+    obj: dict[str, Any],
+    source: dict[str, Any],
+    target: dict[str, Any],
+) -> list[str]:
+    """Drop the subscription's slot, and any table-sync slots, still on the source.
+
+    A plain DROP SUBSCRIPTION took them already; this catches what a detached
+    one - or an unreachable target - left behind. A walsender still holding a
+    slot belongs to a subscriber that is gone or detached, so it is ended.
+    """
+    slot = str(source.get("slot") or "")
+    if not slot:
+        return []
+    oid = target.get("subscriptionOid")
+    login = str(source.get("login") or "")
+    async with ctx.connect(instance) as conn:
+        found = await sub.slots(conn, slot, subscription_oid=int(oid) if oid else None)
+        if not found:
+            return []
+        if any(s.active for s in found) and login:
+            # Signalling a backend takes membership of its role.
+            with contextlib.suppress(ReconcileFailure):
+                await pgroles.ensure_self_membership(
+                    conn, login, per_grant_options=instance.server.supports_per_grant_options
+                )
+        for _ in range(20):
+            busy = [s for s in found if s.active and s.active_pid]
+            if not busy:
+                break
+            for s in busy:
+                await sub.terminate(conn, int(s.active_pid or 0))
+            await asyncio.sleep(0.25)
+            found = await sub.slots(conn, slot, subscription_oid=int(oid) if oid else None)
+        held = [s.name for s in found if s.active]
+        if held:
+            raise ReconcileFailure(
+                f"slot(s) {', '.join(held)} on {instance.name} are still held by a walsender "
+                "that could not be ended; retrying"
+            )
+    names = [s.name for s in found]
+    password = await _login_password(ctx, obj)
+    await _with_slot_privilege(
+        ctx,
+        instance,
+        str(source.get("database") or instance.spec.maintenance_database),
+        login or None,
+        password,
+        lambda conn: sub.drop_slots(conn, names),
+    )
+    return [f"slot {name}" for name in names]
+
+
+async def _login_password(ctx: ReconcileContext, obj: dict[str, Any]) -> str | None:
+    """The replication login's password, from whichever Secret holds it, if it still exists."""
+    status = obj.get("status") or {}
+    credentials = status.get("credentialsSecret") or {}
+    if not credentials.get("name"):
+        return None
+    key = "password"
+    if not credentials.get("generated"):
+        ref = ((obj.get("spec") or {}).get("source") or {}).get("credentialsSecretRef") or {}
+        key = str(ref.get("passwordKey") or "password")
+    try:
+        data = await read_secret(ctx.k8s, str(credentials["namespace"]), str(credentials["name"]))
+    except ReferenceNotFound:
+        return None
+    value = data.get(key)
+    return value.decode() if value else None
 
 
 async def _remove_source_objects(
@@ -907,11 +1354,11 @@ def build_status(
     else:
         conditions.append(st.no_drift(generation))
         conditions.append(st.synced(result.message, generation))
-    conditions.append(st.pending("AwaitingSubscription", result.message, generation))
+    conditions.append(st.ready(result.message, generation))
     merged = st.merge_conditions((existing or {}).get("conditions"), conditions)
 
-    published = len(result.published)
     excluded = len({entry["table"] for entry in result.excluded})
+    subscribed = len(result.subscribed)
     return {
         "observedGeneration": generation,
         "conditions": merged,
@@ -925,7 +1372,9 @@ def build_status(
         "target": {
             **result.target.as_status(),
             "subscription": result.names.subscription,
+            "subscriptionOid": result.subscription_oid,
         },
+        "connectionFingerprint": result.connection_fingerprint,
         "credentialsSecret": result.credentials,
         "created": result.created,
         "grantedMemberships": sorted(set(result.granted)),
@@ -934,9 +1383,30 @@ def build_status(
         "tableWarnings": result.kept + result.warnings,
         "rowFilters": result.row_filters,
         "tables": {
-            "published": published,
+            "published": len(result.published),
+            "subscribed": subscribed,
+            "ready": result.ready_tables,
+            "syncing": subscribed - result.ready_tables,
             "excluded": excluded,
-            "display": f"{published}/{published + excluded}",
+            "display": f"{result.ready_tables}/{subscribed}",
         },
         "lastReconciledAt": st.now(),
     }
+
+
+async def replications_using(ctx: ReconcileContext, namespace: str, name: str) -> list[str]:
+    """PostgresReplications whose source or target is the PostgresDB ``namespace/name``.
+
+    Reads raw specs, so a replication whose spec fails validation still counts:
+    it may have created a slot or a subscription before it became invalid.
+    """
+    found: list[str] = []
+    for replication in await list_replications(ctx.k8s):
+        meta = replication.get("metadata") or {}
+        own_namespace = str(meta.get("namespace"))
+        spec = replication.get("spec") or {}
+        for side in ("source", "target"):
+            ref = (spec.get(side) or {}).get("dbRef") or {}
+            if ref.get("name") == name and (ref.get("namespace") or own_namespace) == namespace:
+                found.append(f"{own_namespace}/{meta.get('name')} ({side})")
+    return found

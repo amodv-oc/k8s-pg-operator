@@ -5,10 +5,11 @@
 # routing orders-18 back into orders-16 would close a loop, which the operator
 # refuses because changes would be republished round it until apply stalls.
 #
-# The source side converges - a login and a publication on each source - but
-# no subscription is created yet, so these report Pending. The replica
-# databases have no tables, so every candidate is held back as
-# TargetTableMissing until one is created there.
+# Each creates a login and publication on its source and a subscription on its
+# target. The replica databases start empty, so every candidate is held back as
+# TargetTableMissing - and the replication reports Drifted - until the table
+# is created there; the next pass then publishes it and the subscription
+# copies it.
 ---
 apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB
@@ -58,6 +59,8 @@ spec:
   source:
     dbRef:
       name: orders-16
+    connection:
+      sslMode: disable   # these servers have no TLS; never copy this to RDS
   target:
     dbRef:
       name: orders-replica-17
@@ -74,6 +77,8 @@ spec:
   source:
     dbRef:
       name: orders-17
+    connection:
+      sslMode: disable   # these servers have no TLS; never copy this to RDS
   target:
     dbRef:
       name: orders-replica-18
@@ -90,6 +95,8 @@ spec:
   source:
     dbRef:
       name: orders-18
+    connection:
+      sslMode: disable   # these servers have no TLS; never copy this to RDS
   target:
     dbRef:
       name: orders-replica-16

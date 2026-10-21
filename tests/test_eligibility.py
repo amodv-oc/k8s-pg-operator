@@ -337,3 +337,19 @@ def test_target_relations_follow_publish_via_root() -> None:
     plain = source()
     assert el.target_relations(plain, via_root=False) == (plain,)
     assert replace(plain, kind="p", leaves=()).kind == "p"
+
+
+# --- the initial copy ----------------------------------------------------------
+
+
+def test_a_new_table_with_rows_on_the_target_waits() -> None:
+    verdict = judge(candidate(), source(), copy_data=True, target_nonempty=frozenset({"public.orders"}))
+    assert reasons(verdict) == [el.TARGET_TABLE_NOT_EMPTY]
+    assert verdict.keeps_membership
+
+
+def test_rows_on_the_target_are_fine_once_subscribed_or_without_a_copy() -> None:
+    nonempty = frozenset({"public.orders"})
+    subscribed = frozenset({"public.orders"})
+    assert judge(candidate(), source(), copy_data=True, target_nonempty=nonempty, subscribed=subscribed).publishable
+    assert judge(candidate(), source(), copy_data=False, target_nonempty=nonempty).publishable

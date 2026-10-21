@@ -43,6 +43,7 @@ from ..postgres.privileges import (
 )
 from ..postgres.sql import fetch_scalar
 from .context import ReconcileContext, ResolvedInstance
+from .replication import replications_using
 
 log = logging.getLogger(__name__)
 
@@ -477,6 +478,17 @@ async def teardown_database(ctx: ReconcileContext, obj: dict[str, Any]) -> str:
         return (
             f"retained database {database} and group roles "
             f"{', '.join(roles.all)} on {instance_spec.host}:{instance_spec.port}"
+        )
+
+    # A replication's subscription makes DROP DATABASE fail outright on its
+    # target; on its source, FORCE would end the walsender and drop the slot
+    # with the database, breaking a live replication without a word. Either
+    # way the replication must go first, so wait for it.
+    using = await replications_using(ctx, namespace, name)
+    if using:
+        raise ReconcileFailure(
+            f"PostgresReplication {', '.join(using)} still uses database {database}; delete it "
+            "first - this teardown retries until it is gone"
         )
 
     instance = await ctx.resolve_instance(spec.instance_ref.name, for_namespace=namespace)

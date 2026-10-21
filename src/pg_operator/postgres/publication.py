@@ -17,7 +17,7 @@ from typing import Any
 
 from psycopg import AsyncConnection, sql
 
-from .sql import execute, fetch_all, fetch_one, ident, idents, literal, qualified
+from .sql import execute, fetch_all, fetch_one, fetch_scalar, ident, idents, literal, qualified
 
 log = logging.getLogger(__name__)
 
@@ -427,3 +427,29 @@ async def replace_table(
 async def drop_publication(conn: AsyncConnection, name: str) -> None:
     await execute(conn, sql.SQL("DROP PUBLICATION IF EXISTS {}").format(ident(name)))
     log.info("dropped publication %s", name)
+
+
+_PUBLISHED_RELATIONS = sql.SQL(
+    "SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname = %s"
+)
+
+
+async def published_relations(conn: AsyncConnection, publication: str) -> set[str]:
+    """What a subscriber of the publication receives: partitions expanded.
+
+    Unlike the publication's own membership, this is in the subscriber's terms -
+    each leaf, or the root under publish_via_partition_root - so it compares
+    directly with pg_subscription_rel.
+    """
+    return {str(row[0]) for row in await fetch_all(conn, _PUBLISHED_RELATIONS, (publication,))}
+
+
+async def nonempty_tables(conn: AsyncConnection, tables: Iterable[tuple[str, str]]) -> set[str]:
+    """Which of the named target tables already hold rows."""
+    found: set[str] = set()
+    for schema, table in sorted(set(tables)):
+        if await fetch_scalar(
+            conn, sql.SQL("SELECT EXISTS (SELECT 1 FROM {})").format(qualified(schema, table))
+        ):
+            found.add(f"{schema}.{table}")
+    return found

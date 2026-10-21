@@ -37,9 +37,18 @@ from pg_operator.postgres.connection import Endpoint, PoolRegistry
 TEST_DSN_ENV = "PGOP_TEST_DSN"
 TARGET_DSN_ENV = "PGOP_TEST_TARGET_DSN"
 SOURCE_FROM_TARGET_ENV = "PGOP_TEST_SOURCE_FROM_TARGET"
+TARGET_FROM_SOURCE_ENV = "PGOP_TEST_TARGET_FROM_SOURCE"
 SUPERUSER_DSN_ENV = "PGOP_TEST_SUPERUSER_DSN"
+TARGET_SUPERUSER_DSN_ENV = "PGOP_TEST_TARGET_SUPERUSER_DSN"
 
-REPLICATION_ENVS = (TEST_DSN_ENV, TARGET_DSN_ENV, SOURCE_FROM_TARGET_ENV, SUPERUSER_DSN_ENV)
+REPLICATION_ENVS = (
+    TEST_DSN_ENV,
+    TARGET_DSN_ENV,
+    SOURCE_FROM_TARGET_ENV,
+    TARGET_FROM_SOURCE_ENV,
+    SUPERUSER_DSN_ENV,
+    TARGET_SUPERUSER_DSN_ENV,
+)
 
 _SHIM = Path(__file__).resolve().parents[1] / "hack" / "rds-replication-shim.sql"
 
@@ -116,28 +125,49 @@ def source_from_target() -> dict[str, str]:
     return _parse_dsn(value)
 
 
-def emulate_rds_replication() -> None:
+@pytest.fixture
+def target_from_source() -> dict[str, str]:
+    """``host``/``port`` of the target as the source server resolves it."""
+    value = os.environ.get(TARGET_FROM_SOURCE_ENV)
+    if not value:
+        pytest.skip(f"{TARGET_FROM_SOURCE_ENV} is not set")
+    return _parse_dsn(value)
+
+
+def _superuser_dsn(*, target: bool = False, database: str | None = None) -> str:
+    name = TARGET_SUPERUSER_DSN_ENV if target else SUPERUSER_DSN_ENV
+    dsn = os.environ.get(name)
+    if not dsn:
+        pytest.skip(f"{name} is not set")
+    return psycopg.conninfo.make_conninfo(dsn, dbname=database) if database else dsn
+
+
+def emulate_rds_replication(*, target: bool = False) -> None:
     """Give direct LOGIN members of rds_replication the REPLICATION attribute.
 
     The one superuser step in the suite. RDS lets a login granted
     rds_replication stream from a slot; stock PostgreSQL checks only the
     attribute, which the managing role cannot confer. Runs the same SQL as the
-    cluster harness's shim.
+    cluster harness's shim - on the source server, and on the target too when
+    a replication runs the other way.
     """
-    dsn = os.environ.get(SUPERUSER_DSN_ENV)
-    if not dsn:
-        pytest.skip(f"{SUPERUSER_DSN_ENV} is not set")
-    with psycopg.connect(dsn, autocommit=True) as conn:
-        conn.execute(_SHIM.read_text())
+    for dsn in [_superuser_dsn()] + ([_superuser_dsn(target=True)] if target else []):
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(_SHIM.read_text())
 
 
-def superuser_execute(statement: str, params: tuple[object, ...] = ()) -> list[tuple]:
-    """Run one statement as the source's superuser - for test cleanup only."""
-    dsn = os.environ.get(SUPERUSER_DSN_ENV)
-    if not dsn:
-        pytest.skip(f"{SUPERUSER_DSN_ENV} is not set")
+def superuser_execute(
+    statement: str,
+    params: tuple[object, ...] = (),
+    *,
+    database: str | None = None,
+    target: bool = False,
+) -> list[tuple]:
+    """Run one statement as a server's superuser - for test set-up and cleanup only."""
+    dsn = _superuser_dsn(target=target, database=database)
     with psycopg.connect(dsn, autocommit=True) as conn, conn.cursor() as cur:
-        cur.execute(statement, params)
+        # No parameters means no placeholder parsing, so a LIKE pattern's % is literal.
+        cur.execute(statement, params or None)
         return cur.fetchall() if cur.description else []
 
 
