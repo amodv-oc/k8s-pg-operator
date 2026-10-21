@@ -268,9 +268,11 @@ async def reconcile_replication(
         if await _ensure_publication(src, spec, result, marker=marker):
             await _record_created(ctx, obj, result)
         created_before, granted_before = dict(result.created), set(result.granted)
+        previous_login = str((existing.get("source") or {}).get("login") or "")
         await _ensure_login(
             ctx, src, spec, info, result,
             namespace=namespace, name=name, marker=marker, read_group=groups["readOnly"],
+            previous_login=previous_login,
         )
         if result.created != created_before or set(result.granted) != granted_before:
             await _record_created(ctx, obj, result)
@@ -338,6 +340,12 @@ async def reconcile_replication(
         await _converge_subscription(
             ctx, obj, src, dst, spec, result, subscription, published,
             source_instance=source_instance, existing=existing, marker=marker,
+        )
+
+        # The subscription now authenticates as the login the spec asks for, so
+        # one this replication used before it has nothing left holding it.
+        await _remove_superseded_login(
+            ctx, src, existing, result, instance=source_instance, previous_login=previous_login
         )
 
         # 7. Health.
@@ -583,8 +591,12 @@ async def _ensure_login(
     name: str,
     marker: str,
     read_group: str,
+    previous_login: str,
 ) -> None:
     """A login the target server can stream as, reading through the source's RO group."""
+    # Start from nothing, so what is recorded is what this pass granted.
+    inherited = list(result.granted)
+    result.granted.clear()
     if spec.source.credentials_secret_ref is not None:
         await _adopt_provided_login(
             ctx, conn, spec.source.credentials_secret_ref, result, namespace=namespace
@@ -593,6 +605,13 @@ async def _ensure_login(
         await _ensure_generated_login(
             ctx, conn, info, result, namespace=namespace, name=name, marker=marker
         )
+    if result.login == previous_login:
+        # The same login as last pass, and a converged pass grants nothing, so
+        # what earlier passes recorded still stands. A *different* login means
+        # those memberships belong to the role this one replaces: teardown must
+        # not revoke a grant it never made, and _remove_superseded_login below
+        # deals with the old role itself.
+        result.granted[:0] = [group for group in inherited if group not in result.granted]
     # USAGE, not mere membership: the login must hold the group's SELECTs.
     await _grant(conn, read_group, result.login, result, privilege="USAGE")
 
@@ -627,6 +646,11 @@ async def _adopt_provided_login(
     result.login = login
     result.password = data[ref.password_key].decode()
     result.credentials = {"namespace": secret_namespace, "name": ref.name, "generated": False}
+    # Neither the role nor the Secret is the operator's work, whatever an
+    # earlier pass with a generated login recorded. Leaving these set would
+    # have teardown drop the user's own login and delete the Secret it read.
+    result.created["login"] = False
+    result.created["secret"] = False
 
 
 async def _ensure_generated_login(
@@ -693,6 +717,58 @@ async def _ensure_generated_login(
         result.changes.append(f"updated Secret {secret_namespace}/{secret_name}")
     result.created["secret"] = True
     result.credentials = {"namespace": secret_namespace, "name": secret_name, "generated": True}
+
+
+async def _remove_superseded_login(
+    ctx: ReconcileContext,
+    conn: AsyncConnection,
+    existing: dict[str, Any],
+    result: ReplicationResult,
+    *,
+    instance: ResolvedInstance,
+    previous_login: str,
+) -> None:
+    """Remove the login this replication used before, once nothing streams as it.
+
+    ``source.credentialsSecretRef`` can be added to, dropped from or repointed
+    at a live replication, which swaps one login for another. The one being
+    replaced is the operator's to remove only if the operator made it; a
+    provided login keeps its role and its Secret, and loses only the
+    memberships the operator granted it. Runs after the subscription carries
+    the new connection string, so the session it ends is one nothing reopens.
+    """
+    if not previous_login or previous_login == result.login:
+        return
+    was = {key: bool(value) for key, value in (existing.get("created") or {}).items()}
+    if await pgroles.role_exists(conn, previous_login):
+        if was.get("login"):
+            # Signalling the login's sessions takes membership of it.
+            with contextlib.suppress(ReconcileFailure):
+                await pgroles.ensure_self_membership(
+                    conn, previous_login, per_grant_options=instance.server.supports_per_grant_options
+                )
+            await pgroles.terminate_role_sessions(conn, previous_login)
+            await pgroles.revoke_all_memberships(conn, previous_login)
+            await pgroles.drop_role(conn, previous_login)
+            result.changes.append(f"dropped the superseded replication login {previous_login}")
+        else:
+            held = await pgroles.memberships(conn, previous_login)
+            for group in existing.get("grantedMemberships") or []:
+                if group in held:
+                    await pgroles.revoke_membership(conn, group, previous_login)
+            result.changes.append(
+                f"revoked this replication's grants from the superseded login {previous_login}"
+            )
+
+    credentials = existing.get("credentialsSecret") or {}
+    superseded = (credentials.get("namespace"), credentials.get("name"))
+    if (
+        was.get("secret")
+        and all(superseded)
+        and superseded != (result.credentials.get("namespace"), result.credentials.get("name"))
+        and await delete_secret(ctx.k8s, str(superseded[0]), str(superseded[1]))
+    ):
+        result.changes.append(f"deleted the superseded Secret {superseded[0]}/{superseded[1]}")
 
 
 async def _grant(

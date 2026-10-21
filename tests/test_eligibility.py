@@ -42,7 +42,13 @@ def source(
     return SourceTable(**fields)
 
 
-def target(name: str = "orders", schema: str = "public", **overrides: Any) -> TargetTable:
+def target(
+    name: str = "orders",
+    schema: str = "public",
+    *,
+    identity: frozenset[str] | None = frozenset({"id"}),
+    **overrides: Any,
+) -> TargetTable:
     fields: dict[str, Any] = {
         "schema": schema,
         "name": name,
@@ -51,6 +57,8 @@ def target(name: str = "orders", schema: str = "public", **overrides: Any) -> Ta
         "owner_settable": True,
         "columns": {"id": "integer", "region": "text", "total": "numeric"},
         "generated": frozenset(),
+        "identity_columns": identity,
+        "required_columns": frozenset(),
     }
     fields.update(overrides)
     return TargetTable(**fields)
@@ -203,6 +211,62 @@ def test_published_columns_must_exist_on_the_target_and_not_be_generated() -> No
 def test_extra_target_columns_are_fine() -> None:
     wider = target(columns={"id": "integer", "region": "text", "total": "numeric", "note": "text"})
     assert judge(candidate(), source(), targets=[wider]).publishable
+
+
+def test_a_target_that_cannot_identify_a_row_stops_the_whole_subscription() -> None:
+    """PostgreSQL refuses the apply, and apply is sequential: one table stops all of them."""
+    verdict = judge(candidate(), source(), targets=[target(identity=None)])
+    assert reasons(verdict) == [el.TARGET_NO_REPLICA_IDENTITY]
+    # Target-sided, so a table already published stays published (design D6).
+    assert verdict.issues[0].side == "target" and verdict.keeps_membership
+    assert "primary key" in verdict.issues[0].message
+
+
+def test_a_publisher_sending_full_rows_asks_nothing_of_the_target() -> None:
+    whole_row = source(replica_identity="f", identity=frozenset({"id", "region", "total"}))
+    assert judge(candidate(), whole_row, targets=[target(identity=None)]).publishable
+
+
+def test_a_source_with_no_identity_is_not_reported_against_the_target_as_well() -> None:
+    """One typo, one cause: NoReplicaIdentity already names the end that must change."""
+    verdict = judge(candidate(), source(identity=None), targets=[target(identity=None)])
+    assert reasons(verdict) == [el.NO_REPLICA_IDENTITY]
+
+
+def test_a_target_identity_wider_than_the_publishers_is_held_back() -> None:
+    """The publisher sends its own identity as the key, whatever else it publishes."""
+    verdict = judge(candidate(), source(), targets=[target(identity=frozenset({"id", "region"}))])
+    assert reasons(verdict) == [el.TARGET_IDENTITY_NOT_SENT]
+    assert "region" in verdict.issues[0].message
+
+
+def test_a_target_identity_of_fewer_columns_is_fine() -> None:
+    wider_source = source(identity=frozenset({"id", "region"}))
+    assert judge(candidate(), wider_source, targets=[target(identity=frozenset({"id"}))]).publishable
+
+
+def test_the_target_needs_no_identity_for_an_insert_only_publication() -> None:
+    verdict = judge(candidate(), source(), targets=[target(identity=None)], keyed=False)
+    assert verdict.publishable
+
+
+def test_a_required_target_column_the_publication_does_not_carry_is_held_back() -> None:
+    """Every INSERT the subscription applies would fail the NOT NULL."""
+    needs_tenant = target(
+        columns={"id": "integer", "region": "text", "total": "numeric", "tenant": "text"},
+        required_columns=frozenset({"tenant"}),
+    )
+    verdict = judge(candidate(), source(), targets=[needs_tenant])
+    assert reasons(verdict) == [el.TARGET_COLUMN_REQUIRED]
+    assert verdict.issues[0].side == "target" and "tenant" in verdict.issues[0].message
+
+
+def test_a_required_target_column_is_fine_once_the_publication_carries_it() -> None:
+    needs_region = target(required_columns=frozenset({"region"}))
+    assert judge(candidate(), source(), targets=[needs_region]).publishable
+    # ...but not if a column list leaves it out.
+    narrowed = judge(candidate(columns=("id", "total")), source(), targets=[needs_region])
+    assert reasons(narrowed) == [el.TARGET_COLUMN_REQUIRED]
 
 
 def test_an_owner_the_managing_role_cannot_become_is_held_back() -> None:

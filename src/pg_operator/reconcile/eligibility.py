@@ -38,6 +38,15 @@ ROW_SECURITY_ENABLED = "RowSecurityEnabled"
 TARGET_TABLE_MISSING = "TargetTableMissing"
 TARGET_COLUMNS_MISSING = "TargetColumnsMissing"
 TARGET_OWNER_NOT_SETTABLE = "TargetOwnerNotSettable"
+#: The target cannot identify the row an UPDATE or DELETE names, which stops
+#: apply for every table the subscription carries, not only this one.
+TARGET_NO_REPLICA_IDENTITY = "TargetNoReplicaIdentity"
+#: The target identifies rows by columns the publisher does not send as part of
+#: *its* replica identity. Same consequence.
+TARGET_IDENTITY_NOT_SENT = "TargetIdentityNotSent"
+#: A NOT NULL column on the target that the publication does not carry and the
+#: server cannot default. Every INSERT the subscription applies fails.
+TARGET_COLUMN_REQUIRED = "TargetColumnRequired"
 #: The initial copy of a newly subscribed table would collide with rows the
 #: target already holds - most often a table unpublished (D6) and re-added.
 TARGET_TABLE_NOT_EMPTY = "TargetTableNotEmpty"
@@ -291,6 +300,21 @@ def judge(
                     "table's owner",
                 )
             )
+        required = sorted(
+            column for column in target.required_columns if column not in published_columns
+        )
+        if required:
+            issues.append(
+                _target(
+                    TARGET_COLUMN_REQUIRED,
+                    f"{relation.qualified} on the target requires column(s) {', '.join(required)}, "
+                    "which this publication does not carry and the server cannot default: every "
+                    "INSERT the subscription applies would fail. Give them a DEFAULT on the "
+                    "target, drop their NOT NULL, or publish them",
+                )
+            )
+        if keyed:
+            issues.extend(_target_identity_issues(relation, target))
         differing = [
             f"{column} {source.columns[column]} -> {target.columns[column]}"
             for column in published_columns
@@ -315,6 +339,48 @@ def judge(
             )
         )
     return Verdict(candidate, tuple(issues), tuple(warnings))
+
+
+def _target_identity_issues(source: SourceTable, target: TargetTable) -> list[Issue]:
+    """Whether the target can find the row an UPDATE or DELETE names.
+
+    PostgreSQL 16's logical-replication documentation puts it as: "If a replica
+    identity other than FULL is set on the publisher side, a replica identity
+    comprising the same or fewer columns must also be set on the subscriber
+    side." A publisher sending FULL rows therefore asks nothing of the target;
+    anything else does, and failing it stops apply for the whole subscription -
+    so this is a gate, not a warning, even though the fault is on the target.
+    """
+    if source.replica_identity == "f" or source.identity_columns is None:
+        # Nothing is asked of the target when the publisher sends whole rows -
+        # and when the *source* cannot identify a row either, NoReplicaIdentity
+        # has already excluded the table, with the remedy at the end that needs it.
+        return []
+    if target.identity_columns is None:
+        return [
+            _target(
+                TARGET_NO_REPLICA_IDENTITY,
+                f"{target.qualified} on the target has neither a primary key nor a REPLICA "  # noqa: S608 - status text, never executed
+                "IDENTITY index, so the apply worker could not find the rows to update or "
+                "delete and would stop the whole subscription; add a primary key there, or "
+                f"set REPLICA IDENTITY FULL on {source.qualified} at the source",
+            )
+        ]
+    # The target may identify rows by fewer columns than the publisher sends,
+    # never by more - and what counts is the publisher's replica identity, not
+    # merely which columns it publishes.
+    uncovered = sorted(target.identity_columns - source.identity_columns)
+    if uncovered:
+        return [
+            _target(
+                TARGET_IDENTITY_NOT_SENT,
+                f"{target.qualified} on the target identifies rows by {', '.join(uncovered)}, "
+                f"which is outside the replica identity {source.qualified} publishes "
+                f"({', '.join(sorted(source.identity_columns))}); the publisher never sends "
+                "those columns as keys, so apply would stop for the whole subscription",
+            )
+        ]
+    return []
 
 
 def _identity_issues(
