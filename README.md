@@ -550,17 +550,38 @@ One-way logical replication of selected tables from a `PostgresDB` on one
 instance into a `PostgresDB` on another. The design is
 [`docs/design/replication.md`](docs/design/replication.md).
 
-**Preview:** this version resolves and validates a replication and reports it
-`Pending`. It does not yet create the publication or the subscription. Each
-step below is checked now, so a `PostgresReplication` that reaches `Pending`
-will be accepted by the version that does replicate:
+**Preview: the source side only.** This version converges everything on the
+source. It does not yet create the subscription, so nothing replicates and the
+phase stays `Pending`. A pass:
 
-- both `PostgresDB`s exist and are on different servers;
-- both instances admit the replication's namespace;
-- every selected schema is managed by the source `PostgresDB`;
-- the replication would not close a loop of replications. A subscription
-  republishes what it applies, so a cycle of any length sends changes round
-  until apply stalls.
+1. **Refuses a replication that can never work.** It checks that both
+   `PostgresDB`s exist on different servers, and that both instances admit the
+   replication's namespace. Every selected schema must be managed by the
+   source. The replication must not close a loop of any length, because a
+   subscription republishes what it applies. Both servers must run PostgreSQL
+   16 or later, and the source must have `wal_level = logical`.
+2. **Ensures a replication login on the source.** By default this is generated:
+   it is granted `rds_replication` so it can stream, and the source's
+   `<db>_ro` group so it can read. Its password is in a Secret in the
+   operator's namespace. A login supplied with `credentialsSecretRef` is used
+   instead and never altered, apart from the `<db>_ro` membership.
+3. **Converges a publication that lists its tables explicitly.** A table is
+   added only once *both* servers can take it. Every other table appears in
+   `status.excludedTables` with its reason and remedy. The most important
+   reasons protect the **source**:
+   - `NoReplicaIdentity`, `RowFilterNotCoveredByIdentity` and
+     `ColumnListMissesIdentity` hold a table back because publishing it would
+     make PostgreSQL refuse that table's `UPDATE`s and `DELETE`s on the source
+     itself. A published table that later loses its replica identity is
+     removed on the next pass.
+   - `TargetTableMissing` and `TargetColumnsMissing` hold a table back until
+     the target has it. Create it there, and it is published on the next pass.
+
+Every object the operator creates carries an ownership comment and is recorded
+in status the moment it exists. An existing object with the same name is never
+taken over. Deleting the `PostgresReplication` removes the publication, the
+generated login and its Secret, whatever the `retentionPolicy`, and never
+touches the target.
 
 | Field | Default | Notes |
 | --- | --- | --- |

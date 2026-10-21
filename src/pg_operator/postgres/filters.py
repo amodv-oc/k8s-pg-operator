@@ -8,6 +8,9 @@ the fixed fragments below. Nothing from the spec is ever spliced in as text.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from psycopg import sql
 
 from ..models import FilterPredicate, RowFilter
@@ -47,3 +50,19 @@ def _render_predicate(predicate: FilterPredicate) -> sql.Composed:
     return sql.SQL("({} {} {})").format(
         column, _COMPARISONS[predicate.op], sql.Literal(predicate.value)
     )
+
+
+def fingerprint(row_filter: RowFilter) -> str:
+    """A stable hash of the filter as the spec writes it.
+
+    The server re-deparses a filter (``pg_get_expr``), so its text never equals
+    what was sent. A pass therefore records this hash beside the server's text,
+    and re-applies only when either changes - the spec, or the filter edited out
+    of band - which keeps a steady-state pass free of DDL.
+    """
+    canonical = json.dumps(
+        row_filter.model_dump(mode="json", by_alias=True, exclude_none=True),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]

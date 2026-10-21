@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | Accepted 2026-10-21, D1–D11 included. PR 1 (prerequisites and harness) built; PR 2 (the resource, resolve-and-validate) in progress |
+| Status | Accepted 2026-10-21, D1–D11 included. PRs 1–2 merged; PR 3 (the source side) in progress |
 | Date | 2026-10-21 |
 | Scope | Long-lived, one-way logical replication from a database on one `PostgresInstance` into a database on another |
 
@@ -344,12 +344,31 @@ resume or the timer. Steady state issues no DDL.
      published is reported as `NotPublishable`.
 5. **Gate each table, then converge the publication** (source).
    - Run every candidate through [table eligibility](#table-eligibility).
-   - Create the publication if it is missing, with an explicit `FOR TABLE` list
-     (see [D1](#decisions-for-review)). Otherwise converge membership with
-     `ALTER PUBLICATION … ADD TABLE` / `DROP TABLE` and `SET TABLE … WHERE (…)
-     (cols)`.
+   - Membership is an explicit `FOR TABLE` list (see
+     [D1](#decisions-for-review)), converged one table at a time:
+     - **New tables:** `ALTER PUBLICATION … ADD TABLE`.
+     - **Removed or failing tables:** `DROP TABLE`.
+     - **Changed column list or filter:** `DROP` then `ADD`, in one
+       transaction. A filter the server refuses therefore leaves the previous
+       shape published, rather than the table out.
+   - A table whose `ADD` the server refuses is held back as `InvalidRowFilter`
+     (it has a filter) or `PublicationRefused` (it has none); every other
+     table proceeds.
    - Converge `publish` and `publish_via_partition_root` with `ALTER
      PUBLICATION … SET`.
+
+**Order within a pass, and why.** Steps 3–5 create objects on the source, so:
+
+- **Names are checked first.** Before anything is created, a read-only pass
+  checks the publication's and the generated login's names. A pass that can
+  never succeed, because another object holds the name, creates nothing.
+- **Each creation is recorded immediately.** The publication (created empty)
+  and then the login are each written to `status.created` with a status patch
+  the moment they exist. A pass that fails afterwards publishes only its
+  conditions, so without this an object made early in it would be unknown to
+  teardown. It would then outlive a deletion that arrived before the next
+  successful pass. A test fails a pass mid-way and proves teardown still finds
+  everything.
 6. **Converge the subscription** (target).
    - Create it if it is missing: `CREATE SUBSCRIPTION … CONNECTION … PUBLICATION
      … WITH (copy_data, streaming, binary, enabled)`.
@@ -402,7 +421,8 @@ names the cause. This is the same "report, don't abort" rule as
 | Table exists on the target with the same schema and name (and the same leaves, for a partitioned root published via leaves) | target | `TargetTableMissing` | Otherwise apply stops for every table |
 | Every published column exists on the target and is not generated there | target | `TargetColumnsMissing` | Same |
 | Managing role can `SET ROLE` to the target table's owner | target | `TargetOwnerNotSettable` | PostgreSQL 16 applies changes as the table owner |
-| No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict |
+| No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict. The older replication keeps the table, by creation time and then namespace/name, so the two can never each defer to the other. It is the one target-side reason that takes an already-published table out |
+| A partitioned table's column list or row filter is set only with `publishViaPartitionRoot: true` | source | `FilterIgnoredWithoutPartitionRoot` | Without it, each leaf is published under its own, empty filter and column list, so every row and column would flow, silently |
 
 `ColumnTypeMismatch` is reported as a **warning only**. The table is still
 published, because apply converts values through their text form and a
@@ -418,8 +438,9 @@ What happens depends on which side changed.
   stays listed as excluded, and it comes back once the check passes. See D6.
 - **Target-side failure** (for example, a column was dropped on the target). The
   table **stays published**. Removing it would not help: the change that broke
-  apply is already in the stream. The operator reports the stall and names the
-  table it suspects.
+  apply is already in the stream. It is reported in `status.tableWarnings`,
+  marked as kept published, and once the subscription exists the operator
+  names it as the suspect in a stall.
 
 ### Row filters are structured, never SQL text
 
@@ -431,7 +452,12 @@ Steady state still has to be a no-op, but the server re-deparses the filter
 operator sent. The operator therefore records, per table, a hash of the filter
 spec and the server's deparsed text after applying it. A filter is re-applied
 only when one of those changes, and a change in the server's text means
-someone edited it out of band.
+someone edited it out of band. With nothing recorded (status lost) a filter is
+re-applied once.
+
+`status.rowFilters` is a list, not an object keyed by table. Status is written
+as a JSON merge patch, so a key removed from a status *object* would linger,
+while a list is replaced whole.
 
 Column lists work the same way: the operator compares them against
 `pg_publication_tables.attnames`.
@@ -771,8 +797,8 @@ Each PR updates `README.md` for what it ships.
 | --- | --- | --- |
 | 1 | Prerequisites: the instance's `logicalReplication` status block; harness and CI changes (second server, `wal_level`, bootstrap grants, shim) | Capabilities reported correctly on 14–18; existing suites green, unchanged |
 | 2 | CRD, models, naming, row-filter DSL, chart (CRD, RBAC, aggregation), example. Handlers registered; step 1 (Resolve) implemented in full, including the cycle check; status `Pending` via `Ready=Unknown` | `test_crds`/`test_examples`, spec and reconcile unit tests; CEL rules verified with `make local-up` |
-| 3 | Source side: login, Secret, table resolution, eligibility, publication convergence | Integration: publication contents and exclusions proven against a real server |
-| 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; teardown; `PostgresDB` teardown ordering | Integration: end-to-end flow, steady-state no-op, all teardown scenarios |
+| 3 | Source side: login, Secret, table resolution, eligibility, publication convergence, and the teardown of all of it. Teardown was planned for PR 4, but PR 3 is the first PR to *create* objects, so shipping removal later would strand them | Integration: publication contents and exclusions, steady-state no-op, teardown (including after a failed pass) proven against real servers |
+| 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; the slot and subscription half of teardown; `PostgresDB` teardown ordering | Integration: end-to-end flow, steady-state no-op, all teardown scenarios |
 | 5 | Health: observation, `status.health`, `Streaming` condition, `Degraded` phase, metrics, `PrometheusRule` | Integration: lag, stall and lost-slot states produced on demand |
 | 6 | State API | Projection tests; credential-leak test extended |
 | 7 | Dashboard | `make ui-check`, `make ui-image-check`, exercised on `make local-ui` |

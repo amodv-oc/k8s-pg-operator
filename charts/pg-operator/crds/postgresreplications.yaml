@@ -62,8 +62,9 @@ spec:
             retentionPolicy does not apply.
 
             The design is docs/design/replication.md. This operator version
-            resolves and validates a replication and reports it Pending; it does
-            not yet create the publication or subscription.
+            converges the source side - the replication login and the
+            publication - and reports Pending; it does not yet create the
+            subscription, so nothing replicates.
           required: [spec]
           properties:
             apiVersion: { type: string }
@@ -395,14 +396,64 @@ spec:
                     syncing: { type: integer }
                     excluded: { type: integer }
                     display: { type: string }
+                credentialsSecret:
+                  type: object
+                  description: Where the replication login's credentials live; generated means the operator wrote them.
+                  properties:
+                    namespace: { type: string }
+                    name: { type: string }
+                    generated: { type: boolean }
+                created:
+                  type: object
+                  description: >-
+                    Which objects the operator created. Deletion removes only
+                    these - never an object it found already there.
+                  properties:
+                    login: { type: boolean }
+                    secret: { type: boolean }
+                    publication: { type: boolean }
+                grantedMemberships:
+                  type: array
+                  description: Roles the operator granted the login; only these are revoked on deletion.
+                  items: { type: string }
+                publishedTables:
+                  type: array
+                  description: What the publication carries, read back from the server.
+                  items: { type: string }
                 excludedTables:
                   type: array
+                  description: Selected tables held out of the publication, each with its reason and remedy.
                   items:
                     type: object
                     properties:
                       table: { type: string }
                       reason: { type: string }
                       message: { type: string }
+                tableWarnings:
+                  type: array
+                  description: >-
+                    Published tables with something to know: differing column
+                    types, or a target-side problem with a table kept
+                    published because removing it would not recall changes
+                    already sent.
+                  items:
+                    type: object
+                    properties:
+                      table: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                rowFilters:
+                  type: array
+                  description: >-
+                    Each applied row filter as the server deparsed it, beside a
+                    hash of the spec it came from; a filter is re-applied only
+                    when either changes.
+                  items:
+                    type: object
+                    properties:
+                      table: { type: string }
+                      specHash: { type: string }
+                      applied: { type: string }
                 health:
                   type: object
                   properties:
