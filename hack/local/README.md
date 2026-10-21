@@ -116,9 +116,12 @@ documented to do.
 `03-replication.yaml` replicates each logical server's `orders` into a
 dedicated `orders_replica` database on the next version. The replicas are
 deliberately not another server's `orders`: 18 → 16 into `orders-16` would
-close a loop, which the operator refuses. In this preview the three
-`PostgresReplication`s resolve, validate and show `Pending`. Their status
-already names the publication, slot and login they will create.
+close a loop, which the operator refuses. In this preview the source side
+converges, so each source server gains a publication and a replication login.
+No subscription is created yet, so the three `PostgresReplication`s show
+`Pending`. The replica databases start empty, so every candidate table appears
+in `status.excludedTables` as `TargetTableMissing`. Create a table on a replica
+and the next pass publishes it on the source.
 
 The bootstrap SQL in `00-servers.yaml` is `hack/rds-like.sql` verbatim, plus
 one local-only script for `GRANT SET ON PARAMETER`. `tests/test_harness.py`

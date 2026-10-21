@@ -14,6 +14,24 @@ from typing import Any
 from kubernetes_asyncio.client.exceptions import ApiException
 
 
+def merge_patch(target: Any, patch: Any) -> Any:
+    """RFC 7386 JSON merge patch, as the API server applies a status patch.
+
+    Objects merge key by key, ``None`` deletes a key, and anything else -
+    arrays included - replaces. A partial status patch must therefore keep the
+    keys it does not mention, exactly as it does against a real cluster.
+    """
+    if not isinstance(patch, dict):
+        return patch
+    merged = dict(target) if isinstance(target, dict) else {}
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = merge_patch(merged.get(key), value)
+    return merged
+
+
 def _not_found(what: str) -> ApiException:
     return ApiException(status=404, reason=f"{what} not found")
 
@@ -221,7 +239,7 @@ class FakeCustomObjects:
         obj = await self.get_namespaced_custom_object(
             group=group, version=version, namespace=namespace, plural=plural, name=name
         )
-        obj["status"] = body["status"]
+        obj["status"] = merge_patch(obj.get("status") or {}, body["status"])
         return obj
 
     async def patch_cluster_custom_object_status(
@@ -237,7 +255,7 @@ class FakeCustomObjects:
         obj = await self.get_cluster_custom_object(
             group=group, version=version, plural=plural, name=name
         )
-        obj["status"] = body["status"]
+        obj["status"] = merge_patch(obj.get("status") or {}, body["status"])
         return obj
 
 

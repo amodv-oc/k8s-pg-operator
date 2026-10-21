@@ -5,8 +5,10 @@
 # routing orders-18 back into orders-16 would close a loop, which the operator
 # refuses because changes would be republished round it until apply stalls.
 #
-# Until the reconciler creates publications and subscriptions, these resolve,
-# validate and report Pending.
+# The source side converges - a login and a publication on each source - but
+# no subscription is created yet, so these report Pending. The replica
+# databases have no tables, so every candidate is held back as
+# TargetTableMissing until one is created there.
 ---
 apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresDB

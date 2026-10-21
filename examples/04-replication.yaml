@@ -16,8 +16,8 @@
 # Deleting the PostgresReplication removes the subscription, slot, publication
 # and login, and keeps every replicated row. retentionPolicy does not apply.
 #
-# This operator version validates the replication and reports it Pending; the
-# publication and subscription arrive in a later release.
+# This operator version converges the source side - the login and the
+# publication - and reports Pending; the subscription arrives in a later release.
 ---
 apiVersion: postgres.ourcommunity.com.au/v1alpha1
 kind: PostgresInstance
