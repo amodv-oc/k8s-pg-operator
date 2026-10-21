@@ -1,0 +1,429 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: postgresreplications.postgres.ourcommunity.com.au
+  annotations:
+    controller-gen.kubebuilder.io/version: "hand-written"
+    api-approved.kubernetes.io: "unapproved, internal operator CRD"
+spec:
+  group: postgres.ourcommunity.com.au
+  scope: Namespaced
+  names:
+    kind: PostgresReplication
+    listKind: PostgresReplicationList
+    plural: postgresreplications
+    singular: postgresreplication
+    shortNames: [pgrepl]
+    categories: [postgres, pg-operator]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Source
+          type: string
+          jsonPath: .status.source.display
+        - name: Target
+          type: string
+          jsonPath: .status.target.display
+        - name: Tables
+          type: string
+          jsonPath: .status.tables.display
+        - name: Lag
+          type: string
+          jsonPath: .status.health.lag
+        - name: State
+          type: string
+          jsonPath: .status.replicationState
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          description: |
+            One-way logical replication of selected tables from a PostgresDB on
+            one instance into a PostgresDB on another.
+
+            The operator owns the plumbing only: a publication and a replication
+            login on the source, a subscription (and so a slot) on the target.
+            It never creates or alters tables. Each selected table is checked
+            against the target and published only once the target can receive
+            it; the rest are reported with a remedy.
+
+            Deleting a PostgresReplication always removes the subscription, the
+            slot, the publication and the login - a slot left behind retains WAL
+            until the source's disk fills - and always keeps the replicated data.
+            retentionPolicy does not apply.
+
+            The design is docs/design/replication.md. This operator version
+            resolves and validates a replication and reports it Pending; it does
+            not yet create the publication or subscription.
+          required: [spec]
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required: [source, target]
+              x-kubernetes-validations:
+                - rule: >-
+                    (has(self.schemas) && size(self.schemas) > 0) ||
+                    (has(self.tables) && size(self.tables) > 0)
+                  message: select at least one entry in schemas or tables
+              properties:
+                source:
+                  type: object
+                  required: [dbRef]
+                  properties:
+                    dbRef:
+                      type: object
+                      required: [name]
+                      description: >-
+                        The PostgresDB replicated from. It must be on a different
+                        server from the target's.
+                      x-kubernetes-validations:
+                        - rule: "self == oldSelf"
+                          message: >-
+                            source.dbRef is immutable. Changing it would orphan the
+                            publication and slot; create a new PostgresReplication
+                            instead.
+                      properties:
+                        name:
+                          type: string
+                          maxLength: 253
+                        namespace:
+                          type: string
+                          maxLength: 253
+                          description: Defaults to this resource's namespace.
+                    connection:
+                      type: object
+                      description: >-
+                        How the target *server* reaches the source - not how the
+                        operator does. Defaults to the source instance's host and
+                        port; set it when the target resolves the source
+                        differently, e.g. through a private DNS name.
+                      x-kubernetes-validations:
+                        - rule: >-
+                            !(self.sslMode in ['verify-ca', 'verify-full']) ||
+                            has(self.sslRootCertPath)
+                          message: sslMode verify-ca and verify-full require sslRootCertPath
+                      properties:
+                        host:
+                          type: string
+                          minLength: 1
+                        port:
+                          type: integer
+                          minimum: 1
+                          maximum: 65535
+                        sslMode:
+                          type: string
+                          enum: [disable, allow, prefer, require, verify-ca, verify-full]
+                          default: require
+                        sslRootCertPath:
+                          type: string
+                          minLength: 1
+                          description: >-
+                            A CA bundle path on the target server's own
+                            filesystem. AWS documents no such path on an RDS
+                            subscriber, so require is the practical mode there.
+                    credentialsSecretRef:
+                      type: object
+                      required: [name]
+                      description: >-
+                        A pre-provisioned replication login, holding REPLICATION
+                        or rds_replication. Read, never written. Without it the
+                        operator generates a login on the source.
+                      properties:
+                        name:
+                          type: string
+                          maxLength: 253
+                        namespace:
+                          type: string
+                          maxLength: 253
+                          description: Defaults to this resource's namespace.
+                        usernameKey:
+                          type: string
+                          default: username
+                        passwordKey:
+                          type: string
+                          default: password
+                target:
+                  type: object
+                  required: [dbRef]
+                  properties:
+                    dbRef:
+                      type: object
+                      required: [name]
+                      description: >-
+                        The PostgresDB replicated into. Its tables must already
+                        exist with the published columns; the operator never
+                        creates them.
+                      x-kubernetes-validations:
+                        - rule: "self == oldSelf"
+                          message: >-
+                            target.dbRef is immutable. Changing it would orphan
+                            the subscription; create a new PostgresReplication
+                            instead.
+                      properties:
+                        name:
+                          type: string
+                          maxLength: 253
+                        namespace:
+                          type: string
+                          maxLength: 253
+                          description: Defaults to this resource's namespace.
+                schemas:
+                  type: array
+                  description: >-
+                    Publish every eligible table in these schemas, re-enumerated
+                    on every pass, so a table created later is picked up once the
+                    target has it. Each must be managed by the source PostgresDB.
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      excludeTables:
+                        type: array
+                        x-kubernetes-list-type: set
+                        items:
+                          type: string
+                          maxLength: 63
+                          pattern: '^[a-z_][a-z0-9_$]*$'
+                  x-kubernetes-list-map-keys: [name]
+                  x-kubernetes-list-type: map
+                tables:
+                  type: array
+                  description: >-
+                    Individual tables, optionally limited to some columns and
+                    rows. An entry here takes precedence over its schema's entry
+                    in schemas; a table cannot be both listed and excluded.
+                  items:
+                    type: object
+                    required: [schema, name]
+                    properties:
+                      schema:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      name:
+                        type: string
+                        maxLength: 63
+                        pattern: '^[a-z_][a-z0-9_$]*$'
+                      columns:
+                        type: array
+                        description: >-
+                          Publish only these columns. Must include every
+                          replica-identity column when update or delete is
+                          published. Empty publishes all.
+                        x-kubernetes-list-type: set
+                        items:
+                          type: string
+                          maxLength: 63
+                          pattern: '^[a-z_][a-z0-9_$]*$'
+                      rowFilter:
+                        type: object
+                        description: |
+                          Publish only matching rows: predicates joined by AND
+                          (all) or OR (any). Structured rather than SQL, so
+                          nothing written here reaches the server as SQL text.
+
+                          With update or delete published, every filtered column
+                          must be in the replica identity - otherwise the source
+                          itself refuses those writes, and the table is not
+                          published.
+                        x-kubernetes-validations:
+                          - rule: "has(self.all) != has(self.any)"
+                            message: rowFilter sets exactly one of all or any
+                        properties:
+                          all:
+                            type: array
+                            minItems: 1
+                            items: &predicate
+                              type: object
+                              required: [column, op]
+                              x-kubernetes-validations:
+                                - rule: >-
+                                    self.op == 'In'
+                                    ? has(self.values) && !has(self.value)
+                                    : (self.op in ['IsNull', 'IsNotNull']
+                                       ? !has(self.value) && !has(self.values)
+                                       : has(self.value) && !has(self.values))
+                                  message: >-
+                                    In takes values; IsNull and IsNotNull take no
+                                    operand; every other op takes value
+                              properties:
+                                column:
+                                  type: string
+                                  maxLength: 63
+                                  pattern: '^[a-z_][a-z0-9_$]*$'
+                                op:
+                                  type: string
+                                  enum: [Eq, Ne, Lt, Le, Gt, Ge, In, IsNull, IsNotNull]
+                                value:
+                                  x-kubernetes-int-or-string: true
+                                  description: >-
+                                    Compared as the column's own type, so "100"
+                                    and 100 are the same against an integer.
+                                values:
+                                  type: array
+                                  minItems: 1
+                                  items:
+                                    x-kubernetes-int-or-string: true
+                          any:
+                            type: array
+                            minItems: 1
+                            items: *predicate
+                  x-kubernetes-list-map-keys: [schema, name]
+                  x-kubernetes-list-type: map
+                publish:
+                  type: array
+                  minItems: 1
+                  description: Operations published. Without update and delete, no replica identity is needed.
+                  x-kubernetes-list-type: set
+                  default: [insert, update, delete, truncate]
+                  items:
+                    type: string
+                    enum: [insert, update, delete, truncate]
+                publishViaPartitionRoot:
+                  type: boolean
+                  default: false
+                copyData:
+                  type: boolean
+                  default: true
+                  description: Copy existing rows on create, and for every table added later.
+                enabled:
+                  type: boolean
+                  default: true
+                  description: >-
+                    False disables the subscription. The slot keeps retaining
+                    WAL on the source meanwhile, so this is for maintenance, not
+                    for parking a replication.
+                subscription:
+                  type: object
+                  description: Passed through to the subscription. Omitted means the server default.
+                  properties:
+                    streaming:
+                      type: string
+                      enum: ["off", "on", "parallel"]
+                      description: Quote it - unquoted, YAML reads on and off as booleans.
+                    binary:
+                      type: boolean
+                alerting:
+                  type: object
+                  description: Thresholds past which the replication reports itself Degraded.
+                  properties:
+                    maxLag:
+                      # Exactly this anyOf, or the schema is not structural:
+                      # a typed branch may carry nothing else, so the floor is CEL.
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      pattern: '^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$'
+                      x-kubernetes-int-or-string: true
+                      x-kubernetes-validations:
+                        - rule: "type(self) == string || self > 0"
+                          message: maxLag must be greater than zero
+                      default: 1Gi
+                      description: Bytes of WAL the target has not yet confirmed.
+                    maxRetainedWal:
+                      # Exactly this anyOf, or the schema is not structural:
+                      # a typed branch may carry nothing else, so the floor is CEL.
+                      anyOf:
+                        - type: integer
+                        - type: string
+                      pattern: '^[0-9]+(\.[0-9]+)?(Ki|Mi|Gi|Ti|Pi|k|M|G|T|P)?$'
+                      x-kubernetes-int-or-string: true
+                      x-kubernetes-validations:
+                        - rule: "type(self) == string || self > 0"
+                          message: maxRetainedWal must be greater than zero
+                      default: 10Gi
+                      description: WAL the slot keeps on the source.
+                    maxSlotInactive:
+                      type: string
+                      minLength: 2
+                      pattern: '^([0-9]+h)?([0-9]+m)?([0-9]+s)?$'
+                      default: 10m
+                      description: How long the slot may go without a consumer, e.g. 10m or 1h30m.
+                paused:
+                  type: boolean
+                  default: false
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+              properties:
+                observedGeneration: { type: integer }
+                phase: { type: string }
+                replicationState: { type: string }
+                lastReconciledAt: { type: string }
+                source:
+                  type: object
+                  description: >-
+                    The resolved source and the names of the objects on it.
+                    Names are recorded once and never re-derived.
+                  properties:
+                    instance: { type: string }
+                    database: { type: string }
+                    postgresDB: { type: string }
+                    display: { type: string }
+                    publication: { type: string }
+                    slot: { type: string }
+                    login: { type: string }
+                target:
+                  type: object
+                  properties:
+                    instance: { type: string }
+                    database: { type: string }
+                    postgresDB: { type: string }
+                    display: { type: string }
+                    subscription: { type: string }
+                tables:
+                  type: object
+                  properties:
+                    published: { type: integer }
+                    ready: { type: integer }
+                    syncing: { type: integer }
+                    excluded: { type: integer }
+                    display: { type: string }
+                excludedTables:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      table: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                health:
+                  type: object
+                  properties:
+                    observedAt: { type: string }
+                    lag: { type: string }
+                    lagBytes: { type: integer }
+                    retainedWalBytes: { type: integer }
+                    slotActive: { type: boolean }
+                    walStatus: { type: string }
+                    workerRunning: { type: boolean }
+                    applyErrorCount: { type: integer }
+                    syncErrorCount: { type: integer }
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required: [type, status]
+                    properties:
+                      type: { type: string }
+                      status: { type: string }
+                      reason: { type: string }
+                      message: { type: string }
+                      lastTransitionTime: { type: string }
+                      observedGeneration: { type: integer }

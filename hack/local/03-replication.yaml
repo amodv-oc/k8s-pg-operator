@@ -1,0 +1,96 @@
+# Replication across versions: each logical server's orders database into a
+# replica database on the next one - 16 -> 17, 17 -> 18, 18 -> 16.
+#
+# The targets are dedicated replica databases, never another server's orders:
+# routing orders-18 back into orders-16 would close a loop, which the operator
+# refuses because changes would be republished round it until apply stalls.
+#
+# Until the reconciler creates publications and subscriptions, these resolve,
+# validate and report Pending.
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-replica-17
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg17
+  databaseName: orders_replica
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-replica-18
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg18
+  databaseName: orders_replica
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-replica-16
+  namespace: team-a
+spec:
+  instanceRef:
+    name: pg16
+  databaseName: orders_replica
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresReplication
+metadata:
+  name: orders-16-to-17
+  namespace: team-a
+spec:
+  source:
+    dbRef:
+      name: orders-16
+  target:
+    dbRef:
+      name: orders-replica-17
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresReplication
+metadata:
+  name: orders-17-to-18
+  namespace: team-a
+spec:
+  source:
+    dbRef:
+      name: orders-17
+  target:
+    dbRef:
+      name: orders-replica-18
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresReplication
+metadata:
+  name: orders-18-to-16
+  namespace: team-a
+spec:
+  source:
+    dbRef:
+      name: orders-18
+  target:
+    dbRef:
+      name: orders-replica-16
+  schemas:
+    - name: public
+    - name: audit

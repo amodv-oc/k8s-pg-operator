@@ -204,6 +204,7 @@ local-up: build ui-image ## Build, start PostgreSQL 14-18 in-cluster, install th
 	  --set reconcile.interval=60 --set reconcile.idle=5 \
 	  --wait --timeout 3m
 	kubectl apply -f $(LOCAL_DIR)/02-workload.yaml
+	kubectl apply -f $(LOCAL_DIR)/03-replication.yaml
 	@echo
 	@echo "applied; run 'make local-status' once the timers have fired"
 
@@ -222,6 +223,8 @@ local-status: ## Phases for every managed resource
 	@kubectl get postgresdbs -n team-a
 	@echo
 	@kubectl get postgresusers -n team-a
+	@echo
+	@kubectl get postgresreplications -n team-a
 
 .PHONY: local-verify
 local-verify: ## Connect as each generated user and assert its privileges
@@ -255,6 +258,7 @@ local-ui: ## Port-forward the dashboard to localhost:8081
 
 .PHONY: local-down
 local-down: ## Remove the operator, the servers and their namespaces
+	-kubectl delete -f $(LOCAL_DIR)/03-replication.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/02-workload.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/01-instances.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/00-servers.yaml --ignore-not-found

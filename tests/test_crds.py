@@ -9,13 +9,14 @@ either half alone, so they are compared here.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args, get_origin
 
 import pytest
 import yaml
+from pydantic import BaseModel
 
 from pg_operator.constants import API_GROUP, API_VERSION
-from pg_operator.models import DatabaseSpec, InstanceSpec, UserSpec
+from pg_operator.models import DatabaseSpec, InstanceSpec, ReplicationSpec, UserSpec
 
 CRD_DIR = Path(__file__).resolve().parents[1] / "charts" / "pg-operator" / "crds"
 
@@ -23,6 +24,7 @@ CASES = [
     ("postgresinstances.yaml", "PostgresInstance", InstanceSpec, "Cluster"),
     ("postgresdbs.yaml", "PostgresDB", DatabaseSpec, "Namespaced"),
     ("postgresusers.yaml", "PostgresUser", UserSpec, "Namespaced"),
+    ("postgresreplications.yaml", "PostgresReplication", ReplicationSpec, "Namespaced"),
 ]
 
 
@@ -217,3 +219,152 @@ def test_status_conditions_follow_the_kubernetes_shape(
     assert set(conditions["items"]["required"]) == {"type", "status"}
     for field in ("type", "status", "reason", "message", "lastTransitionTime"):
         assert field in properties
+
+
+# --- PostgresReplication ----------------------------------------------------
+#
+# Its spec nests four levels deep, where the top-level comparisons above cannot
+# see, so the model and the CRD are walked together at every depth.
+
+
+def _spec_model(annotation: Any) -> type[BaseModel] | None:
+    """The Spec model a field holds, through Optional and list, if any."""
+    for candidate in (annotation, *get_args(annotation)):
+        if isinstance(candidate, type) and issubclass(candidate, BaseModel):
+            return candidate
+        if get_origin(candidate) is list:
+            nested = _spec_model(get_args(candidate)[0])
+            if nested is not None:
+                return nested
+    return None
+
+
+def _walk(model: type[BaseModel], schema: dict[str, Any], path: str) -> list[str]:
+    problems: list[str] = []
+    properties = schema.get("properties") or {}
+    fields = {(field.alias or name): field for name, field in model.model_fields.items()}
+    for missing in sorted(set(fields) - set(properties)):
+        problems.append(f"{path}.{missing}: in the model, not the CRD")
+    for unknown in sorted(set(properties) - set(fields)):
+        problems.append(f"{path}.{unknown}: in the CRD, not the model")
+    for wire, field in fields.items():
+        nested = _spec_model(field.annotation)
+        if nested is None or wire not in properties:
+            continue
+        child = properties[wire]
+        child = child.get("items", child) if child.get("type") == "array" else child
+        problems.extend(_walk(nested, child, f"{path}.{wire}"))
+    return problems
+
+
+def replication_spec_schema() -> dict[str, Any]:
+    version = load("postgresreplications.yaml")["spec"]["versions"][0]
+    return version["schema"]["openAPIV3Schema"]["properties"]["spec"]
+
+
+def test_replication_crd_matches_the_model_at_every_depth() -> None:
+    assert _walk(ReplicationSpec, replication_spec_schema(), "spec") == []
+
+
+def test_replication_enums_match_the_model() -> None:
+    from pg_operator.models import FilterOperator, PublishOperation, SubscriptionStreaming
+
+    spec = replication_spec_schema()["properties"]
+    predicate = spec["tables"]["items"]["properties"]["rowFilter"]["properties"]["all"]["items"]
+    assert predicate["properties"]["op"]["enum"] == list(get_args(FilterOperator))
+    assert spec["publish"]["items"]["enum"] == list(get_args(PublishOperation))
+    streaming = spec["subscription"]["properties"]["streaming"]["enum"]
+    # A YAML 1.1 parser reads bare on/off as booleans; the CRD must quote them.
+    assert streaming == list(get_args(SubscriptionStreaming))
+    assert all(isinstance(value, str) for value in streaming)
+
+
+def test_replication_defaults_match_the_model() -> None:
+    spec = replication_spec_schema()["properties"]
+    model = ReplicationSpec.model_validate(
+        {"source": {"dbRef": {"name": "a"}}, "target": {"dbRef": {"name": "b"}}, "schemas": [{"name": "public"}]}
+    )
+    assert spec["publish"]["default"] == model.publish
+    alerting = spec["alerting"]["properties"]
+    assert alerting["maxLag"]["default"] == model.alerting.max_lag
+    assert alerting["maxRetainedWal"]["default"] == model.alerting.max_retained_wal
+    assert alerting["maxSlotInactive"]["default"] == model.alerting.max_slot_inactive
+    assert spec["source"]["properties"]["connection"]["properties"]["sslMode"]["default"] == (
+        model.source.connection.ssl_mode
+    )
+
+
+def test_replication_quantity_and_duration_patterns_match_the_parsers() -> None:
+    from pg_operator.units import DURATION_PATTERN, QUANTITY_PATTERN
+
+    alerting = replication_spec_schema()["properties"]["alerting"]["properties"]
+    assert alerting["maxLag"]["pattern"] == QUANTITY_PATTERN
+    assert alerting["maxRetainedWal"]["pattern"] == QUANTITY_PATTERN
+    assert alerting["maxSlotInactive"]["pattern"] == DURATION_PATTERN
+
+
+def test_replication_ends_are_immutable() -> None:
+    """Re-pointing a replication would orphan its publication, slot or subscription."""
+    spec = replication_spec_schema()["properties"]
+    for side in ("source", "target"):
+        db_ref = spec[side]["properties"]["dbRef"]
+        assert any(rule["rule"] == "self == oldSelf" for rule in db_ref["x-kubernetes-validations"])
+
+
+def test_replication_selections_are_keyed_maps() -> None:
+    """The API server then rejects a duplicate schema or table itself."""
+    spec = replication_spec_schema()["properties"]
+    assert spec["schemas"]["x-kubernetes-list-type"] == "map"
+    assert spec["schemas"]["x-kubernetes-list-map-keys"] == ["name"]
+    assert spec["tables"]["x-kubernetes-list-type"] == "map"
+    assert spec["tables"]["x-kubernetes-list-map-keys"] == ["schema", "name"]
+    for key in spec["tables"]["x-kubernetes-list-map-keys"]:
+        assert key in spec["tables"]["items"]["required"]
+
+
+def test_replication_admission_rules_cover_what_the_model_refuses() -> None:
+    """Each cross-field rule the model enforces has a CEL counterpart.
+
+    CEL cannot be evaluated here; `make local-up` proves the rules compile and
+    bite. This proves none has been dropped.
+    """
+    spec = replication_spec_schema()
+    connection = spec["properties"]["source"]["properties"]["connection"]
+    row_filter = spec["properties"]["tables"]["items"]["properties"]["rowFilter"]
+    predicate = row_filter["properties"]["all"]["items"]
+
+    def rules(node: dict[str, Any]) -> str:
+        return " ".join(rule["rule"] for rule in node.get("x-kubernetes-validations", []))
+
+    assert "size(self.schemas)" in rules(spec) and "size(self.tables)" in rules(spec)
+    assert "sslRootCertPath" in rules(connection)
+    assert "has(self.all) != has(self.any)" in rules(row_filter)
+    assert "'In'" in rules(predicate) and "IsNull" in rules(predicate)
+
+
+def _schemas_with_any_of(node: Any, path: str = "") -> list[tuple[str, dict[str, Any]]]:
+    found: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(node, dict):
+        if "anyOf" in node:
+            found.append((path, node))
+        for key, value in node.items():
+            found.extend(_schemas_with_any_of(value, f"{path}.{key}"))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            found.extend(_schemas_with_any_of(value, f"{path}[{index}]"))
+    return found
+
+
+@pytest.mark.parametrize(("filename", "kind", "model", "scope"), CASES)
+def test_any_of_is_only_the_structural_int_or_string_form(
+    filename: str, kind: str, model: type, scope: str
+) -> None:
+    """The API server refuses a CRD whose anyOf branches carry anything but a type.
+
+    `minimum: 1` inside the integer branch made the whole CRD non-structural -
+    found only by `make local-up`. Constraints belong beside the anyOf, or in CEL.
+    """
+    del kind, model, scope
+    for path, node in _schemas_with_any_of(load(filename)):
+        assert node["anyOf"] == [{"type": "integer"}, {"type": "string"}], path
+        assert node.get("x-kubernetes-int-or-string") is True, path

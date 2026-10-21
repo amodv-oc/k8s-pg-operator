@@ -22,7 +22,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
@@ -36,7 +36,7 @@ jobs:
         run: uv run mypy src/pg_operator
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -81,7 +81,7 @@ jobs:
     # pair is started the way `make test-setup` starts it. 16 is the floor; the
     # mixed pairs cover a newer target and a newer source.
     name: replication (${{ matrix.source }} → ${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -111,7 +111,7 @@ jobs:
         run: uv run pytest -m replication -rA
 
   ui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui
@@ -129,7 +129,7 @@ jobs:
         run: npm run build
 
   chart:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
@@ -182,7 +182,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -342,7 +342,7 @@ jobs:
 
   image-manifest:
     needs: image-push
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write

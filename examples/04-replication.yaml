@@ -1,0 +1,92 @@
+# One-way logical replication of team-a's orders database (prod-rds) into a
+# reporting copy on a second instance.
+#
+# The operator owns the plumbing: a publication and a replication login on
+# prod-rds, a subscription - and so a replication slot - on reporting-rds. It
+# never creates tables. Each selected table must already exist on the target
+# with the published columns; until it does, it is listed in
+# status.excludedTables with a remedy, and everything else replicates.
+#
+# Prerequisites the operator reads but cannot set (see each instance's
+# status.logicalReplication):
+#   - prod-rds: rds.logical_replication = 1 in its parameter group (a reboot),
+#     and max_slot_wal_keep_size set, so a stalled subscriber cannot fill its disk.
+#   - reporting-rds must be able to reach prod-rds over the network.
+#
+# Deleting the PostgresReplication removes the subscription, slot, publication
+# and login, and keeps every replicated row. retentionPolicy does not apply.
+#
+# This operator version validates the replication and reports it Pending; the
+# publication and subscription arrive in a later release.
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresInstance
+metadata:
+  name: reporting-rds
+spec:
+  host: reporting.abc123ghi.ap-southeast-2.rds.amazonaws.com
+  credentialsSecretRef:
+    name: reporting-rds-superuser
+    namespace: pg-operator
+  sslMode: require
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresDB
+metadata:
+  name: orders-replica
+  namespace: analytics
+spec:
+  instanceRef:
+    name: reporting-rds
+  databaseName: orders_replica
+  schemas:
+    - name: public
+    - name: audit
+---
+apiVersion: postgres.ourcommunity.com.au/v1alpha1
+kind: PostgresReplication
+metadata:
+  name: orders-to-reporting
+  # prod-rds admits team-a and team-b only. A replication's namespace must be
+  # admitted by the instances at both ends.
+  namespace: team-a
+spec:
+  source:
+    dbRef:
+      name: orders
+    # How reporting-rds reaches prod-rds, which need not be how the operator
+    # does. Omitted, it is prod-rds's own host and port.
+    connection:
+      host: prod-rds.internal.example.com
+      sslMode: require
+  target:
+    dbRef:
+      name: orders-replica
+      namespace: analytics
+
+  # Every eligible table in audit, now and as tables are added - except one.
+  # Each schema must be managed by the source PostgresDB.
+  schemas:
+    - name: audit
+      excludeTables: [raw_events]
+
+  # One table from public, limited to some columns and rows. Its primary key
+  # is (region, id): with updates and deletes published, the column list must
+  # include it and a filter may only read it - otherwise the source itself
+  # would refuse those writes, so the operator holds such a table back.
+  tables:
+    - schema: public
+      name: orders
+      columns: [region, id, customer_id, total, created_at]
+      rowFilter:
+        all:
+          - { column: region, op: In, values: [AU, NZ] }
+
+  subscription:
+    streaming: "parallel"   # quoted: unquoted, YAML reads on and off as booleans
+
+  # The replication reports Degraded past these.
+  alerting:
+    maxLag: 512Mi
+    maxRetainedWal: 20Gi
+    maxSlotInactive: 15m

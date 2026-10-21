@@ -14,7 +14,12 @@ import pytest
 import yaml
 
 from pg_operator.constants import API_GROUP, API_VERSION
-from pg_operator.models import parse_database_spec, parse_instance_spec, parse_user_spec
+from pg_operator.models import (
+    parse_database_spec,
+    parse_instance_spec,
+    parse_replication_spec,
+    parse_user_spec,
+)
 
 EXAMPLES = Path(__file__).resolve().parents[1] / "examples"
 
@@ -22,6 +27,7 @@ PARSERS = {
     "PostgresInstance": parse_instance_spec,
     "PostgresDB": parse_database_spec,
     "PostgresUser": parse_user_spec,
+    "PostgresReplication": parse_replication_spec,
 }
 
 
@@ -59,7 +65,7 @@ def test_example_uses_the_current_api_version(name: str, doc: dict[str, Any]) ->
 def test_namespaced_examples_declare_a_namespace(
     name: str, doc: dict[str, Any]
 ) -> None:
-    """PostgresInstance is cluster-scoped; the other two are not."""
+    """PostgresInstance is cluster-scoped; the other kinds are not."""
     del name
     metadata = doc["metadata"]
     if doc["kind"] == "PostgresInstance":
@@ -114,10 +120,41 @@ def test_referenced_instances_exist_in_the_examples() -> None:
         doc["metadata"]["name"] for _, doc in OURS if doc["kind"] == "PostgresInstance"
     }
     for name, doc in OURS:
-        if doc["kind"] == "PostgresInstance":
+        if doc["kind"] in {"PostgresInstance", "PostgresReplication"}:
             continue
         referenced = doc["spec"]["instanceRef"]["name"]
         assert referenced in instances, f"{name} references unknown instance {referenced}"
+
+
+def test_replication_examples_would_resolve() -> None:
+    """The checks the reconciler makes first, applied to the examples.
+
+    Both PostgresDBs exist, sit on different instances, both instances admit
+    the replication's namespace, and every selected schema is managed by the
+    source - so the example would reach Pending rather than Failed.
+    """
+    instances = {
+        doc["metadata"]["name"]: parse_instance_spec(doc["spec"])
+        for _, doc in OURS
+        if doc["kind"] == "PostgresInstance"
+    }
+    databases = {
+        (doc["metadata"]["namespace"], doc["metadata"]["name"]): parse_database_spec(doc["spec"])
+        for _, doc in OURS
+        if doc["kind"] == "PostgresDB"
+    }
+    replications = [(name, doc) for name, doc in OURS if doc["kind"] == "PostgresReplication"]
+    assert replications, "no PostgresReplication example"
+    for name, doc in replications:
+        namespace = doc["metadata"]["namespace"]
+        spec = parse_replication_spec(doc["spec"])
+        source = databases[(spec.source.db_ref.resolve_namespace(namespace), spec.source.db_ref.name)]
+        target = databases[(spec.target.db_ref.resolve_namespace(namespace), spec.target.db_ref.name)]
+        assert source.instance_ref.name != target.instance_ref.name, name
+        for database in (source, target):
+            assert instances[database.instance_ref.name].permits_namespace(namespace), name
+        managed = {schema.name for schema in source.resolve_schemas()}
+        assert spec.selected_schemas <= managed, name
 
 
 def test_no_example_contains_a_literal_password() -> None:

@@ -6,6 +6,6 @@ Importing this package registers every kopf handler. ``kopf run`` is pointed at
 
 from __future__ import annotations
 
-from . import database, instance, startup, user
+from . import database, instance, replication, startup, user
 
-__all__ = ["database", "instance", "startup", "user"]
+__all__ = ["database", "instance", "replication", "startup", "user"]

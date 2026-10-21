@@ -11,6 +11,9 @@ PostgresDB         a database, its schemas, extensions, roles     (namespaced)
 PostgresUser       a login role and the access it holds           (namespaced)
 ```
 
+A fourth, `PostgresReplication`, replicates selected tables between instances.
+It is arriving in increments; see [PostgresReplication](#postgresreplication-namespaced-preview).
+
 ## Table of contents
 
 - [How it works](#how-it-works)
@@ -540,6 +543,38 @@ neither it nor the API authenticates. Gate it at the ingress.
 | `passwordLength` | `32` | 16–128 |
 | `generatedSecret` | — | `name`, `namespace`, `keys`, `labels`, `annotations`, `includeUri`, `defaultDatabase` |
 | `pushSecret` | inherits instance | Overrides the instance default |
+
+### PostgresReplication (namespaced, preview)
+
+One-way logical replication of selected tables from a `PostgresDB` on one
+instance into a `PostgresDB` on another. The design is
+[`docs/design/replication.md`](docs/design/replication.md).
+
+**Preview:** this version resolves and validates a replication and reports it
+`Pending`. It does not yet create the publication or the subscription. Each
+step below is checked now, so a `PostgresReplication` that reaches `Pending`
+will be accepted by the version that does replicate:
+
+- both `PostgresDB`s exist and are on different servers;
+- both instances admit the replication's namespace;
+- every selected schema is managed by the source `PostgresDB`;
+- the replication would not close a loop of replications. A subscription
+  republishes what it applies, so a cycle of any length sends changes round
+  until apply stalls.
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `source.dbRef`, `target.dbRef` | — | `name`, `namespace`. Immutable |
+| `source.connection` | the source instance's | `host`, `port`, `sslMode` (`require`), `sslRootCertPath`. How the target *server* reaches the source |
+| `source.credentialsSecretRef` | generated | A pre-provisioned replication login; read, never written |
+| `schemas[]` | — | `name`, `excludeTables`. Every eligible table, re-enumerated each pass |
+| `tables[]` | — | `schema`, `name`, `columns`, `rowFilter`. At least one of `schemas`/`tables` |
+| `rowFilter` | — | `all` (AND) or `any` (OR) of `{column, op, value \| values}`; `op` is `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. Never SQL text |
+| `publish` | all four | `insert`, `update`, `delete`, `truncate` |
+| `publishViaPartitionRoot`, `copyData`, `enabled` | `false`, `true`, `true` | |
+| `subscription` | server defaults | `streaming` (`"off"`/`"on"`/`"parallel"` — quote them), `binary` |
+| `alerting` | `1Gi`, `10Gi`, `10m` | `maxLag`, `maxRetainedWal`, `maxSlotInactive` |
+| `paused` | `false` | |
 
 ## Operating notes
 

@@ -77,6 +77,16 @@ def not_ready(reason: str, message: str, generation: int | None = None) -> dict[
     return condition(COND_READY, "False", reason, message, observed_generation=generation)
 
 
+def pending(reason: str, message: str, generation: int | None = None) -> dict[str, Any]:
+    """Nothing is wrong, but readiness cannot be decided yet - phase ``Pending``.
+
+    ``Unknown`` rather than ``False``: a pass that failed is ``Failed``, while
+    this one simply has more to do than it can do yet. Written explicitly, it
+    also replaces a ``False`` left behind by an earlier, failed pass.
+    """
+    return condition(COND_READY, "Unknown", reason, message, observed_generation=generation)
+
+
 def reachable(message: str, generation: int | None = None) -> dict[str, Any]:
     return condition(
         COND_REACHABLE, "True", "Connected", message, observed_generation=generation
@@ -135,6 +145,8 @@ def phase_from_conditions(conditions: list[dict[str, Any]]) -> str:
         if drift is not None and drift.get("status") == "True":
             return "Drifted"
         return "Ready"
+    if ready_cond.get("status") == "Unknown":
+        return "Pending"
     if ready_cond.get("reason") in {"Paused"}:
         return "Paused"
     if by_type.get(COND_REACHABLE, {}).get("status") == "False":

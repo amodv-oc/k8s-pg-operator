@@ -45,6 +45,7 @@ distinguishable from one on a real cluster, and the poll interval is dropped to
 | `00-servers.yaml` | The five servers, the RDS-like bootstrap SQL, and the `rds_replication` shim |
 | `01-instances.yaml` | Namespaces, credential Secrets, one `PostgresInstance` per server |
 | `02-workload.yaml` | The same `PostgresDB` + three `PostgresUser` shapes on every server |
+| `03-replication.yaml` | Replica databases, and replications 16 → 17, 17 → 18 and 18 → 16 between them |
 | `verify.sh` | Connects as each generated user and asserts what it may and may not do |
 
 Applying the identical workload to every version is deliberate: any behavioural
@@ -111,6 +112,13 @@ pg18       logical     Granted       rds_replication     0
 `Assumed` on 14 and 15 is the RDS answer. Those servers have no
 `pg_create_subscription`, so the probe falls back to what `rds_superuser` is
 documented to do.
+
+`03-replication.yaml` replicates each logical server's `orders` into a
+dedicated `orders_replica` database on the next version. The replicas are
+deliberately not another server's `orders`: 18 → 16 into `orders-16` would
+close a loop, which the operator refuses. In this preview the three
+`PostgresReplication`s resolve, validate and show `Pending`. Their status
+already names the publication, slot and login they will create.
 
 The bootstrap SQL in `00-servers.yaml` is `hack/rds-like.sql` verbatim, plus
 one local-only script for `GRANT SET ON PARAMETER`. `tests/test_harness.py`

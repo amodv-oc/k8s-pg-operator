@@ -40,3 +40,8 @@ annotations:
       name: postgresusers.postgres.ourcommunity.com.au
       displayName: Postgres User
       description: A login role, its grants and its generated credentials Secret.
+    - kind: PostgresReplication
+      version: v1alpha1
+      name: postgresreplications.postgres.ourcommunity.com.au
+      displayName: Postgres Replication
+      description: One-way logical replication of selected tables between two instances.

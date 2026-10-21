@@ -2,7 +2,7 @@
 
 | | |
 | --- | --- |
-| Status | Accepted 2026-10-21, D1–D11 included. PR 1 (prerequisites and harness) in progress |
+| Status | Accepted 2026-10-21, D1–D11 included. PR 1 (prerequisites and harness) built; PR 2 (the resource, resolve-and-validate) in progress |
 | Date | 2026-10-21 |
 | Scope | Long-lived, one-way logical replication from a database on one `PostgresInstance` into a database on another |
 
@@ -214,7 +214,7 @@ spec:
 | `source.connection.sslMode` | `require` | `verify-ca`/`verify-full` also need `sslRootCertPath`, a path **on the target server's filesystem**. See D11 |
 | `source.credentialsSecretRef` | — | Bring your own replication login, pre-provisioned with the replication privilege. Read only, never written. See D9 |
 | `schemas[]` | `[]` | `name`, `excludeTables[]`. Every eligible table in the schema is published. The list is re-enumerated on every pass, so a new table is picked up automatically once it qualifies |
-| `tables[]` | `[]` | `schema`, `name`, optional `columns[]` and `rowFilter`. An explicit entry overrides the table's `schemas[]` membership |
+| `tables[]` | `[]` | `schema`, `name`, optional `columns[]` and `rowFilter`. An explicit entry overrides the table's `schemas[]` membership. A table both listed here and excluded in `schemas[]` is refused as contradictory |
 | `rowFilter` | — | `all:` (AND) or `any:` (OR), one level deep. Each predicate is `{column, op, value \| values}`. `op` is one of `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. See D2 |
 | `publish` | all four | Subset of `insert`, `update`, `delete`, `truncate` |
 | `publishViaPartitionRoot` | `false` | Passed through to the publication |
@@ -238,7 +238,9 @@ non-superuser owner.
 - No `(schema, name)` appears twice in `tables`. No schema appears twice in
   `schemas`.
 - `rowFilter` sets exactly one of `all` or `any`. `values` is set for `In` only,
-  and `value` is set for every other operator except the null tests.
+  and `value` is set for every other operator except the null tests. Operands
+  are int-or-string. A YAML boolean is refused rather than coerced, because a
+  literal of unknown type is compared as the column's own type.
 - Identifier fields match the pattern the other CRDs already use.
 
 ### Checks the reconciler makes
@@ -251,26 +253,39 @@ These are reported as **permanent** errors:
 - A `schemas[]` or `tables[]` entry names a schema that is not managed by the
   source `PostgresDB`. The replication login reads through `<db>_ro`, which
   holds grants only on managed schemas.
-- The reverse replication exists: a `PostgresReplication` whose source is this
-  one's target and whose target is this one's source.
+- The replication would close a **cycle of any length**. A subscription
+  republishes what it applies, so A→B→C→A loops changes just as A→B beside B→A
+  does, until apply stalls on a duplicate key. The graph's nodes are physical
+  databases (`host`, `port`, database name), so two `PostgresDB`s naming one
+  database cannot hide a loop. A replication that is being deleted, or cannot
+  resolve, adds no edge. The check is at database level, so two databases
+  exchanging *disjoint* tables are refused too. That is consistent with the
+  non-goal of bidirectional replication.
 
 ## What the operator creates
 
 | Object | Where | Name | Created by |
 | --- | --- | --- | --- |
-| Replication login | source server | `{rolePrefix}pgop_repl_{ns}_{name}` | operator, unless `credentialsSecretRef` is set |
-| Credentials Secret | operator namespace | `pgop-repl-{ns}-{name}` | operator, for a generated login only |
-| Publication | source database | `pgop_{rolePrefix}{ns}_{name}` | operator |
+| Replication login | source server | `{rolePrefix}pgop_repl_{ns}_{name}_{hash}` | operator, unless `credentialsSecretRef` is set |
+| Credentials Secret | operator namespace | `pgop-repl.{ns}.{name}` | operator, for a generated login only |
+| Publication | source database | `pgop_{rolePrefix}{ns}_{name}_{hash}` | operator |
 | Slot | source server | same as the subscription | `CREATE SUBSCRIPTION` |
-| Subscription | target database | `pgop_{rolePrefix}{ns}_{name}` | operator |
+| Subscription | target database | `pgop_{rolePrefix}{ns}_{name}_{hash}` | operator |
 
 Naming rules:
 
-- **Name construction.** Every name goes through `naming.sanitize_identifier`,
-  which truncates to 63 bytes and adds a hash suffix. The `pgop_` prefix keeps
-  slot names out of RDS's reserved `rds*` namespace and away from `pg_`.
-  Including `rolePrefix` keeps two environments that share a source server
-  from colliding.
+- **Name construction** (`naming.replication_names`).
+  - **The hash.** Mapping `-` and `.` to `_` loses the boundary between
+    namespace and name, so `team-a/x` and `team/a-x` would sanitise alike. Every
+    identifier therefore ends in an 8-character hash of the exact
+    `rolePrefix`/namespace/name. The readable part is truncated so the whole
+    name fits in 63 bytes.
+  - **The Secret name.** A namespace is a DNS label and cannot contain a dot,
+    so `pgop-repl.{ns}.{name}` is unambiguous without a hash. One is added only
+    if the name would exceed 253 characters.
+  - **Prefixes.** The `pgop_` prefix keeps slot names out of RDS's reserved
+    `rds*` namespace and away from `pg_`. Including `rolePrefix` keeps two
+    environments that share a source server from colliding.
 - **Names are recorded, not re-derived.** Each name is written to status when
   the object is created. Every later pass and the teardown use the recorded
   name, so a future change to the naming scheme cannot orphan an object.
@@ -755,7 +770,7 @@ Each PR updates `README.md` for what it ships.
 | PR | Scope | Exit criteria |
 | --- | --- | --- |
 | 1 | Prerequisites: the instance's `logicalReplication` status block; harness and CI changes (second server, `wal_level`, bootstrap grants, shim) | Capabilities reported correctly on 14–18; existing suites green, unchanged |
-| 2 | CRD, models, naming, row-filter DSL, chart (CRD, RBAC, aggregation, values), example. Handlers registered but reporting `Pending` | `test_crds`/`test_models`/`test_examples`; CEL rules verified with `make local-up` |
+| 2 | CRD, models, naming, row-filter DSL, chart (CRD, RBAC, aggregation), example. Handlers registered; step 1 (Resolve) implemented in full, including the cycle check; status `Pending` via `Ready=Unknown` | `test_crds`/`test_examples`, spec and reconcile unit tests; CEL rules verified with `make local-up` |
 | 3 | Source side: login, Secret, table resolution, eligibility, publication convergence | Integration: publication contents and exclusions proven against a real server |
 | 4 | Target side: subscription, refresh, connection fingerprint, enable/disable; teardown; `PostgresDB` teardown ordering | Integration: end-to-end flow, steady-state no-op, all teardown scenarios |
 | 5 | Health: observation, `status.health`, `Streaming` condition, `Degraded` phase, metrics, `PrometheusRule` | Integration: lag, stall and lost-slot states produced on demand |

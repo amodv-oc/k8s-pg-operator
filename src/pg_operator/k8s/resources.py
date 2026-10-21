@@ -10,6 +10,7 @@ from ..constants import (
     API_VERSION,
     PLURAL_DATABASE,
     PLURAL_INSTANCE,
+    PLURAL_REPLICATION,
     PLURAL_USER,
 )
 from ..errors import InstanceNotFound, ReferenceNotFound
@@ -65,6 +66,12 @@ async def list_databases(
 
 async def list_users(k8s: K8sClient, namespace: str | None = None) -> list[dict[str, Any]]:
     return await _list_namespaced(k8s, PLURAL_USER, namespace)
+
+
+async def list_replications(
+    k8s: K8sClient, namespace: str | None = None
+) -> list[dict[str, Any]]:
+    return await _list_namespaced(k8s, PLURAL_REPLICATION, namespace)
 
 
 async def _list_namespaced(

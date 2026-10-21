@@ -12,12 +12,14 @@ rules:
       - postgresinstances
       - postgresdbs
       - postgresusers
+      - postgresreplications
     verbs: [get, list, watch, patch, update]
   - apiGroups: [postgres.ourcommunity.com.au]
     resources:
       - postgresinstances/status
       - postgresdbs/status
       - postgresusers/status
+      - postgresreplications/status
     verbs: [get, patch, update]
   # Finalizers gate the retention policy, so they must be writable.
   - apiGroups: [postgres.ourcommunity.com.au]
@@ -25,6 +27,7 @@ rules:
       - postgresinstances/finalizers
       - postgresdbs/finalizers
       - postgresusers/finalizers
+      - postgresreplications/finalizers
     verbs: [update, patch]
 
   # --- secrets, cluster-wide ------------------------------------------------
@@ -142,7 +145,7 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-view: "true"
 rules:
   - apiGroups: [postgres.ourcommunity.com.au]
-    resources: [postgresinstances, postgresdbs, postgresusers]
+    resources: [postgresinstances, postgresdbs, postgresusers, postgresreplications]
     verbs: [get, list, watch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -154,7 +157,7 @@ metadata:
     rbac.authorization.k8s.io/aggregate-to-edit: "true"
 rules:
   - apiGroups: [postgres.ourcommunity.com.au]
-    resources: [postgresdbs, postgresusers]
+    resources: [postgresdbs, postgresusers, postgresreplications]
     verbs: [get, list, watch, create, update, patch, delete]
 {{- end }}
 {{- end }}
