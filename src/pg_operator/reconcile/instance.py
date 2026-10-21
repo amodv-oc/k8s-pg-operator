@@ -13,11 +13,12 @@ from typing import Any
 
 from .. import status as st
 from ..constants import PLURAL_INSTANCE
-from ..errors import ConfigurationError, ConnectionFailure, OperatorError
+from ..errors import ConfigurationError, ConnectionFailure, OperatorError, ReconcileFailure
 from ..k8s.pushsecret import crd_available
 from ..k8s.resources import list_databases, list_users
 from ..models import parse_instance_spec
-from .context import ReconcileContext
+from ..postgres.replication import describe_logical_replication
+from .context import ReconcileContext, ResolvedInstance
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +129,9 @@ async def reconcile_instance(
     }
     if push_secrets_available is not None:
         instance_status["pushSecretsAvailable"] = push_secrets_available
+    logical_replication = await _probe_logical_replication(ctx, instance)
+    if logical_replication is not None:
+        instance_status["logicalReplication"] = logical_replication
 
     return InstanceResult(
         reachable=True,
@@ -183,6 +187,24 @@ async def _probe_push_secret_crd(ctx: ReconcileContext) -> bool:
     except Exception as exc:  # noqa: BLE001 - a probe failure is not a reconcile failure
         log.debug("PushSecret CRD probe failed: %s", exc)
         return False
+
+
+async def _probe_logical_replication(
+    ctx: ReconcileContext, instance: ResolvedInstance
+) -> dict[str, Any] | None:
+    """Report what a replication on this server would need, or None if unreadable.
+
+    Informational only - an instance no replication uses has nothing to fix -
+    so a probe failure is logged and leaves the block out rather than failing
+    the instance.
+    """
+    try:
+        async with ctx.connect(instance) as conn:
+            info = await describe_logical_replication(conn, instance.server)
+    except (ConnectionFailure, ReconcileFailure) as exc:
+        log.warning("instance %s: logical replication probe failed: %s", instance.name, exc)
+        return None
+    return info.as_status()
 
 
 def build_status(

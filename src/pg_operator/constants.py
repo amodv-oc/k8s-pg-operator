@@ -10,10 +10,12 @@ API_VERSION: Final = "v1alpha1"
 KIND_INSTANCE: Final = "PostgresInstance"
 KIND_DATABASE: Final = "PostgresDB"
 KIND_USER: Final = "PostgresUser"
+KIND_REPLICATION: Final = "PostgresReplication"
 
 PLURAL_INSTANCE: Final = "postgresinstances"
 PLURAL_DATABASE: Final = "postgresdbs"
 PLURAL_USER: Final = "postgresusers"
+PLURAL_REPLICATION: Final = "postgresreplications"
 
 FINALIZER: Final = f"{API_GROUP}/finalizer"
 

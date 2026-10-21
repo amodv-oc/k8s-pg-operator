@@ -1,8 +1,9 @@
 # pg-operator development tasks.
 #
 # Integration tests need a live PostgreSQL server reachable via PGOP_TEST_DSN.
-# `make test-setup` starts one configured like RDS: the managing role is a
-# member of rds_superuser with CREATEDB and CREATEROLE, but is not a superuser.
+# `make test-setup` starts two configured like RDS - the managing role is a
+# member of rds_superuser with CREATEDB and CREATEROLE, but is not a superuser -
+# a source and a target, so logical replication can be tested between them.
 
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
@@ -13,10 +14,12 @@ TAG         ?= dev
 UI_DIR      := ui
 CHART       := charts/pg-operator
 NAMESPACE   ?= pg-operator
-PG_CONTAINER?= pgop-test
 PG_PORT     ?= 15432
 PG_IMAGE    ?= postgres:16-alpine
-TEST_DSN    := host=localhost port=$(PG_PORT) user=pgadmin password=adminpw dbname=postgres sslmode=disable
+PG_TARGET_PORT  ?= 15433
+PG_TARGET_IMAGE ?= $(PG_IMAGE)
+TEST_SERVERS := SOURCE_IMAGE=$(PG_IMAGE) TARGET_IMAGE=$(PG_TARGET_IMAGE) \
+                SOURCE_PORT=$(PG_PORT) TARGET_PORT=$(PG_TARGET_PORT) hack/test-servers.sh
 
 .PHONY: help
 help: ## Show this help
@@ -45,32 +48,22 @@ test: ## Unit tests (integration tests skip without PGOP_TEST_DSN)
 	uv run pytest
 
 .PHONY: test-setup
-test-setup: ## Start a PostgreSQL container with an RDS-like managing role
-	-docker rm -f $(PG_CONTAINER)
-	docker run -d --name $(PG_CONTAINER) \
-	  -e POSTGRES_PASSWORD=testpw -p $(PG_PORT):5432 $(PG_IMAGE)
-	@for i in $$(seq 1 30); do \
-	  docker exec $(PG_CONTAINER) pg_isready -U postgres >/dev/null 2>&1 && break; \
-	  sleep 1; \
-	done
-	docker exec $(PG_CONTAINER) psql -U postgres -c "CREATE ROLE rds_superuser NOLOGIN"
-	docker exec $(PG_CONTAINER) psql -U postgres -c \
-	  "CREATE ROLE pgadmin LOGIN PASSWORD 'adminpw' CREATEDB CREATEROLE"
-	docker exec $(PG_CONTAINER) psql -U postgres -c "GRANT rds_superuser TO pgadmin"
+test-setup: ## Start source and target PostgreSQL containers with an RDS-like managing role
+	$(TEST_SERVERS) up
 	@echo
-	@echo 'export PGOP_TEST_DSN="$(TEST_DSN)"'
+	@$(TEST_SERVERS) env
 
 .PHONY: test-integration
-test-integration: ## Full suite against the container from test-setup
-	PGOP_TEST_DSN="$(TEST_DSN)" uv run pytest
+test-integration: ## Full suite against the containers from test-setup
+	eval "$$($(TEST_SERVERS) env)" && uv run pytest
 
 .PHONY: test-teardown
-test-teardown: ## Remove the PostgreSQL container
-	-docker rm -f $(PG_CONTAINER)
+test-teardown: ## Remove the PostgreSQL containers
+	$(TEST_SERVERS) down
 
 .PHONY: coverage
 coverage: ## Full suite with a coverage report
-	PGOP_TEST_DSN="$(TEST_DSN)" uv run pytest \
+	eval "$$($(TEST_SERVERS) env)" && uv run pytest \
 	  --cov=pg_operator --cov-report=term-missing --cov-report=html
 
 .PHONY: check
@@ -211,6 +204,7 @@ local-up: build ui-image ## Build, start PostgreSQL 14-18 in-cluster, install th
 	  --set reconcile.interval=60 --set reconcile.idle=5 \
 	  --wait --timeout 3m
 	kubectl apply -f $(LOCAL_DIR)/02-workload.yaml
+	kubectl apply -f $(LOCAL_DIR)/03-replication.yaml
 	@echo
 	@echo "applied; run 'make local-status' once the timers have fired"
 
@@ -224,9 +218,13 @@ local-reload: build ui-image ## Rebuild both images and restart the pod
 local-status: ## Phases for every managed resource
 	@kubectl get postgresinstances
 	@echo
+	@kubectl get postgresinstances -o custom-columns='INSTANCE:.metadata.name,WAL LEVEL:.status.logicalReplication.walLevel,SUBSCRIBE:.status.logicalReplication.createSubscription,REPLICATION GRANT:.status.logicalReplication.replicationGrant,SLOTS:.status.logicalReplication.replicationSlotsInUse'
+	@echo
 	@kubectl get postgresdbs -n team-a
 	@echo
 	@kubectl get postgresusers -n team-a
+	@echo
+	@kubectl get postgresreplications -n team-a
 
 .PHONY: local-verify
 local-verify: ## Connect as each generated user and assert its privileges
@@ -234,15 +232,16 @@ local-verify: ## Connect as each generated user and assert its privileges
 
 .PHONY: local-test
 local-test: ## Run the full pytest suite against each server in turn
-	@for v in $(LOCAL_PGS); do \
+	@status=0; for v in $(LOCAL_PGS); do \
 	  kubectl port-forward -n pg-instances svc/pg$$v 15432:5432 >/dev/null 2>&1 & \
 	  pf=$$!; \
 	  until nc -z localhost 15432 2>/dev/null; do sleep 1; done; \
 	  printf "PostgreSQL %-3s " $$v; \
-	  PGOP_TEST_DSN="host=localhost port=15432 user=pgadmin password=adminpw dbname=postgres sslmode=disable" \
-	    uv run pytest -q 2>&1 | tail -1; \
+	  out=$$(PGOP_TEST_DSN="host=localhost port=15432 user=pgadmin password=adminpw dbname=postgres sslmode=disable" \
+	    uv run pytest 2>&1) || status=1; \
+	  echo "$$out" | tail -1; \
 	  kill $$pf 2>/dev/null; wait $$pf 2>/dev/null; \
-	done
+	done; exit $$status
 
 .PHONY: local-logs
 local-logs: ## Follow the operator log
@@ -259,6 +258,7 @@ local-ui: ## Port-forward the dashboard to localhost:8081
 
 .PHONY: local-down
 local-down: ## Remove the operator, the servers and their namespaces
+	-kubectl delete -f $(LOCAL_DIR)/03-replication.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/02-workload.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/01-instances.yaml --ignore-not-found
 	-kubectl delete -f $(LOCAL_DIR)/00-servers.yaml --ignore-not-found

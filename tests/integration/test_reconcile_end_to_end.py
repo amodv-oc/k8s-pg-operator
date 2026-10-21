@@ -146,6 +146,10 @@ async def test_instance_reconcile_reports_server_capabilities(ctx, k8s) -> None:
     assert int(result.status["serverVersion"].split(".")[0]) >= 14
     assert "CREATEDB" in result.status["privileges"]
     assert result.status["pushSecretsAvailable"] is True
+    replication = result.status["logicalReplication"]
+    assert replication["walLevel"] in {"replica", "logical"}
+    assert replication["createSubscription"] in {"Granted", "Assumed", "Unavailable"}
+    assert isinstance(replication["issues"], list)
 
 
 async def test_instance_reports_a_missing_pushsecret_crd(ctx, k8s) -> None:

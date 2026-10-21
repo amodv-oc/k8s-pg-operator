@@ -79,6 +79,13 @@ def test_phase_failed_for_a_non_connectivity_failure() -> None:
     assert st.phase_from_conditions(conditions) == "Failed"
 
 
+def test_phase_pending_when_readiness_is_undecided() -> None:
+    """Ready=Unknown is "more to do than this version can do", not a failure."""
+    earlier = st.merge_conditions([], [st.not_ready("ConfigurationError", "bad spec", 1)])
+    conditions = st.merge_conditions(earlier, [st.pending("AwaitingReconciler", "valid", 2)])
+    assert st.phase_from_conditions(conditions) == "Pending"
+
+
 def test_phase_paused() -> None:
     conditions = [st.condition("Ready", "False", "Paused", "suspended")]
     assert st.phase_from_conditions(conditions) == "Paused"

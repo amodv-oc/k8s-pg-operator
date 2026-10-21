@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 
 #: PostgreSQL truncates identifiers at NAMEDATALEN-1 bytes.
 MAX_IDENTIFIER_LENGTH = 63
@@ -122,6 +123,66 @@ def _truncate_bytes(value: str, limit: int) -> str:
     if len(encoded) <= limit:
         return value
     return encoded[:limit].decode(errors="ignore").rstrip("_")
+
+
+@dataclass(frozen=True, slots=True)
+class ReplicationNames:
+    """What one PostgresReplication creates, named once and recorded in status."""
+
+    #: In the source database.
+    publication: str
+    #: In the target database; also the slot's name on the source server.
+    subscription: str
+    #: The generated replication login on the source server.
+    login: str
+    #: The login's credentials Secret, in the operator's namespace.
+    secret: str
+
+
+def replication_names(namespace: str, name: str, role_prefix: str = "") -> ReplicationNames:
+    """Derive the objects' names for a PostgresReplication ``namespace/name``.
+
+    Mapping ``-`` and ``.`` to ``_`` loses the namespace/name boundary -
+    ``team-a/x`` and ``team/a-x`` would sanitise alike, and both could slot on
+    one server - so each identifier ends in a hash of the exact identity. The
+    readable part is only for whoever reads ``pg_replication_slots``.
+
+    ``pgop_`` leads the slot and subscription names, keeping them out of the
+    ``rds`` and ``pg_`` namespaces RDS and PostgreSQL reserve. The login follows
+    the instance's role convention instead: ``rolePrefix`` first.
+    """
+    digest = hashlib.sha256(f"{role_prefix}\0{namespace}\0{name}".encode()).hexdigest()[:8]
+    readable = _readable(f"{namespace}_{name}")
+    subscription = _with_digest(f"pgop_{role_prefix}{readable}", digest)
+    login = reject_reserved_role_prefix(
+        _with_digest(f"{role_prefix}pgop_repl_{readable}", digest), kind="replication login"
+    )
+    return ReplicationNames(
+        publication=subscription,
+        subscription=subscription,
+        login=login,
+        secret=_replication_secret_name(namespace, name),
+    )
+
+
+def _readable(value: str) -> str:
+    candidate = _INVALID_CHARS.sub("_", value.strip().lower())
+    return _LEADING_INVALID.sub("", candidate).strip("_")
+
+
+def _with_digest(base: str, digest: str) -> str:
+    keep = MAX_IDENTIFIER_LENGTH - len(digest) - 1
+    return f"{_truncate_bytes(base, keep)}_{digest}"
+
+
+def _replication_secret_name(namespace: str, name: str) -> str:
+    # A namespace is a DNS label - it cannot contain a dot - so a dot after it
+    # is an unambiguous boundary, and the name stays readable.
+    candidate = f"pgop-repl.{namespace}.{name}"
+    if len(candidate) <= 253:
+        return candidate
+    digest = hashlib.sha256(f"{namespace}/{name}".encode()).hexdigest()[:8]
+    return f"{candidate[: 253 - len(digest) - 1].rstrip('.-')}-{digest}"
 
 
 def secret_name(resource_name: str, suffix: str = "pg-credentials") -> str:

@@ -22,7 +22,7 @@ env:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.0.1
@@ -36,7 +36,7 @@ jobs:
         run: uv run mypy src/pg_operator
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -67,19 +67,51 @@ jobs:
         # CREATEROLE, which is what the RDS master user actually is.
         env:
           PGPASSWORD: testpw
-        run: |
-          psql -h localhost -U postgres -c "CREATE ROLE rds_superuser NOLOGIN"
-          psql -h localhost -U postgres -c \
-            "CREATE ROLE pgadmin LOGIN PASSWORD 'adminpw' CREATEDB CREATEROLE"
-          psql -h localhost -U postgres -c "GRANT rds_superuser TO pgadmin"
+        run: psql -h localhost -U postgres -v ON_ERROR_STOP=1 -f hack/rds-like.sql
 
       - name: Tests
         env:
           PGOP_TEST_DSN: "host=localhost port=5432 user=pgadmin password=adminpw dbname=postgres sslmode=disable"
         run: uv run pytest --cov=pg_operator --cov-report=term-missing
 
+  replication:
+    # Logical replication needs two servers - one cannot usefully subscribe to
+    # itself - on a network where the target's server reaches the source's.
+    # Service containers cannot take server arguments such as wal_level, so the
+    # pair is started the way `make test-setup` starts it. 16 is the floor; the
+    # mixed pairs cover a newer target and a newer source.
+    name: replication (${{ matrix.source }} → ${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { source: "16", target: "16" }
+          - { source: "17", target: "17" }
+          - { source: "18", target: "18" }
+          - { source: "16", target: "18" }
+          - { source: "18", target: "16" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --extra dev
+
+      - name: Start source and target servers
+        env:
+          SOURCE_IMAGE: postgres:${{ matrix.source }}-alpine
+          TARGET_IMAGE: postgres:${{ matrix.target }}-alpine
+        run: |
+          hack/test-servers.sh up
+          hack/test-servers.sh github-env >> "$GITHUB_ENV"
+
+      - name: Replication tests
+        run: uv run pytest -m replication -rA
+
   ui:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: ui
@@ -97,7 +129,7 @@ jobs:
         run: npm run build
 
   chart:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
@@ -150,7 +182,7 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            runner: ubuntu-24.04
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
@@ -218,7 +250,7 @@ jobs:
 
   # --- publish ----
   # Gated on every check in the workflow, so nothing reaches the registry
-  # unless lint, the PostgreSQL matrix, the dashboard and the chart all pass
+  # unless lint, both PostgreSQL matrices, the dashboard and the chart all pass
   # and both architectures built and smoke-tested cleanly.
   #
   # Each runner pushes an untagged, single-arch image and reports its digest;
@@ -226,7 +258,7 @@ jobs:
   # points at a half-published pair. The build here is the same one image
   # already did, restored from the shared gha cache scope.
   image-push:
-    needs: [lint, test, ui, chart, image]
+    needs: [lint, test, replication, ui, chart, image]
     if: github.event_name != 'pull_request'
     strategy:
       fail-fast: false
@@ -310,7 +342,7 @@ jobs:
 
   image-manifest:
     needs: image-push
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write

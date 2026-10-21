@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, model_validator
 
 from .constants import ACCESS_OWNER, ACCESS_RO, ACCESS_RW, DROP, RETAIN
 from .naming import (
@@ -21,6 +21,7 @@ from .naming import (
     validate_identifier,
     validate_role_name,
 )
+from .units import parse_duration, parse_quantity
 
 RetentionPolicy = Literal["RETAIN", "DROP"]
 AccessLevel = Literal["OWNER", "RW", "RO"]
@@ -428,6 +429,248 @@ class UserSpec(Spec):
 
 
 # ---------------------------------------------------------------------------
+# PostgresReplication
+# ---------------------------------------------------------------------------
+
+PublishOperation = Literal["insert", "update", "delete", "truncate"]
+FilterOperator = Literal["Eq", "Ne", "Lt", "Le", "Gt", "Ge", "In", "IsNull", "IsNotNull"]
+SubscriptionStreaming = Literal["off", "on", "parallel"]
+
+#: A row-filter operand. The CRD declares it int-or-string; strict types stop a
+#: YAML boolean from being coerced to 1 on its way through the model.
+FilterValue = StrictInt | StrictStr
+
+ALL_PUBLISH_OPERATIONS: tuple[PublishOperation, ...] = ("insert", "update", "delete", "truncate")
+
+
+class FilterPredicate(Spec):
+    """One comparison in a row filter: a column, an operator and its operand."""
+
+    column: Identifier
+    op: FilterOperator
+    value: FilterValue | None = None
+    values: list[FilterValue] | None = None
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        validate_identifier(self.column, kind="rowFilter column")
+        if self.op == "In":
+            if not self.values or self.value is not None:
+                raise ValueError(f"rowFilter {self.column} In takes values, not value")
+        elif self.op in {"IsNull", "IsNotNull"}:
+            if self.value is not None or self.values is not None:
+                raise ValueError(f"rowFilter {self.column} {self.op} takes no operand")
+        elif self.value is None or self.values is not None:
+            raise ValueError(f"rowFilter {self.column} {self.op} takes value, not values")
+        return self
+
+
+class RowFilter(Spec):
+    """Predicates joined by AND (``all``) or OR (``any``), one level deep.
+
+    Structured rather than SQL text so that columns reach the server as
+    identifiers and operands as literals - a filter is applied by the master
+    user, and text cannot be proven not to escape its parentheses.
+    """
+
+    all_: list[FilterPredicate] | None = Field(default=None, alias="all")
+    any_: list[FilterPredicate] | None = Field(default=None, alias="any")
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if bool(self.all_) == bool(self.any_):
+            raise ValueError("rowFilter sets exactly one of all or any, with at least one entry")
+        return self
+
+    @property
+    def predicates(self) -> list[FilterPredicate]:
+        return self.all_ or self.any_ or []
+
+    @property
+    def conjunction(self) -> Literal["AND", "OR"]:
+        return "AND" if self.all_ else "OR"
+
+    @property
+    def columns(self) -> frozenset[str]:
+        """Columns the filter reads - which must lie inside the replica identity."""
+        return frozenset(predicate.column for predicate in self.predicates)
+
+
+class SchemaSelection(Spec):
+    """Publish every eligible table in a schema, re-enumerated on each pass."""
+
+    name: Identifier
+    exclude_tables: list[Identifier] = Field(default_factory=list, alias="excludeTables")
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        validate_identifier(self.name, kind="schema name")
+        for table in self.exclude_tables:
+            validate_identifier(table, kind="excluded table")
+        if len(self.exclude_tables) != len(set(self.exclude_tables)):
+            raise ValueError(f"schemas[{self.name}].excludeTables contains duplicates")
+        return self
+
+
+class TableSelection(Spec):
+    """Publish one table, optionally limited to some columns and rows."""
+
+    schema_: Identifier = Field(alias="schema")
+    name: Identifier
+    #: Empty publishes every column.
+    columns: list[Identifier] = Field(default_factory=list)
+    row_filter: RowFilter | None = Field(default=None, alias="rowFilter")
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        validate_identifier(self.schema_, kind="table schema")
+        validate_identifier(self.name, kind="table name")
+        for column in self.columns:
+            validate_identifier(column, kind="column")
+        if len(self.columns) != len(set(self.columns)):
+            raise ValueError(f"tables[{self.qualified}].columns contains duplicates")
+        return self
+
+    @property
+    def qualified(self) -> str:
+        return f"{self.schema_}.{self.name}"
+
+
+class ReplicationConnection(Spec):
+    """How the *target server* reaches the source - not how the operator does.
+
+    Defaults to the source instance's endpoint. The two often differ: the
+    operator may reach RDS through one name while another RDS instance in the
+    VPC resolves it through a private one.
+    """
+
+    host: Annotated[str, Field(min_length=1)] | None = None
+    port: Annotated[int, Field(ge=1, le=65535)] | None = None
+    ssl_mode: SslMode = Field(default="require", alias="sslMode")
+    #: A CA bundle path on the *target server's* filesystem, for verify-*.
+    ssl_root_cert_path: Annotated[str, Field(min_length=1)] | None = Field(
+        default=None, alias="sslRootCertPath"
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if self.ssl_mode in {"verify-ca", "verify-full"} and not self.ssl_root_cert_path:
+            raise ValueError(
+                f"sslMode {self.ssl_mode!r} requires sslRootCertPath, a CA bundle "
+                "path on the target server"
+            )
+        return self
+
+
+class ReplicationSource(Spec):
+    db_ref: ObjectRef = Field(alias="dbRef")
+    connection: ReplicationConnection = Field(default_factory=ReplicationConnection)
+    #: A pre-provisioned replication login, read and never written. Without it
+    #: the operator generates one on the source.
+    credentials_secret_ref: CredentialsSecretRef | None = Field(
+        default=None, alias="credentialsSecretRef"
+    )
+
+
+class ReplicationTarget(Spec):
+    db_ref: ObjectRef = Field(alias="dbRef")
+
+
+class SubscriptionOptions(Spec):
+    """Subscription settings passed through. Omitted means the server default."""
+
+    streaming: SubscriptionStreaming | None = None
+    binary: bool | None = None
+
+
+class AlertingSpec(Spec):
+    """Thresholds past which a replication reports itself unhealthy."""
+
+    max_lag: StrictInt | StrictStr = Field(default="1Gi", alias="maxLag")
+    max_retained_wal: StrictInt | StrictStr = Field(default="10Gi", alias="maxRetainedWal")
+    max_slot_inactive: str = Field(default="10m", alias="maxSlotInactive")
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        for field_name, value in (
+            ("maxLag", self.max_lag_bytes),
+            ("maxRetainedWal", self.max_retained_wal_bytes),
+            ("maxSlotInactive", self.max_slot_inactive_seconds),
+        ):
+            if value <= 0:
+                raise ValueError(f"alerting.{field_name} must be greater than zero")
+        return self
+
+    @property
+    def max_lag_bytes(self) -> int:
+        return parse_quantity(self.max_lag)
+
+    @property
+    def max_retained_wal_bytes(self) -> int:
+        return parse_quantity(self.max_retained_wal)
+
+    @property
+    def max_slot_inactive_seconds(self) -> int:
+        return parse_duration(self.max_slot_inactive)
+
+
+class ReplicationSpec(Spec):
+    """Spec of the namespaced PostgresReplication resource."""
+
+    source: ReplicationSource
+    target: ReplicationTarget
+    schemas: list[SchemaSelection] = Field(default_factory=list)
+    tables: list[TableSelection] = Field(default_factory=list)
+    publish: list[PublishOperation] = Field(
+        default_factory=lambda: list(ALL_PUBLISH_OPERATIONS), min_length=1
+    )
+    publish_via_partition_root: bool = Field(default=False, alias="publishViaPartitionRoot")
+    #: Copy existing rows on create, and for every table added later.
+    copy_data: bool = Field(default=True, alias="copyData")
+    #: False disables the subscription; the slot keeps retaining WAL meanwhile.
+    enabled: bool = True
+    subscription: SubscriptionOptions = Field(default_factory=SubscriptionOptions)
+    alerting: AlertingSpec = Field(default_factory=AlertingSpec)
+    paused: bool = False
+
+    @model_validator(mode="after")
+    def _validate(self) -> Self:
+        if not self.schemas and not self.tables:
+            raise ValueError("a replication selects at least one entry in schemas or tables")
+        schema_names = [entry.name for entry in self.schemas]
+        if len(schema_names) != len(set(schema_names)):
+            raise ValueError("spec.schemas lists a schema more than once")
+        tables = [entry.qualified for entry in self.tables]
+        if len(tables) != len(set(tables)):
+            raise ValueError("spec.tables lists a table more than once")
+        if len(self.publish) != len(set(self.publish)):
+            raise ValueError("spec.publish lists an operation more than once")
+
+        excluded = {
+            f"{entry.name}.{table}" for entry in self.schemas for table in entry.exclude_tables
+        }
+        contradictions = sorted(excluded.intersection(tables))
+        if contradictions:
+            raise ValueError(
+                f"{', '.join(contradictions)} is both excluded in spec.schemas and "
+                "listed in spec.tables"
+            )
+        return self
+
+    @property
+    def selected_schemas(self) -> frozenset[str]:
+        """Every schema the replication reads from, whole or in part."""
+        return frozenset(
+            [entry.name for entry in self.schemas] + [entry.schema_ for entry in self.tables]
+        )
+
+    @property
+    def publishes_keyed_changes(self) -> bool:
+        """UPDATE or DELETE is published, so each table needs a replica identity."""
+        return "update" in self.publish or "delete" in self.publish
+
+
+# ---------------------------------------------------------------------------
 # parsing helpers
 # ---------------------------------------------------------------------------
 
@@ -442,6 +685,10 @@ def parse_database_spec(spec: dict[str, Any]) -> DatabaseSpec:
 
 def parse_user_spec(spec: dict[str, Any]) -> UserSpec:
     return UserSpec.model_validate(spec)
+
+
+def parse_replication_spec(spec: dict[str, Any]) -> ReplicationSpec:
+    return ReplicationSpec.model_validate(spec)
 
 
 def effective_retention(
