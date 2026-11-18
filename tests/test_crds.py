@@ -275,6 +275,12 @@ def test_replication_crd_matches_the_model_at_every_depth() -> None:
     assert _walk(ReplicationSpec, replication_spec_schema(), "spec") == []
 
 
+def test_a_provided_replication_login_cannot_name_another_namespace() -> None:
+    """The operator would read it with its own, cluster-wide, access to Secrets."""
+    source = replication_spec_schema()["properties"]["source"]["properties"]
+    assert set(source["credentialsSecretRef"]["properties"]) == {"name", "usernameKey", "passwordKey"}
+
+
 def test_replication_enums_match_the_model() -> None:
     from pg_operator.models import FilterOperator, PublishOperation, SubscriptionStreaming
 

@@ -23,6 +23,9 @@ from .sql import execute, fetch_all, fetch_one, fetch_scalar, ident, literal
 
 log = logging.getLogger(__name__)
 
+#: The only way a subscription may authenticate to its source: see build_conninfo.
+REQUIRED_AUTH = "scram-sha-256"
+
 #: pg_subscription.substream, as PostgreSQL 16 stores it.
 _STREAMING = {"f": "off", "t": "on", "p": "parallel"}
 
@@ -64,6 +67,14 @@ def build_conninfo(
     ``connect_timeout`` bounds how long CREATE and DROP SUBSCRIPTION wait on a
     source the target cannot route to, rather than leaving that to the
     statement timeout.
+
+    ``require_auth`` is what keeps the password from a server that is not the
+    source. ``host`` comes from the spec, and libpq answers any server that
+    asks for a cleartext password with the password - under ``sslmode=require``
+    too, which checks no certificate. Insisting on SCRAM means the target
+    proves it knows the password without ever sending it. (The option is read
+    by the target server's libpq, which is PostgreSQL 16 or later for every
+    replication, the release that introduced it.)
     """
     params = {
         "host": host,
@@ -73,6 +84,7 @@ def build_conninfo(
         "password": password,
         "sslmode": ssl_mode,
         "connect_timeout": "10",
+        "require_auth": REQUIRED_AUTH,
     }
     if ssl_root_cert:
         params["sslrootcert"] = ssl_root_cert
@@ -157,6 +169,12 @@ async def create_subscription(
     Owned by the managing role, with ``run_as_owner`` and ``password_required``
     left at their defaults: changes apply as each table's owner, and the
     connection must authenticate with the password it carries.
+
+    Created and marked in one transaction, so it never exists without the
+    comment that makes it this replication's - an unmarked one is refused as
+    someone else's. Only ``create_slot = true`` keeps CREATE SUBSCRIPTION out
+    of a transaction block; without it the statement still connects to the
+    publisher to read its tables, and the apply worker starts at commit.
     """
     options = [
         sql.SQL("create_slot = false"),
@@ -168,16 +186,17 @@ async def create_subscription(
         options.append(sql.SQL("binary = {}").format(literal(binary)))
     if streaming is not None:
         options.append(sql.SQL("streaming = {}").format(literal(streaming)))
-    await execute(
-        conn,
-        sql.SQL("CREATE SUBSCRIPTION {} CONNECTION {} PUBLICATION {} WITH ({})").format(
-            ident(name), literal(conninfo), ident(publication), sql.SQL(", ").join(options)
-        ),
-        describe=f"CREATE SUBSCRIPTION {name} CONNECTION <redacted> PUBLICATION {publication}",
-    )
-    await execute(
-        conn, sql.SQL("COMMENT ON SUBSCRIPTION {} IS {}").format(ident(name), literal(comment))
-    )
+    async with conn.transaction():
+        await execute(
+            conn,
+            sql.SQL("CREATE SUBSCRIPTION {} CONNECTION {} PUBLICATION {} WITH ({})").format(
+                ident(name), literal(conninfo), ident(publication), sql.SQL(", ").join(options)
+            ),
+            describe=f"CREATE SUBSCRIPTION {name} CONNECTION <redacted> PUBLICATION {publication}",
+        )
+        await execute(
+            conn, sql.SQL("COMMENT ON SUBSCRIPTION {} IS {}").format(ident(name), literal(comment))
+        )
     log.info("created subscription %s", name)
 
 
@@ -246,24 +265,65 @@ async def drop_subscription(conn: AsyncConnection, name: str) -> bool:
 _SLOT = sql.SQL(
     "SELECT slot_name, database, active, active_pid FROM pg_replication_slots WHERE slot_name = %s"
 )
-#: Table-sync slots are named ``pg_<subscription oid>_sync_<relid>_<system id>``.
-#: A plain DROP SUBSCRIPTION removes them; a detached one leaves them behind.
+#: A plain DROP SUBSCRIPTION removes the table-sync slots; a detached one
+#: leaves them behind. See sync_slot_pattern for their names.
 _SLOT_AND_SYNC_SLOTS = sql.SQL(
     """
     SELECT slot_name, database, active, active_pid
       FROM pg_replication_slots
-     WHERE slot_name = %s OR slot_name LIKE 'pg\\_' || %s || '\\_sync\\_%%'
+     WHERE slot_name = %s OR slot_name ~ %s
      ORDER BY slot_name
     """
 )
 
+_SYSTEM_IDENTIFIER = sql.SQL("SELECT system_identifier FROM pg_control_system()")
 
-async def slots(conn: AsyncConnection, name: str, *, subscription_oid: int | None) -> list[SlotState]:
-    """The subscription's slot and, given its oid, its table-sync slots."""
+
+def sync_slot_pattern(subscription_oid: int, system_identifier: str | None) -> str:
+    """A regular expression for a subscription's table-sync slot names.
+
+    PostgreSQL names them ``pg_<subscription oid>_sync_<relid>_<system
+    identifier>`` (ReplicationSlotNameForTablesync), all three the subscriber's.
+    The oid is assigned by the target server, so another target subscribing to
+    the same source can hold the same one: the system identifier is what tells
+    their slots apart. Without it the pattern matches every subscriber's.
+    """
+    subscriber = str(int(system_identifier)) if system_identifier else "[0-9]+"
+    return f"^pg_{int(subscription_oid)}_sync_[0-9]+_{subscriber}$"
+
+
+async def get_system_identifier(conn: AsyncConnection) -> str | None:
+    """The server's system identifier, as its table-sync slot names spell it. None if unreadable.
+
+    ``pg_control_system()`` makes no privilege check and is executable by
+    PUBLIC. It returns the unsigned identifier as a bigint, so one at or above
+    2^63 reads negative; slot names print it unsigned.
+    """
+    try:
+        value = await fetch_scalar(conn, _SYSTEM_IDENTIFIER)
+    except ReconcileFailure as exc:
+        log.warning("cannot read the server's system identifier: %s", exc)
+        return None
+    return str(int(value) % 2**64) if value is not None else None
+
+
+async def slots(
+    conn: AsyncConnection,
+    name: str,
+    *,
+    subscription_oid: int | None,
+    system_identifier: str | None = None,
+) -> list[SlotState]:
+    """The subscription's slot and, given its oid, its table-sync slots.
+
+    Without the subscriber's ``system_identifier``, the table-sync slots of any
+    subscriber with that oid.
+    """
     if subscription_oid is None:
         rows = await fetch_all(conn, _SLOT, (name,))
     else:
-        rows = await fetch_all(conn, _SLOT_AND_SYNC_SLOTS, (name, str(subscription_oid)))
+        pattern = sync_slot_pattern(subscription_oid, system_identifier)
+        rows = await fetch_all(conn, _SLOT_AND_SYNC_SLOTS, (name, pattern))
     return [
         SlotState(name=str(row[0]), database=row[1], active=bool(row[2]), active_pid=row[3])
         for row in rows

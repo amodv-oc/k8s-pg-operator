@@ -139,15 +139,17 @@ spec:
                       description: >-
                         A pre-provisioned replication login, holding REPLICATION
                         or rds_replication. Read, never written. Without it the
-                        operator generates a login on the source.
+                        operator generates a login on the source. The Secret is
+                        always read from this resource's own namespace - there
+                        is no namespace field - and the login must be a
+                        dedicated one: the managing role, a superuser and a
+                        member of rds_superuser are refused, because its
+                        password is stored on the target server and sent to
+                        source.connection.
                       properties:
                         name:
                           type: string
                           maxLength: 253
-                        namespace:
-                          type: string
-                          maxLength: 253
-                          description: Defaults to this resource's namespace.
                         usernameKey:
                           type: string
                           default: username
@@ -406,7 +408,14 @@ spec:
                     subscription: { type: string }
                     subscriptionOid:
                       type: integer
-                      description: Names the table-sync slots (pg_<oid>_sync_*) a detached subscription can leave on the source.
+                      description: Names the table-sync slots (pg_<oid>_sync_<relid>_<systemIdentifier>) a detached subscription can leave on the source.
+                    systemIdentifier:
+                      type: string
+                      description: >-
+                        The target server's system identifier, which ends its
+                        table-sync slots' names and tells them from those of
+                        another target's subscription with the same oid. A
+                        string: it is an unsigned 64-bit number.
                 connectionFingerprint:
                   type: string
                   description: >-
@@ -444,6 +453,27 @@ spec:
                   type: array
                   description: Roles the operator granted the login; only these are revoked on deletion.
                   items: { type: string }
+                supersededLogins:
+                  type: array
+                  description: >-
+                    Logins a change to source.credentialsSecretRef replaced
+                    that are not yet removed - one the operator made is
+                    dropped with its Secret, a provided one loses only the
+                    memberships the operator granted it. Each stays here until
+                    that is done, by a later pass or by deletion.
+                  items:
+                    type: object
+                    properties:
+                      login: { type: string }
+                      created: { type: boolean }
+                      grantedMemberships:
+                        type: array
+                        items: { type: string }
+                      secret:
+                        type: object
+                        properties:
+                          namespace: { type: string }
+                          name: { type: string }
                 publishedTables:
                   type: array
                   description: What the publication carries, read back from the server.

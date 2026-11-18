@@ -65,6 +65,20 @@ class CredentialsSecretRef(Spec):
         return self.namespace or default
 
 
+class LocalCredentialsSecretRef(Spec):
+    """Reference to a credentials Secret in the referring resource's own namespace.
+
+    There is no ``namespace``, on purpose. The operator can read Secrets
+    cluster-wide, and whoever writes a namespaced resource must not be able to
+    borrow that reach: a reference that could name another namespace could name
+    the Secret holding an instance's superuser credentials.
+    """
+
+    name: K8sName
+    username_key: str = Field(default="username", alias="usernameKey")
+    password_key: str = Field(default="password", alias="passwordKey")
+
+
 class ObjectRef(Spec):
     """Reference to another custom resource by name."""
 
@@ -566,8 +580,9 @@ class ReplicationSource(Spec):
     db_ref: ObjectRef = Field(alias="dbRef")
     connection: ReplicationConnection = Field(default_factory=ReplicationConnection)
     #: A pre-provisioned replication login, read and never written. Without it
-    #: the operator generates one on the source.
-    credentials_secret_ref: CredentialsSecretRef | None = Field(
+    #: the operator generates one on the source. Always a Secret in the
+    #: replication's own namespace.
+    credentials_secret_ref: LocalCredentialsSecretRef | None = Field(
         default=None, alias="credentialsSecretRef"
     )
 

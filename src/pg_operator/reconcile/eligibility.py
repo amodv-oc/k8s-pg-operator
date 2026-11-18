@@ -15,6 +15,14 @@ a table the source cannot replicate whole (row security, an unlogged leaf) is
 not replicated at all rather than silently in part; a target-side failure
 leaves it in, since the change that broke apply is already in the stream and
 removing the table cannot recall it.
+
+That last rule holds only for a table the subscription *carries*. A published
+table it does not carry - its target relation was dropped, or dropped and
+recreated, which removes it from the subscription - has nothing in the stream
+to protect, and leaving it published is the dangerous choice: the next refresh
+subscribes whatever is published, and either fails on a relation the target
+lacks or copies the source's rows in beside the ones already there. Such a
+table goes back to being held out, exactly as if it had never been published.
 """
 
 from __future__ import annotations
@@ -66,6 +74,10 @@ PUBLICATION_REFUSED = "PublicationRefused"
 #: A warning, not a gate: apply converts through text, and widening a column
 #: on the target (int -> bigint) is a deliberate, common choice.
 COLUMN_TYPE_MISMATCH = "ColumnTypeMismatch"
+#: A warning on a partitioned table kept published while the target cannot yet
+#: receive one of its partitions: the subscription's table list is not
+#: refreshed until it can, because a refresh would subscribe that one too.
+REFRESH_HELD_BACK = "RefreshHeldBack"
 
 #: pg_class.relkind values a publication can carry.
 PUBLISHABLE_KINDS = frozenset({"r", "p"})
@@ -108,6 +120,13 @@ class Verdict:
     candidate: Candidate
     issues: tuple[Issue, ...] = ()
     warnings: tuple[Issue, ...] = ()
+    #: The subscription carries at least one relation this table applies into.
+    carried: bool = False
+    #: Relations it does *not* carry that failed a target-side check. While the
+    #: table stays published these must not be subscribed, and a refresh would
+    #: subscribe them: it would fail on one the target lacks, and copy the
+    #: source's rows into one that already holds some.
+    refresh_blockers: tuple[str, ...] = ()
 
     @property
     def publishable(self) -> bool:
@@ -117,11 +136,14 @@ class Verdict:
     def keeps_membership(self) -> bool:
         """Whether an already-published table should stay published despite its issues.
 
-        Only target-side issues qualify. A table claimed by an older replication
+        Only target-side issues qualify, and only for a table the subscription
+        carries: that is the table whose changes are already in the stream. One
+        it does not carry has none, and would be subscribed - and copied -
+        afresh by the next refresh. A table claimed by an older replication
         must go regardless: two subscriptions writing one table is the conflict
         the check exists to end.
         """
-        return all(
+        return self.carried and all(
             issue.side == "target" and issue.reason != TABLE_TARGETED_TWICE for issue in self.issues
         )
 
@@ -188,8 +210,10 @@ def judge(
 
     ``subscribed`` is what the subscription already carries; with
     ``copy_data``, any other relation gets an initial copy, which must land in
-    an empty table. ``source_major_version`` is the source server's, since
-    what its publisher enforces differs by release.
+    an empty table. It also decides what a target-side failure means for a
+    table that is already published - see :attr:`Verdict.keeps_membership`.
+    ``source_major_version`` is the source server's, since what its publisher
+    enforces differs by release.
     """
     q = candidate.qualified
     if source is None:
@@ -309,7 +333,10 @@ def judge(
     published_columns = tuple(
         column for column in candidate.columns or source.columns if column in source.columns
     )
-    for relation in target_relations(source, via_root=via_root):
+    relations = target_relations(source, via_root=via_root)
+    blockers: list[str] = []
+    for relation in relations:
+        counted = len(issues)
         target = targets.get(relation.qualified)
         if target is None or target.kind not in PUBLISHABLE_KINDS:
             issues.append(
@@ -319,6 +346,8 @@ def judge(
                     "and it is published on the next pass",
                 )
             )
+            if relation.qualified not in subscribed:
+                blockers.append(relation.qualified)
             continue
         missing = [column for column in published_columns if column not in target.columns]
         if missing:
@@ -366,6 +395,8 @@ def judge(
             )
         if keyed:
             issues.extend(_target_identity_issues(relation, target))
+        if len(issues) > counted and relation.qualified not in subscribed:
+            blockers.append(relation.qualified)
         differing = [
             f"{column} {source.columns[column]} -> {target.columns[column]}"
             for column in published_columns
@@ -389,7 +420,13 @@ def judge(
                 f"{q} is already replicated into the same target database by {claimed_by}",
             )
         )
-    return Verdict(candidate, tuple(issues), tuple(warnings))
+    return Verdict(
+        candidate,
+        tuple(issues),
+        tuple(warnings),
+        carried=any(relation.qualified in subscribed for relation in relations),
+        refresh_blockers=tuple(blockers),
+    )
 
 
 def _publishable(table: SourceTable) -> bool:

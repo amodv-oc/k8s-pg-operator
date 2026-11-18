@@ -135,6 +135,7 @@ must confirm.
 | Apply changes as the table owner | `SET` on each target table's owner role (D, PostgreSQL 16 with `run_as_owner = false`) | The operator already grants itself `SET` on `<db>_owner` (`ensure_self_membership`) | None needed |
 | Full rows in `pg_stat_replication` | `pg_read_all_stats` | `rds_superuser` holds `pg_monitor` (D) | Bootstrap runs `GRANT pg_monitor TO rds_superuser` |
 | `pg_drop_replication_slot` | `REPLICATION` | Through `rds_replication` (D) | Done as the replication login |
+| Read the target's system identifier, `pg_control_system()` | Any role: no `REVOKE` from `PUBLIC`, no check in the function (PostgreSQL source; the docs are silent) | Assume the same (?) | None needed |
 | Read `pg_subscription.subconninfo` | Superuser only (D) | Assume not (?) | None. The operator never reads it |
 
 ### PostgreSQL behaviours the design depends on
@@ -212,7 +213,7 @@ spec:
 | `source.dbRef`, `target.dbRef` | — | `name`, `namespace` (defaults to the resource's own). **Immutable.** They must resolve to `PostgresDB`s on two **different** instances |
 | `source.connection.host` / `port` | source instance's | The endpoint as seen from the target server. Often a private DNS name the operator never uses itself |
 | `source.connection.sslMode` | `require` | `verify-ca`/`verify-full` also need `sslRootCertPath`, a path **on the target server's filesystem**. See D11 |
-| `source.credentialsSecretRef` | — | Bring your own replication login, pre-provisioned with the replication privilege. Read only, never written. See D9 |
+| `source.credentialsSecretRef` | — | `name`, `usernameKey`, `passwordKey`: bring your own replication login, pre-provisioned with the replication privilege. Read only, never written. The Secret is always in the replication's own namespace; there is no `namespace` field, because the operator reads Secrets cluster-wide and the reference could otherwise name an instance's superuser Secret. See D9 |
 | `schemas[]` | `[]` | `name`, `excludeTables[]`. Every eligible table in the schema is published. The list is re-enumerated on every pass, so a new table is picked up automatically once it qualifies |
 | `tables[]` | `[]` | `schema`, `name`, optional `columns[]` and `rowFilter`. An explicit entry overrides the table's `schemas[]` membership. A table both listed here and excluded in `schemas[]` is refused as contradictory |
 | `rowFilter` | — | `all:` (AND) or `any:` (OR), one level deep. Each predicate is `{column, op, value \| values}`. `op` is one of `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. See D2 |
@@ -267,10 +268,35 @@ These are reported as **permanent** errors:
   republishes what it applies, so A→B→C→A loops changes just as A→B beside B→A
   does, until apply stalls on a duplicate key. The graph's nodes are physical
   databases (`host`, `port`, database name), so two `PostgresDB`s naming one
-  database cannot hide a loop. A replication that is being deleted, or cannot
-  resolve, adds no edge. The check is at database level, so two databases
+  database cannot hide a loop. The check is at database level, so two databases
   exchanging *disjoint* tables are refused too. That is consistent with the
   non-goal of bidirectional replication.
+
+  Which other replications add an edge decides which one a loop refuses, so
+  that a newcomer can never stop a replication that is already streaming:
+  - One whose subscription is recorded (`status.created.subscription`, written
+    just before the subscription is created, so this also covers one whose
+    `CREATE SUBSCRIPTION` is still failing) always does,
+    placed where status records its objects, whatever has since become of its
+    spec or its `PostgresDB`s. So does one being deleted, until its teardown
+    has finished and the object is gone.
+  - One with no subscription yet adds an edge only to the check of a younger
+    replication that has none either (by creation time, then namespace and
+    name), and only while it is not being deleted and resolves.
+
+  So a replication with a subscription is refused only for a loop that
+  already streams, which every replication on it reports. Otherwise the one
+  closing the loop is refused, even if it is older than the others, say
+  because it could not resolve until they were streaming. Of two created
+  together, whose passes run concurrently, the younger is refused: they cannot
+  both go ahead, nor both stand aside. The check reads Kubernetes and takes no
+  lock, so one race remains: an older replication that becomes resolvable
+  while a younger one's pass is creating its subscription can create its own.
+  Both then report the loop on their next pass.
+
+  The check lists `PostgresReplication`s once per pass, and `PostgresDB`s and
+  `PostgresInstance`s once each when another replication needs placing, so its
+  cost does not grow with the number of replications.
 
 ## What the operator creates
 
@@ -296,11 +322,12 @@ Naming rules:
   - **Prefixes.** The `pgop_` prefix keeps slot names out of RDS's reserved
     `rds*` namespace and away from `pg_`. Including `rolePrefix` keeps two
     environments that share a source server from colliding.
-- **Names are recorded, not re-derived.** Each name is written to status when
+- **Names are recorded, not re-derived.** Each name is written to status before
   the object is created. Every later pass and the teardown use the recorded
   name, so a future change to the naming scheme cannot orphan an object.
 - **Ownership markers.** The publication, subscription and generated login each
-  get `COMMENT ON … IS 'pg-operator: PostgresReplication <ns>/<name>'`. Suppose
+  get `COMMENT ON … IS 'pg-operator: PostgresReplication <ns>/<name>'`, in the
+  same transaction as the `CREATE`, so none of them ever exists unmarked. Suppose
   an object with the derived name already exists with a different marker, or
   none at all. The operator does not take it over: it reports a permanent
   `NameConflict`. An object carrying this resource's own marker is adopted,
@@ -325,7 +352,9 @@ resume or the timer. Steady state issues no DDL.
      replication slot. If it does not, the pass fails with
      `InsufficientCapacity` (temporary) rather than an opaque `CREATE
      SUBSCRIPTION` failure. Its table-sync workers briefly want more slots
-     during the initial copy, but PostgreSQL retries those itself.
+     during the initial copy, but PostgreSQL retries those itself. The
+     replication's own slot, left by an earlier pass that failed before its
+     subscription was created, needs no free one: step 6 adopts it.
    - The target's managing role must be able to create subscriptions
      (`status.logicalReplication.createSubscription` is not `Unavailable`).
 3. **Replication login** (source).
@@ -341,7 +370,12 @@ resume or the timer. Steady state issues no DDL.
        - `none`: the replication fails permanently with
          `ReplicationPrivilegeUnavailable`, and the error points at
          `credentialsSecretRef`.
-   - **Bring-your-own login:** read the Secret.
+   - **Bring-your-own login:** read the Secret, from the replication's own
+     namespace. The login must be a dedicated one. The managing role, a
+     superuser and a member of `rds_superuser` are refused permanently: the
+     password is stored in the target's catalog and sent to
+     `source.connection`, neither of which is a place for a credential that
+     can do more than stream.
    - **Either kind:** grant membership of the source's `<db>_ro`, which supplies
      `CONNECT`, `USAGE` and `SELECT`. Verify the grant by reading it back.
    - **Self-healing:** if the Secret is deleted, generate a new password, apply
@@ -375,13 +409,17 @@ resume or the timer. Steady state issues no DDL.
 - **Names are checked first.** Before anything is created, a read-only pass
   checks the publication's and the generated login's names. A pass that can
   never succeed, because another object holds the name, creates nothing.
-- **Each creation is recorded immediately.** The publication (created empty)
-  and then the login are each written to `status.created` with a status patch
-  the moment they exist. A pass that fails afterwards publishes only its
-  conditions, so without this an object made early in it would be unknown to
-  teardown. It would then outlive a deletion that arrived before the next
-  successful pass. A test fails a pass mid-way and proves teardown still finds
-  everything.
+- **Each creation is recorded first.** The publication (created empty), the
+  login and its Secret, each membership granted to the login, the slot and the
+  subscription are each written to status with a status patch *before* they
+  are created. A pass that fails afterwards publishes only its conditions, so
+  an object recorded only once it existed would be unknown to teardown if the
+  pass stopped in between - and would outlive a deletion that arrived before
+  the next successful pass. Teardown, and the health read after a failed pass,
+  pass over a recorded object that was never made. The patch is skipped when
+  status already says the same, so a converged pass writes nothing, and it
+  never writes an empty login or subscription oid over a recorded one. Tests
+  stop passes at each step and prove teardown still finds everything.
 6. **Converge the subscription** (target).
    - Create it if it is missing, in two steps:
      1. **The slot.** It is created from the source with
@@ -392,7 +430,10 @@ resume or the timer. Steady state issues no DDL.
         database, is reported and never touched.
      2. **The subscription.** `CREATE SUBSCRIPTION … CONNECTION … PUBLICATION
         … WITH (create_slot = false, slot_name, copy_data, streaming, binary,
-        enabled)`.
+        enabled)`, and its ownership `COMMENT`, in one transaction. Only
+        `create_slot = true` keeps `CREATE SUBSCRIPTION` out of a transaction
+        block; it still connects to the publisher to read the table list, and
+        the apply worker starts at commit.
    - **Why the slot is never made by `CREATE SUBSCRIPTION`.** `CREATE
      SUBSCRIPTION` would create the slot inside its own transaction *on the
      target*, and creating a slot waits for every transaction already running
@@ -458,7 +499,7 @@ names the cause. This is the same "report, don't abort" rule as
 | The target's identity columns ⊆ the columns the source publishes *as its replica identity* | target | `TargetIdentityNotSent` | The publisher sends only its own identity as the key, however many columns it publishes. Same consequence |
 | Every `NOT NULL` column on the target that the publication does not carry has a default, or is an identity or generated column | target | `TargetColumnRequired` | Otherwise every `INSERT` the subscription applies fails the constraint, from the initial copy onwards |
 | No other `PostgresReplication` targets the same table | target | `TableTargetedTwice` | Two writers to one replica table conflict. The older replication keeps the table, by creation time and then namespace/name, so the two can never each defer to the other. It is the one target-side reason that takes an already-published table out |
-| With `copyData`, a table not yet subscribed is empty on the target | target | `TargetTableNotEmpty` | Its initial copy would collide with the rows already there and stall apply. The case D6 makes easy: a table unpublished when its replica identity went, then fixed, would otherwise be copied over its own replicated rows |
+| With `copyData`, a table not yet subscribed is empty on the target | target | `TargetTableNotEmpty` | Its initial copy would collide with the rows already there and stall apply. The case D6 makes easy: a table unpublished when its replica identity went, then fixed, would otherwise be copied over its own replicated rows. The rows are counted as the table's owner, and only in a table: the relation is a tenant's, and a view's functions, or a `FORCE ROW LEVEL SECURITY` policy, would otherwise run as the managing role |
 | A partitioned table's column list or row filter is set only with `publishViaPartitionRoot: true` | source | `FilterIgnoredWithoutPartitionRoot` | Without it, each leaf is published under its own, empty filter and column list, so every row and column would flow, silently |
 
 A table's **replica-identity columns** are the *key* columns of the index
@@ -485,6 +526,28 @@ What happens depends on which side changed.
   apply is already in the stream. It is reported in `status.tableWarnings`,
   marked as kept published, and once the subscription exists the operator
   names it as the suspect in a stall.
+- **Target-side failure, on a table the subscription no longer carries.** The
+  rule above is about changes already in the stream, so it applies only to a
+  table that is in `pg_subscription_rel`. Dropping a table on the target
+  removes it from there, while the publication still lists it. Whatever then
+  has its name is new to the subscription, and `REFRESH PUBLICATION`
+  subscribes everything the publication lists:
+  - if the target has no such table, the refresh fails, and with it every
+    pass;
+  - if the table was recreated with its rows, as a rewrite does (`CREATE TABLE
+    … AS`, drop, rename), the refresh copies the source's rows in beside them.
+
+  Such a table is therefore **removed from the publication** and held back
+  like one that was never published, with `TargetTableMissing` or
+  `TargetTableNotEmpty`. It returns through the ordinary gate.
+- **A partitioned table published through its partitions, with a partition the
+  target cannot receive.** Typically the source gained a partition first. The
+  table stays published while the subscription carries any of its partitions:
+  unpublishing it would stop them all, and coming back would need their
+  target emptied. Refreshing is what must not happen, so the subscription is
+  **not refreshed** while such a partition exists. The table carries a
+  `RefreshHeldBack` warning, tables published meanwhile wait with it, and the
+  refresh runs on the first pass after the target has the partition.
 
 ### Row filters are structured, never SQL text
 
@@ -515,6 +578,14 @@ Column lists work the same way: the operator compares them against
   passed as a single `sql.Literal`. It includes `connect_timeout=10`, so an
   unroutable source fails `CREATE SUBSCRIPTION` quickly instead of riding the
   statement timeout.
+- **`require_auth=scram-sha-256`.** `source.connection.host` is free-form, and
+  libpq answers any server that requests a cleartext password with the
+  password. `sslmode=require` does not help, because it verifies no
+  certificate. The connection string therefore insists on SCRAM, which proves
+  the password without disclosing it. `require_auth` is a libpq 16 option; the
+  string is parsed by the target server's libpq, and every target is 16 or
+  later. A source that offers anything else is reported as
+  `SourceUnreachableFromTarget`, with the remedy.
 - **Redaction.** Every statement that carries the connection string is executed
   with `sql.execute(..., describe=…)` and a redacted rendering. The password
   therefore reaches neither operator logs nor status messages.
@@ -541,7 +612,8 @@ Column lists work the same way: the operator compares them against
 On a converged replication, a pass runs only catalog reads and statistics reads
 on both servers. No DDL is issued, and the only status that changes is
 `status.health` (see D4). The existing no-op assertion is extended to this kind
-on that basis.
+on that basis. The publication is read once per pass, and read back only after
+a pass changed its tables.
 
 ## Health
 
@@ -615,9 +687,20 @@ always true when a whole namespace is being deleted.
       source, this also drops the slot and any table-sync slots.
    3. If that fails, because the target cannot reach the source or a walsender
       still holds the slot, the subscription is detached (`SET (slot_name =
-      NONE)`) and dropped anyway. That is safe because the slot's name and the
-      subscription's oid are recorded in status: step 2 finds the slot, and
-      the table-sync slots by their `pg_<oid>_sync_*` names.
+      NONE)`) and dropped anyway. That is safe because the slot's name, the
+      subscription's oid and the target's system identifier are recorded in
+      status: step 2 finds the slot, and the table-sync slots by their
+      `pg_<oid>_sync_<relid>_<system identifier>` names.
+
+      The oid alone would not do. The target server assigns it, so another
+      target subscribing to the same source can hold a subscription with the
+      same oid, and its table-sync slots differ from these only in the system
+      identifier (PostgreSQL appends it for exactly this reason). The
+      identifier is read with `pg_control_system()` when the subscription is
+      created. If status has none, a table-sync slot of that oid could be
+      either target's: it is neither ended nor dropped, and the finalizer is
+      held with an error that names it until it is gone, because its own
+      subscriber finished its copy or someone dropped it by hand.
 2. **Source, slots:**
    1. Any slot still held has its walsender ended (`active_pid`). Its
       subscriber is gone or detached.
@@ -643,14 +726,19 @@ always true when a whole namespace is being deleted.
    on that same pass, after the subscription carries the new connection string,
    and only as far as it is the operator's — a generated login and its Secret
    go, a provided one keeps both and loses only the memberships the operator
-   granted it.
+   granted it. The status patch that records the new login moves the old one
+   to `status.supersededLogins`, with whether the operator made it, its Secret
+   and the memberships the operator granted it. It stays there until it is
+   removed, so a pass that fails before then leaves it to the next pass, and
+   teardown removes it too.
 5. **Secret:** delete the credentials Secret, for a generated login only, and
    only once the source is cleared. It is the login's credential, and step 2
    may still need it.
 6. **Target data:** never touched.
 
-Each server is handled independently. If the **target is unreachable**, the
-source is cleared anyway, because the slot is the dangerous part. The
+Each server is handled independently. If the **target is unreachable**, or
+cannot be cleared for any other reason, the source is cleared anyway, because
+the slot is the dangerous part. The
 subscription is then retried as a temporary error, and when it can be reached
 it is dropped detached. If the **source is unreachable**, the subscription is
 still dropped; the target can usually reach the source even when the operator
@@ -661,6 +749,15 @@ wrong for a resource with two sides. If the target `PostgresInstance` is gone,
 the source slot must still be dropped. The replication teardown therefore
 handles each side's instance separately. It releases the finalizer only when
 both sides are done, or when both sides' instances are gone.
+
+Its other shortcut, releasing the finalizer on a `ConfigurationError`, is
+wrong here too, and the replication handler opts out of both. A
+`PostgresInstance` that still exists but cannot be used, because its spec no
+longer parses or its credentials Secret is gone, may still have this
+replication's objects on its server. That side holds the finalizer, with a
+retried error that names the cause, and the other side is cleared regardless.
+`minServerVersion` and `allowedNamespaces` do not apply to teardown at all:
+they are conditions for creating objects, not for removing them.
 
 ## Interaction with the existing kinds
 
@@ -831,6 +928,11 @@ Scenarios:
 - **Teardown, target container stopped.** The source slot is still dropped and
   the finalizer waits for the target.
 - **Teardown, source stopped.** The finalizer holds, and no slot is orphaned.
+- **Teardown, an instance that exists but cannot be used.** An invalid spec or
+  a missing credentials Secret holds the finalizer for that side only; a
+  `minServerVersion` above the server's holds nothing.
+- **Teardown, another target's table-sync slot.** A slot named for the same
+  subscription oid but another system identifier is left alone.
 - **`PostgresDB` `DROP` teardown.** It waits for a replication that references
   it.
 
@@ -874,10 +976,21 @@ release, one RDS 16 or 17 pair must confirm each of the following:
 - **Connection string.** `subconninfo` is unreadable, as assumed.
 - **TLS.** Whether any server-local CA path works for `sslmode=verify-full` from
   an RDS subscriber (D11).
+- **SCRAM.** A subscription whose connection string carries
+  `require_auth=scram-sha-256` connects, for both a generated login and one
+  granted `rds_replication` by hand. This depends on the source's
+  `password_encryption` when the login's password was set.
 - **Statement log.** What `log_statement=ddl` puts in CloudWatch for `CREATE
   SUBSCRIPTION`.
 - **Multi-AZ failover.** What happens to the slot when a Multi-AZ DB instance
   fails over (undocumented).
+- **System identifier.** The master user can read `pg_control_system()`. Also
+  whether two RDS instances report different system identifiers: a
+  third-party report says some RDS instances share one. Where two targets
+  share it, it cannot tell their table-sync slots apart, and a subscription
+  oid that also matches puts the other's slots back in teardown's reach. A
+  target restored from another's snapshot is a physical copy, and would share
+  it too (inferred, not checked).
 
 ## Delivery plan
 

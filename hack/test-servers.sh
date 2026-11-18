@@ -41,7 +41,11 @@ variables() {
 }
 
 start() { # name image port
+  # host.docker.internal lets a server reach this machine: one test stands up
+  # a fake source here to prove the replication password is never handed to
+  # it. Docker Desktop and OrbStack define the name; Linux needs it added.
   docker run -d --name "$1" --network "$network" \
+    --add-host host.docker.internal:host-gateway \
     -e POSTGRES_PASSWORD=testpw -p "$3:5432" "$2" \
     -c wal_level=logical -c max_connections=200 >/dev/null
 }

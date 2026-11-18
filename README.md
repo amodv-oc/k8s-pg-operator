@@ -572,18 +572,29 @@ Every `reconcile.replicationInterval` seconds (60 by default), a pass:
    `PostgresDB`s exist on different servers, and that both instances admit the
    replication's namespace. Every selected schema must be managed by the
    source. The replication must not close a loop of any length, because a
-   subscription republishes what it applies. Both servers must run PostgreSQL
+   subscription republishes what it applies. The one refused is the one that
+   closes the loop: a replication that has got as far as its subscription is refused only
+   for a loop of others that have one too, and of two that have none yet, the
+   younger is refused. Both servers must run PostgreSQL
    16 or later. The source must have `wal_level = logical` and a free
-   replication slot, and the target's managing role must be able to create
+   replication slot (unless the replication's own slot is already there, left
+   by an earlier pass), and the target's managing role must be able to create
    subscriptions.
 2. **Ensures a replication login on the source.** By default this is generated:
    it is granted `rds_replication` so it can stream, and the source's
    `<db>_ro` group so it can read. Its password is in a Secret in the
    operator's namespace. A login supplied with `credentialsSecretRef` is used
-   instead and never altered, apart from the `<db>_ro` membership. Adding or
+   instead and never altered, apart from the `<db>_ro` membership. Its Secret
+   is always read from the replication's own namespace, and it must be a
+   dedicated login: the managing role, a superuser and a member of
+   `rds_superuser` are refused, because the password is stored on the target
+   server and sent to `source.connection`. Adding or
    removing `credentialsSecretRef` later swaps the login: the one it replaces
    is removed once the subscription uses the new one — a generated login and
-   its Secret are dropped, a supplied one keeps both.
+   its Secret are dropped, a supplied one keeps both and loses only the
+   memberships the operator granted it. Until then it is listed in
+   `status.supersededLogins`, so a pass that fails first, or a deletion,
+   still removes it.
 3. **Converges a publication that lists its tables explicitly.** A table is
    added only once *both* servers can take it. Every other table appears in
    `status.excludedTables` with its reason and remedy.
@@ -611,6 +622,18 @@ Every `reconcile.replicationInterval` seconds (60 by default), a pass:
    - **The reason that protects the target:** `TargetTableNotEmpty`. A table's
      initial copy would collide with rows already on the target, so the
      table waits until it is emptied there, or until `copyData` is false.
+   - **A published table that later fails a target-side check** stays
+     published while the subscription carries it, and is listed in
+     `status.tableWarnings`: the change that broke apply is already in the
+     stream, and unpublishing cannot recall it. A table the subscription no
+     longer carries is different. Dropping a table on the target removes it
+     from the subscription, so one that was dropped there - or dropped and
+     recreated, as a table rewrite does - is unpublished and held back like
+     any other. It is never refreshed back in over the rows it already holds.
+     A partitioned table published through its partitions stays published
+     while any of them is carried. If the target lacks a newer partition, the
+     subscription is not refreshed until it has one (`RefreshHeldBack`), and
+     tables published meanwhile wait with it.
 4. **Converges the subscription on the target.** It is created with the slot,
    and kept enabled or disabled as the spec says. Its connection is updated
    when the login's password changes. It is refreshed when the publication's
@@ -648,11 +671,22 @@ The target server, not the operator, connects to the source. If it cannot, the
 replication reports `SourceUnreachableFromTarget`. Set `source.connection.host`
 if the target resolves the source differently from the operator.
 
-Every object the operator creates carries an ownership comment and is recorded
-in status the moment it exists. An existing object with the same name is never
-taken over. An idle slot left by an earlier incarnation is adopted. The slot is
-always created from the source before the subscription, never by `CREATE
-SUBSCRIPTION` itself. That avoids a deadlock between replications created at
+That connection authenticates with SCRAM-SHA-256 and nothing else
+(`require_auth=scram-sha-256` in the subscription's connection string).
+`source.connection.host` is free-form, and libpq otherwise sends the password
+in cleartext to any server that asks for it, so a replication pointed at the
+wrong host would hand that host the password. With SCRAM the target proves it
+knows the password without sending it. A source that asks for `md5` or
+cleartext authentication, or that stores the login's password as an MD5 hash,
+is refused the same way, and the error says so.
+
+Every object the operator creates is recorded in status before it is created,
+so a pass that stops part-way leaves nothing teardown cannot find. The
+publication, subscription and generated login carry an ownership comment from
+the moment they exist: each is created and commented in one transaction. An
+existing object with the same name is never taken over. An idle slot left by an
+earlier incarnation is adopted. The slot is always created from the source
+before the subscription, never by `CREATE SUBSCRIPTION` itself. That avoids a deadlock between replications created at
 the same time in opposite directions.
 
 Deleting a `PostgresReplication` removes, whatever the `retentionPolicy`:
@@ -666,6 +700,13 @@ The finalizer holds until the source's slots are confirmed gone. A slot left
 behind retains WAL until the disk fills. If either server is unreachable, the
 other is cleared first. The replicated rows on the target are never touched.
 
+A table-sync slot is recognised by the subscription's oid and the target's
+system identifier, so another target's subscription that happens to have the
+same oid keeps its own. A `PostgresInstance` that still exists but cannot be
+used, because its spec is invalid or its credentials Secret is missing, holds
+the finalizer with an error that says why; `minServerVersion` and
+`allowedNamespaces` apply to creating objects, never to removing them.
+
 A `PostgresDB` with `retentionPolicy: DROP` waits to be dropped while a
 replication uses it, in either direction.
 
@@ -673,7 +714,7 @@ replication uses it, in either direction.
 | --- | --- | --- |
 | `source.dbRef`, `target.dbRef` | — | `name`, `namespace`. Immutable |
 | `source.connection` | the source instance's | `host`, `port`, `sslMode` (`require`), `sslRootCertPath`. How the target *server* reaches the source |
-| `source.credentialsSecretRef` | generated | A pre-provisioned replication login; read, never written |
+| `source.credentialsSecretRef` | generated | `name`, `usernameKey`, `passwordKey`. A pre-provisioned, dedicated replication login; read, never written. The Secret is in the replication's own namespace: there is no `namespace` field |
 | `schemas[]` | — | `name`, `excludeTables`. Every eligible table, re-enumerated each pass |
 | `tables[]` | — | `schema`, `name`, `columns`, `rowFilter`. At least one of `schemas`/`tables` |
 | `rowFilter` | — | `all` (AND) or `any` (OR) of `{column, op, value \| values}`; `op` is `Eq` `Ne` `Lt` `Le` `Gt` `Ge` `In` `IsNull` `IsNotNull`. Never SQL text |
@@ -739,6 +780,13 @@ A misconfigured spec is a **permanent** error — retrying cannot help until the
 spec changes. A missing reference, an unreachable server or a failed statement
 is **temporary** and retried with backoff. Failures are written to status, so
 the reason is on the object rather than only in the logs.
+
+Passes share up to `PG_OPERATOR_POOL_MAX_SIZE` (chart: `postgres.poolMaxSize`)
+pooled connections per database, and a replication pass holds its source and
+target connections for as long as it runs. A pass that waits the whole connect
+timeout for one, on a server that still accepts a direct connection, fails with
+reason `PoolExhausted` and leaves `Reachable` alone: the server is fine, and
+other passes on that database hold every connection.
 
 ### Metrics
 

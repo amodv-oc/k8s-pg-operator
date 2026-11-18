@@ -135,21 +135,23 @@ class ReconcileContext:
         return spec, generation
 
     async def resolve_instance(
-        self, name: str, *, for_namespace: str | None = None
+        self, name: str, *, for_namespace: str | None = None, version_floor: bool = True
     ) -> ResolvedInstance:
         """Load a PostgresInstance and turn it into a usable endpoint.
 
         Also enforces the instance's ``allowedNamespaces`` gate and its
         ``minServerVersion`` floor, so a database or user in a namespace that is
         not permitted to use an instance fails with a clear message instead of
-        quietly getting objects created.
+        quietly getting objects created. Both are conditions for creating
+        objects: a teardown removing what was already created passes no
+        ``for_namespace`` and ``version_floor=False``.
         """
         spec, generation = await self.load_instance_spec(name, for_namespace=for_namespace)
 
         endpoint = await self.build_endpoint(name, spec)
         server = await self._describe(endpoint)
 
-        if spec.min_server_version and server.major_version < spec.min_server_version:
+        if version_floor and spec.min_server_version and server.major_version < spec.min_server_version:
             raise ConfigurationError(
                 f"PostgresInstance {name!r} requires PostgreSQL "
                 f">= {spec.min_server_version} but the server reports {server.version}"

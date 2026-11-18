@@ -7,6 +7,7 @@ retention decisions rather than the SQL primitives alone.
 
 from __future__ import annotations
 
+import dataclasses
 from typing import Any
 
 import pytest
@@ -1075,3 +1076,31 @@ async def test_connection_failure_names_the_real_cause(ctx, k8s) -> None:
     finally:
         del instance_obj["spec"]["connectTimeoutSeconds"]
         await ctx.pools.close_database(INSTANCE, "e2e_no_such_database")
+
+
+async def test_a_saturated_pool_is_not_reported_as_an_unreachable_server(endpoint) -> None:
+    """Every pooled connection in use is the operator's own queue, not the server's fault.
+
+    Reported as a connection failure, it marked the resource Unreachable and
+    sent whoever was on call to the network and credentials of a server that
+    was answering all along.
+    """
+    from pg_operator.errors import ConnectionFailure, OperatorError, PoolExhausted
+
+    pools = PoolRegistry(Settings(operator_namespace=OPERATOR_NS, pool_max_size=1))
+    hurried = dataclasses.replace(endpoint, connect_timeout=1)
+    try:
+        async with pools.connection(hurried):
+            with pytest.raises(OperatorError) as excinfo:
+                async with pools.connection(hurried):
+                    pass
+        # Once the holder is done, the pool serves again.
+        async with pools.connection(hurried) as conn:
+            assert await fetch_scalar(conn, sql.SQL("SELECT 1")) == 1
+    finally:
+        await pools.close_all()
+    assert not isinstance(excinfo.value, ConnectionFailure), str(excinfo.value)
+    assert isinstance(excinfo.value, PoolExhausted)
+    message = str(excinfo.value)
+    assert "all 1 connection" in message
+    assert "PG_OPERATOR_POOL_MAX_SIZE" in message

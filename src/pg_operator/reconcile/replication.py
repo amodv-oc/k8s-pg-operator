@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
@@ -33,16 +34,24 @@ from ..errors import (
     ReplicationRefused,
     SourceUnreachableFromTarget,
 )
-from ..k8s.resources import get_database, list_replications, patch_status
+from ..k8s.client import K8sClient
+from ..k8s.resources import (
+    get_database,
+    list_databases,
+    list_instances,
+    list_replications,
+    patch_status,
+)
 from ..k8s.secrets import apply_secret, delete_secret, generate_password, managed_labels, read_secret
 from ..models import (
     AlertingSpec,
-    CredentialsSecretRef,
     DatabaseSpec,
     InstanceSpec,
+    LocalCredentialsSecretRef,
     ObjectRef,
     ReplicationSpec,
     parse_database_spec,
+    parse_instance_spec,
     parse_replication_spec,
 )
 from ..naming import ReplicationNames, replication_names
@@ -61,6 +70,7 @@ from .context import ReconcileContext, ResolvedInstance
 from .eligibility import (
     INVALID_ROW_FILTER,
     PUBLICATION_REFUSED,
+    REFRESH_HELD_BACK,
     Verdict,
     candidates,
     judge,
@@ -130,21 +140,32 @@ class ReplicationResult:
     created: dict[str, bool] = field(default_factory=dict)
     #: Memberships the operator granted the login; teardown revokes only these.
     granted: list[str] = field(default_factory=list)
+    #: Logins this replication used before, each kept in status until it is
+    #: removed: ``login``, ``created``, ``grantedMemberships`` and ``secret``.
+    superseded: list[dict[str, Any]] = field(default_factory=list)
     published: list[str] = field(default_factory=list)
     excluded: list[dict[str, str]] = field(default_factory=list)
     #: Published tables with a target-side problem, kept published (design D6).
     kept: list[dict[str, str]] = field(default_factory=list)
+    #: Kept tables with a partition the subscription does not carry and the
+    #: target cannot receive, by table. A refresh would subscribe those too, so
+    #: it waits while any is listed here.
+    refresh_blockers: dict[str, tuple[str, ...]] = field(default_factory=dict)
     warnings: list[dict[str, str]] = field(default_factory=list)
     row_filters: list[dict[str, str]] = field(default_factory=list)
     changes: list[str] = field(default_factory=list)
     #: The login's password, for the subscription's connection string. Never in status.
     password: str = field(default="", repr=False)
     subscription_oid: int | None = None
+    #: The target's, which ends its table-sync slots' names; see sub.sync_slot_pattern.
+    target_system_identifier: str | None = None
     subscription_enabled: bool = True
     connection_fingerprint: str = ""
     #: ``schema.table -> srsubstate`` for every table the subscription carries.
     subscribed: dict[str, str] = field(default_factory=dict)
     assessment: Assessment | None = None
+    #: Status as this pass last wrote it, so recording patches only a change.
+    recorded: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
     def ready_tables(self) -> int:
@@ -174,6 +195,7 @@ class Resolved:
     target: ReplicationEnd
     source_db: DatabaseSpec
     source_instance: InstanceSpec
+    peers: Peers
 
 
 async def resolve_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> Resolved:
@@ -200,8 +222,9 @@ async def resolve_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> Res
         )
     _refuse_moved_ends(obj.get("status") or {}, source=source, target=target)
     _require_managed_schemas(spec, source, source_db)
-    await _refuse_cycles(ctx, namespace, name, source, target)
-    return Resolved(spec, source, target, source_db, source_instance)
+    peers = await Peers.read(ctx.k8s, namespace, name)
+    await _refuse_cycles(peers, obj, source, target)
+    return Resolved(spec, source, target, source_db, source_instance, peers)
 
 
 def _refuse_moved_ends(
@@ -247,13 +270,26 @@ async def reconcile_replication(
     spec, source, target, source_db = (
         resolved.spec, resolved.source, resolved.target, resolved.source_db
     )
+    oid = (existing.get("target") or {}).get("subscriptionOid")
     result = ReplicationResult(
         source=source,
         target=target,
         names=_names(existing, namespace, name, resolved.source_instance.role_prefix),
+        # What earlier passes recorded stands until this one learns otherwise,
+        # so recording an object early in the pass cannot blank the others.
+        login=str((existing.get("source") or {}).get("login") or ""),
+        credentials=dict(existing.get("credentialsSecret") or {}),
         created={key: bool(value) for key, value in (existing.get("created") or {}).items()},
         granted=list(existing.get("grantedMemberships") or []),
+        superseded=[dict(entry) for entry in existing.get("supersededLogins") or []],
+        subscription_oid=int(oid) if oid else None,
+        target_system_identifier=(existing.get("target") or {}).get("systemIdentifier"),
+        # Normalised as the API server stores it: a key set to None is absent.
+        recorded=_merge_patch({}, existing),
     )
+
+    async def record() -> None:
+        await _record_created(ctx, obj, result)
 
     # 2. Prerequisites: both servers new enough, the source logging logically,
     # the target able to own a subscription.
@@ -286,26 +322,27 @@ async def reconcile_replication(
             )
 
         # Nothing is created until every name is known to be free: a pass that
-        # can never succeed must not leave objects behind it.
+        # can never succeed must not leave objects behind it. The publication
+        # is read here once, and its tables reused by step 5.
         subscription = await sub.get_subscription(dst, result.names.subscription)
-        await _refuse_foreign_objects(src, spec, result, subscription, marker=marker)
-        if subscription is None:
+        publication = await pub.get_publication(src, result.names.publication)
+        await _refuse_foreign_objects(src, spec, result, subscription, publication, marker=marker)
+        if subscription is None and not await sub.slots(
+            src, result.names.subscription, subscription_oid=None
+        ):
+            # A slot an earlier pass made is this replication's to adopt, not
+            # one more that needs room.
             _require_free_slot(info, source)
 
         # 3. The publication (empty for now) and the replication login. Each is
-        # recorded in status the moment it exists, so a pass that fails later
-        # cannot hide it from teardown.
-        if await _ensure_publication(src, spec, result, marker=marker):
-            await _record_created(ctx, obj, result)
-        created_before, granted_before = dict(result.created), set(result.granted)
-        previous_login = str((existing.get("source") or {}).get("login") or "")
+        # recorded in status before it is created, so a pass that fails - or
+        # stops - part-way cannot hide it from teardown.
+        await _ensure_publication(src, spec, result, publication, marker=marker, record=record)
         await _ensure_login(
             ctx, src, spec, info, result,
             namespace=namespace, name=name, marker=marker, read_group=groups["readOnly"],
-            previous_login=previous_login,
+            record=record,
         )
-        if result.created != created_before or set(result.granted) != granted_before:
-            await _record_created(ctx, obj, result)
 
         # 4. The table set, judged against both catalogs.
         catalog = await pub.describe_source_tables(
@@ -328,22 +365,23 @@ async def reconcile_replication(
             else frozenset()
         )
         # Only a table about to get an initial copy needs an empty target; the
-        # rest are not even looked at.
+        # rest are not even looked at. Each is read as its owner, never as the
+        # managing role - see nonempty_tables.
         nonempty = (
             frozenset(
                 await pub.nonempty_tables(
                     dst,
                     (
-                        (relation.schema, relation.name)
+                        relation
                         for relation in targets.values()
-                        if relation.owner_settable and relation.qualified not in subscribed
+                        if relation.qualified not in subscribed
                     ),
                 )
             )
             if spec.copy_data
             else frozenset()
         )
-        claims = await _claims_elsewhere(ctx, obj, target)
+        claims = await _claims_elsewhere(resolved.peers, obj, target)
         verdicts = [
             judge(
                 candidate,
@@ -363,8 +401,9 @@ async def reconcile_replication(
             for candidate in selected
         ]
 
-        # 5. The publication's tables.
-        await _converge_tables(src, verdicts, existing, result)
+        # 5. The publication's tables: none yet if step 3 just created it.
+        current = dict(publication.tables) if publication is not None else {}
+        await _converge_tables(src, verdicts, current, existing, result)
 
         # 6. The subscription.
         published = await pub.published_relations(src, result.names.publication)
@@ -375,9 +414,7 @@ async def reconcile_replication(
 
         # The subscription now authenticates as the login the spec asks for, so
         # one this replication used before it has nothing left holding it.
-        await _remove_superseded_login(
-            ctx, src, existing, result, instance=source_instance, previous_login=previous_login
-        )
+        await _remove_superseded_logins(ctx, src, result, instance=source_instance)
 
         # 7. Health.
         observation = Observation(
@@ -429,8 +466,13 @@ async def observe_from_status(ctx: ReconcileContext, obj: dict[str, Any]) -> Ass
         log.debug("cannot observe the source: %s", exc)
         return None
 
-    subscription, tables = None, {}
     oid = target.get("subscriptionOid")
+    if slot is None and not oid:
+        # Recorded just before it was to be made, by a pass that failed first.
+        # No subscription has read from it, so nothing is lost: the next pass
+        # makes it.
+        return None
+    subscription, tables = None, {}
     if oid and target.get("instance") and target.get("database"):
         try:
             instance = await ctx.resolve_instance(str(target["instance"]))
@@ -540,12 +582,120 @@ def _require_managed_schemas(
         )
 
 
+def _rank(meta: dict[str, Any]) -> tuple[str, str, str]:
+    """Which of two replications is older: creation time, then namespace and name, so none tie."""
+    return (
+        str(meta.get("creationTimestamp") or ""),
+        str(meta.get("namespace")),
+        str(meta.get("name")),
+    )
+
+
+def _streams(obj: dict[str, Any]) -> bool:
+    """Whether a replication has a subscription - it replicates, whatever its spec now says.
+
+    ``created.subscription`` is recorded just before the subscription is
+    created, so this is also true of one whose CREATE SUBSCRIPTION is still
+    failing. That errs the safe way: it keeps its place in the graph, and a
+    reverse newcomer waits for it rather than racing it.
+    """
+    return bool(((obj.get("status") or {}).get("created") or {}).get("subscription"))
+
+
+@dataclass(slots=True)
+class Peers:
+    """The other PostgresReplications in the cluster, and where they point, read for one pass.
+
+    PostgresDBs and PostgresInstances are listed once, when first needed, not
+    fetched one per replication, so a pass costs the same few reads however
+    many replications the cluster holds. It lives for one pass only, so it
+    never answers with an end that has since moved. Lookups are ungated:
+    ``allowedNamespaces`` governs what a replication may use, not whether
+    another one's objects exist.
+    """
+
+    k8s: K8sClient
+    replications: list[dict[str, Any]]
+    _databases: dict[tuple[str, str], dict[str, Any]] | None = None
+    _instances: dict[str, dict[str, Any]] | None = None
+    _servers: dict[str, tuple[str, int] | None] = field(default_factory=dict)
+
+    @classmethod
+    async def read(cls, k8s: K8sClient, namespace: str, name: str) -> Peers:
+        """Every PostgresReplication but ``namespace/name``, from one cluster-wide list."""
+        others = []
+        for other in await list_replications(k8s):
+            meta = other.get("metadata") or {}
+            if (meta.get("namespace"), meta.get("name")) != (namespace, name):
+                others.append(other)
+        return cls(k8s, others)
+
+    async def server(self, instance: str) -> tuple[str, int] | None:
+        """A PostgresInstance's ``(host, port)``; None if it does not exist or its spec is invalid."""
+        if instance not in self._servers:
+            if self._instances is None:
+                self._instances = {
+                    str(obj["metadata"]["name"]): obj for obj in await list_instances(self.k8s)
+                }
+            found = self._instances.get(instance)
+            try:
+                spec = parse_instance_spec(found.get("spec") or {}) if found is not None else None
+            except ValueError:
+                spec = None
+            self._servers[instance] = (spec.host.lower(), spec.port) if spec is not None else None
+        return self._servers[instance]
+
+    async def database(self, ref: ObjectRef, namespace: str) -> DatabaseIdentity | None:
+        """The physical database a dbRef names; None if it cannot be resolved."""
+        if self._databases is None:
+            self._databases = {
+                (str(obj["metadata"].get("namespace")), str(obj["metadata"]["name"])): obj
+                for obj in await list_databases(self.k8s)
+            }
+        found = self._databases.get((ref.resolve_namespace(namespace), ref.name))
+        if found is None:
+            return None
+        try:
+            spec = parse_database_spec(found.get("spec") or {})
+            database = spec.resolve_database_name(ref.name)
+        except ValueError:
+            return None
+        server = await self.server(spec.instance_ref.name)
+        return (*server, database) if server is not None else None
+
+
+async def _edge(
+    peers: Peers, other: dict[str, Any]
+) -> tuple[DatabaseIdentity, DatabaseIdentity] | None:
+    """The databases another replication runs between; None if it cannot be placed.
+
+    One that streams is placed where status records its objects, because its
+    subscription is there whatever has become of its spec: its PostgresDB may
+    since have been deleted under RETAIN or recreated elsewhere, or its spec
+    made invalid. Any other is placed by resolving its spec.
+    """
+    status = other.get("status") or {}
+    recorded = [status.get(side) or {} for side in ("source", "target")]
+    if _streams(other) and all(end.get("instance") and end.get("database") for end in recorded):
+        ends = []
+        for end in recorded:
+            server = await peers.server(str(end["instance"]))
+            if server is None:
+                return None
+            ends.append((*server, str(end["database"])))
+        return ends[0], ends[1]
+    try:
+        spec = parse_replication_spec(other.get("spec") or {})
+    except ValueError:
+        return None
+    namespace = str((other.get("metadata") or {}).get("namespace"))
+    source = await peers.database(spec.source.db_ref, namespace)
+    target = await peers.database(spec.target.db_ref, namespace)
+    return (source, target) if source is not None and target is not None else None
+
+
 async def _refuse_cycles(
-    ctx: ReconcileContext,
-    namespace: str,
-    name: str,
-    source: ReplicationEnd,
-    target: ReplicationEnd,
+    peers: Peers, obj: dict[str, Any], source: ReplicationEnd, target: ReplicationEnd
 ) -> None:
     """Refuse a replication that would close a loop of replications.
 
@@ -553,29 +703,39 @@ async def _refuse_cycles(
     beside B->A, but A->B->C->A - sends each change round until a duplicate key
     stops apply. The graph is of physical databases, so two PostgresDBs naming
     the same database cannot hide a loop between them.
+
+    Which other replications count decides which one a possible loop refuses:
+
+    - One that streams always counts, even while it is being deleted - its
+      subscription lasts until its teardown has removed it.
+    - One that does not stream yet counts only for a replication that does not
+      stream either and is younger, and only while it is not being deleted.
+
+    So a newcomer that would close a loop is refused, never the replication
+    already streaming round the rest of it - even if the newcomer is the older
+    one, say because it could not resolve until then. Of two that do not stream
+    yet, whose passes run concurrently, the younger yields: they cannot both go
+    ahead, nor both stand aside. Only a loop that already streams is reported by
+    every replication on it.
     """
+    meta = obj.get("metadata") or {}
+    mine, streaming = _rank(meta), _streams(obj)
     edges: dict[DatabaseIdentity, set[tuple[DatabaseIdentity, str]]] = {}
-    for other in await list_replications(ctx.k8s):
-        meta = other.get("metadata") or {}
-        other_namespace = str(meta.get("namespace"))
-        other_name = str(meta.get("name"))
-        if (other_namespace, other_name) == (namespace, name) or meta.get("deletionTimestamp"):
+    for other in peers.replications:
+        other_meta = other.get("metadata") or {}
+        label = f"{other_meta.get('namespace')}/{other_meta.get('name')}"
+        if not _streams(other) and (
+            streaming or other_meta.get("deletionTimestamp") or _rank(other_meta) >= mine
+        ):
             continue
-        try:
-            other_spec = parse_replication_spec(other.get("spec") or {})
-            other_source, _, _ = await _resolve_end(
-                ctx, other_spec.source.db_ref, other_namespace, side="source", for_namespace=None
-            )
-            other_target, _, _ = await _resolve_end(
-                ctx, other_spec.target.db_ref, other_namespace, side="target", for_namespace=None
-            )
-        except (ConfigurationError, ValueError) as exc:
-            # One that cannot resolve cannot be replicating either.
-            log.debug("ignoring %s/%s in the cycle check: %s", other_namespace, other_name, exc)
+        edge = await _edge(peers, other)
+        if edge is None:
+            # Without a subscription, one that cannot resolve cannot be
+            # replicating; with one, a PostgresInstance its status names is
+            # gone or invalid, so there is no telling which server it is.
+            log.debug("ignoring %s in the cycle check: it cannot be placed", label)
             continue
-        edges.setdefault(other_source.identity, set()).add(
-            (other_target.identity, f"{other_namespace}/{other_name}")
-        )
+        edges.setdefault(edge[0], set()).add((edge[1], label))
 
     loop = _path(edges, start=target.identity, goal=source.identity)
     if loop is not None:
@@ -622,40 +782,75 @@ async def _ensure_login(
     name: str,
     marker: str,
     read_group: str,
-    previous_login: str,
+    record: Callable[[], Awaitable[None]],
 ) -> None:
     """A login the target server can stream as, reading through the source's RO group."""
-    # Start from nothing, so what is recorded is what this pass granted.
-    inherited = list(result.granted)
-    result.granted.clear()
     if spec.source.credentials_secret_ref is not None:
         await _adopt_provided_login(
-            ctx, conn, spec.source.credentials_secret_ref, result, namespace=namespace
+            ctx, conn, spec.source.credentials_secret_ref, info, result, namespace=namespace
         )
+        await record()
     else:
         await _ensure_generated_login(
-            ctx, conn, info, result, namespace=namespace, name=name, marker=marker
+            ctx, conn, info, result, namespace=namespace, name=name, marker=marker, record=record
         )
-    if result.login == previous_login:
-        # The same login as last pass, and a converged pass grants nothing, so
-        # what earlier passes recorded still stands. A *different* login means
-        # those memberships belong to the role this one replaces: teardown must
-        # not revoke a grant it never made, and _remove_superseded_login below
-        # deals with the old role itself.
-        result.granted[:0] = [group for group in inherited if group not in result.granted]
     # USAGE, not mere membership: the login must hold the group's SELECTs.
-    await _grant(conn, read_group, result.login, result, privilege="USAGE")
+    await _grant(conn, read_group, result.login, result, privilege="USAGE", record=record)
+
+
+def _take_login(result: ReplicationResult, login: str, *, credentials: dict[str, Any]) -> None:
+    """Make ``login`` this replication's login, keeping any login it replaces known.
+
+    ``source.credentialsSecretRef`` can be added to, dropped from or repointed
+    at a live replication, which swaps one login for another. The one replaced
+    moves to ``supersededLogins`` - whether the operator made it, its Secret,
+    what the operator granted it - in the same status patch that records the
+    new one, and stays there until it is removed, so neither a pass that fails
+    before then nor teardown can lose it.
+    """
+    generated = bool(credentials.get("generated"))
+    if result.login and result.login != login:
+        entry: dict[str, Any] = {
+            "login": result.login,
+            "created": bool(result.created.get("login")),
+            "grantedMemberships": sorted(set(result.granted)),
+        }
+        if result.created.get("secret") and result.credentials.get("name"):
+            entry["secret"] = {
+                "namespace": result.credentials.get("namespace"),
+                "name": result.credentials["name"],
+            }
+        result.superseded = [e for e in result.superseded if e.get("login") != result.login]
+        result.superseded.append(entry)
+        # What the operator granted belongs to the login it granted it to.
+        result.granted = []
+    for entry in [e for e in result.superseded if e.get("login") == login]:
+        # A login put back before it was removed: it is this one's again.
+        result.superseded.remove(entry)
+        result.granted.extend(
+            group for group in entry.get("grantedMemberships") or [] if group not in result.granted
+        )
+    result.login = login
+    result.credentials = credentials
+    # Recorded false rather than left out for a provided login: status is a
+    # merge patch, and a key left out would keep an earlier pass's true - and
+    # teardown would drop the user's own login and delete the Secret it read.
+    result.created["login"] = generated
+    result.created["secret"] = generated
 
 
 async def _adopt_provided_login(
     ctx: ReconcileContext,
     conn: AsyncConnection,
-    ref: CredentialsSecretRef,
+    ref: LocalCredentialsSecretRef,
+    info: LogicalReplicationInfo,
     result: ReplicationResult,
     *,
     namespace: str,
 ) -> None:
-    secret_namespace = ref.resolve_namespace(namespace)
+    # The replication's own namespace, never another: the operator reads
+    # Secrets cluster-wide, and the reference must not lend that reach out.
+    secret_namespace = namespace
     data = await read_secret(ctx.k8s, secret_namespace, ref.name)
     missing = [key for key in (ref.username_key, ref.password_key) if not data.get(key)]
     if missing:
@@ -669,19 +864,28 @@ async def _adopt_provided_login(
             f"credentialsSecretRef {secret_namespace}/{ref.name} names login {login!r}, "
             f"which does not exist on {result.source.instance}"
         )
+    privileged = await _privileged(conn, login, managing_role=info.current_user)
+    if privileged:
+        # This login's password goes into the target's catalog, and to whatever
+        # server source.connection names. Neither is a place for a credential
+        # that can do more than stream.
+        raise ConfigurationError(
+            f"credentialsSecretRef {secret_namespace}/{ref.name} names login {login!r}, which is "
+            f"{privileged} on {result.source.instance}; a replication login's password is stored "
+            "on the target server and sent to source.connection, so provide a dedicated login "
+            "that holds REPLICATION (or rds_replication) and nothing more"
+        )
     if not role.replication and not await _member_of(conn, login, "rds_replication"):
         raise ConfigurationError(
             f"login {login!r} from credentialsSecretRef holds neither REPLICATION nor "
             "rds_replication, so the target server could not stream as it"
         )
-    result.login = login
-    result.password = data[ref.password_key].decode()
-    result.credentials = {"namespace": secret_namespace, "name": ref.name, "generated": False}
     # Neither the role nor the Secret is the operator's work, whatever an
-    # earlier pass with a generated login recorded. Leaving these set would
-    # have teardown drop the user's own login and delete the Secret it read.
-    result.created["login"] = False
-    result.created["secret"] = False
+    # earlier pass with a generated login recorded.
+    _take_login(
+        result, login, credentials={"namespace": secret_namespace, "name": ref.name, "generated": False}
+    )
+    result.password = data[ref.password_key].decode()
 
 
 async def _ensure_generated_login(
@@ -693,6 +897,7 @@ async def _ensure_generated_login(
     namespace: str,
     name: str,
     marker: str,
+    record: Callable[[], Awaitable[None]],
 ) -> None:
     login = result.names.login
     if info.replication_grant == "none":
@@ -710,25 +915,34 @@ async def _ensure_generated_login(
         stored = None
     password = stored.decode() if stored else generate_password()
 
+    # Recorded before the role and its Secret exist, so a pass that fails - or
+    # stops - after making them still leaves them to teardown.
+    _take_login(
+        result, login, credentials={"namespace": secret_namespace, "name": secret_name, "generated": True}
+    )
+    await record()
+
     # REPLICATION is named only when it is how streaming is granted. Restating
     # it otherwise would emit NOREPLICATION, which a managing role without
     # REPLICATION - the RDS master user - is refused even as a no-op.
     attributes = {"login": True, "inherit": True}
     if info.replication_grant == "attribute":
         attributes["replication"] = True
-    created = await pgroles.ensure_login_role(conn, login, password=password, attributes=attributes)
+    # One transaction, so the role never exists without the marker that makes
+    # it this replication's: an unmarked one would be refused as foreign.
+    async with conn.transaction():
+        created = await pgroles.ensure_login_role(conn, login, password=password, attributes=attributes)
+        if created:
+            await execute(conn, sql.SQL("COMMENT ON ROLE {} IS {}").format(ident(login), literal(marker)))
     if created:
-        await execute(conn, sql.SQL("COMMENT ON ROLE {} IS {}").format(ident(login), literal(marker)))
         result.changes.append(f"created replication login {login}")
     elif stored is None:
         await pgroles.set_password(conn, login, password)
         result.changes.append("credentials Secret was missing; generated and applied a new password")
-    result.created["login"] = True
-    result.login = login
     result.password = password
 
     if info.replication_grant == "rds_replication":
-        await _grant(conn, "rds_replication", login, result, privilege="MEMBER")
+        await _grant(conn, "rds_replication", login, result, privilege="MEMBER", record=record)
 
     secret_created, secret_changed = await apply_secret(
         ctx.k8s,
@@ -746,77 +960,95 @@ async def _ensure_generated_login(
         result.changes.append(f"created Secret {secret_namespace}/{secret_name}")
     elif secret_changed:
         result.changes.append(f"updated Secret {secret_namespace}/{secret_name}")
-    result.created["secret"] = True
-    result.credentials = {"namespace": secret_namespace, "name": secret_name, "generated": True}
 
 
-async def _remove_superseded_login(
-    ctx: ReconcileContext,
-    conn: AsyncConnection,
-    existing: dict[str, Any],
-    result: ReplicationResult,
-    *,
-    instance: ResolvedInstance,
-    previous_login: str,
+async def _remove_superseded_logins(
+    ctx: ReconcileContext, conn: AsyncConnection, result: ReplicationResult, *, instance: ResolvedInstance
 ) -> None:
-    """Remove the login this replication used before, once nothing streams as it.
+    """Remove the logins this replication used before, once nothing streams as them.
 
-    ``source.credentialsSecretRef`` can be added to, dropped from or repointed
-    at a live replication, which swaps one login for another. The one being
-    replaced is the operator's to remove only if the operator made it; a
-    provided login keeps its role and its Secret, and loses only the
-    memberships the operator granted it. Runs after the subscription carries
-    the new connection string, so the session it ends is one nothing reopens.
+    Runs after the subscription carries the new connection string, so the
+    session it ends is one nothing reopens. Each stays in status until this
+    has run, so a pass that fails first leaves it for the next one, or for
+    teardown.
     """
-    if not previous_login or previous_login == result.login:
-        return
-    was = {key: bool(value) for key, value in (existing.get("created") or {}).items()}
-    if await pgroles.role_exists(conn, previous_login):
-        if was.get("login"):
-            # Signalling the login's sessions takes membership of it.
-            with contextlib.suppress(ReconcileFailure):
-                await pgroles.ensure_self_membership(
-                    conn, previous_login, per_grant_options=instance.server.supports_per_grant_options
-                )
-            await pgroles.terminate_role_sessions(conn, previous_login)
-            await pgroles.revoke_all_memberships(conn, previous_login)
-            await pgroles.drop_role(conn, previous_login)
-            result.changes.append(f"dropped the superseded replication login {previous_login}")
-        else:
-            held = await pgroles.memberships(conn, previous_login)
-            for group in existing.get("grantedMemberships") or []:
-                if group in held:
-                    await pgroles.revoke_membership(conn, group, previous_login)
-            result.changes.append(
-                f"revoked this replication's grants from the superseded login {previous_login}"
-            )
+    keep = (result.credentials.get("namespace"), result.credentials.get("name"))
+    for entry in list(result.superseded):
+        if entry.get("login") != result.login:
+            removed = await _remove_login_role(conn, instance, entry)
+            removed += await _remove_login_secret(ctx, entry, keep=keep)
+            result.changes.extend(f"removed {what}" for what in removed)
+        result.superseded.remove(entry)
 
-    credentials = existing.get("credentialsSecret") or {}
-    superseded = (credentials.get("namespace"), credentials.get("name"))
-    if (
-        was.get("secret")
-        and all(superseded)
-        and superseded != (result.credentials.get("namespace"), result.credentials.get("name"))
-        and await delete_secret(ctx.k8s, str(superseded[0]), str(superseded[1]))
-    ):
-        result.changes.append(f"deleted the superseded Secret {superseded[0]}/{superseded[1]}")
+
+async def _remove_login_role(
+    conn: AsyncConnection, instance: ResolvedInstance, entry: dict[str, Any]
+) -> list[str]:
+    """A superseded login, removed as far as it is the operator's.
+
+    One the operator made is dropped. A provided one keeps its role, and loses
+    only the memberships the operator granted it.
+    """
+    login = str(entry.get("login") or "")
+    if not login or not await pgroles.role_exists(conn, login):
+        return []
+    if entry.get("created"):
+        # Signalling the login's sessions takes membership of it.
+        with contextlib.suppress(ReconcileFailure):
+            await pgroles.ensure_self_membership(
+                conn, login, per_grant_options=instance.server.supports_per_grant_options
+            )
+        await pgroles.terminate_role_sessions(conn, login)
+        await pgroles.revoke_all_memberships(conn, login)
+        await pgroles.drop_role(conn, login)
+        return [f"superseded login {login}"]
+    removed: list[str] = []
+    held = await pgroles.memberships(conn, login)
+    for group in entry.get("grantedMemberships") or []:
+        if group in held:
+            await pgroles.revoke_membership(conn, group, login)
+            removed.append(f"{group} membership of superseded login {login}")
+    return removed
+
+
+async def _remove_login_secret(
+    ctx: ReconcileContext, entry: dict[str, Any], *, keep: tuple[Any, Any] = (None, None)
+) -> list[str]:
+    """A superseded login's Secret, if the operator wrote it and nothing uses it now."""
+    secret = entry.get("secret") or {}
+    where = (secret.get("namespace"), secret.get("name"))
+    if all(where) and where != keep and await delete_secret(ctx.k8s, str(where[0]), str(where[1])):
+        return [f"superseded Secret {where[0]}/{where[1]}"]
+    return []
 
 
 async def _grant(
-    conn: AsyncConnection, group: str, member: str, result: ReplicationResult, *, privilege: str
+    conn: AsyncConnection,
+    group: str,
+    member: str,
+    result: ReplicationResult,
+    *,
+    privilege: str,
+    record: Callable[[], Awaitable[None]],
 ) -> None:
-    """Grant membership if missing, then read it back - GRANT only warns when refused."""
+    """Grant membership if missing, then read it back - GRANT only warns when refused.
+
+    A grant is recorded before it is made, so teardown revokes it even if the
+    pass stops straight after. A membership the login already held directly
+    is not the operator's, and is not recorded.
+    """
     has = sql.SQL("SELECT pg_has_role(%s, %s, %s)")
     if await fetch_scalar(conn, has, (member, group, privilege)):
         return
+    if group not in result.granted and group not in await pgroles.memberships(conn, member):
+        result.granted.append(group)
+        await record()
     await pgroles.grant_membership(conn, group, member)
     if not await fetch_scalar(conn, has, (member, group, privilege)):
         raise ReconcileFailure(
             f"GRANT {group} TO {member} was accepted but did not take effect; the managing "
             f"role needs ADMIN OPTION on {group}"
         )
-    if group not in result.granted:
-        result.granted.append(group)
     result.changes.append(f"granted {group} to {member}")
 
 
@@ -827,6 +1059,17 @@ async def _member_of(conn: AsyncConnection, member: str, group: str) -> bool:
     return bool(exists) and bool(
         await fetch_scalar(conn, sql.SQL("SELECT pg_has_role(%s, %s, 'MEMBER')"), (member, group))
     )
+
+
+async def _privileged(conn: AsyncConnection, login: str, *, managing_role: str) -> str | None:
+    """What makes ``login`` too powerful to be a replication login, if anything does."""
+    if login == managing_role:
+        return "the managing role"
+    if await fetch_scalar(conn, sql.SQL("SELECT rolsuper FROM pg_roles WHERE rolname = %s"), (login,)):
+        return "a superuser"
+    if await _member_of(conn, login, "rds_superuser"):
+        return "a member of rds_superuser"
+    return None
 
 
 async def _role_comment(conn: AsyncConnection, role: str) -> str | None:
@@ -846,7 +1089,7 @@ async def _role_comment(conn: AsyncConnection, role: str) -> str | None:
 
 
 async def _claims_elsewhere(
-    ctx: ReconcileContext, obj: dict[str, Any], target: ReplicationEnd
+    peers: Peers, obj: dict[str, Any], target: ReplicationEnd
 ) -> dict[str, str]:
     """Tables an older replication already publishes into the same target database.
 
@@ -854,27 +1097,18 @@ async def _claims_elsewhere(
     it - by creation time, then namespace and name - so the two cannot each
     defer to the other and both drop it.
     """
-    meta = obj.get("metadata") or {}
-    mine = (str(meta.get("creationTimestamp") or ""), str(meta.get("namespace")), str(meta.get("name")))
+    mine = _rank(obj.get("metadata") or {})
     claims: dict[str, str] = {}
-    for other in await list_replications(ctx.k8s):
+    for other in peers.replications:
         other_meta = other.get("metadata") or {}
-        rank = (
-            str(other_meta.get("creationTimestamp") or ""),
-            str(other_meta.get("namespace")),
-            str(other_meta.get("name")),
-        )
+        rank = _rank(other_meta)
         if rank >= mine or other_meta.get("deletionTimestamp"):
             continue
         status = other.get("status") or {}
         other_target = status.get("target") or {}
         if other_target.get("database") != target.database or not other_target.get("instance"):
             continue
-        try:
-            instance_spec, _ = await ctx.load_instance_spec(str(other_target["instance"]))
-        except ConfigurationError:
-            continue
-        if (instance_spec.host.lower(), instance_spec.port) != target.server:
+        if await peers.server(str(other_target["instance"])) != target.server:
             continue
         for table in status.get("publishedTables") or []:
             claims.setdefault(str(table), f"{rank[1]}/{rank[2]}")
@@ -891,14 +1125,15 @@ async def _refuse_foreign_objects(
     spec: ReplicationSpec,
     result: ReplicationResult,
     subscription: sub.SubscriptionState | None,
+    state: pub.PublicationState | None,
     *,
     marker: str,
 ) -> None:
     """Refuse to proceed if a name this replication needs belongs to someone else.
 
-    Read-only, and run before anything is created. An object carrying this
-    replication's marker - or recorded in status as created - is its own; any
-    other object of that name is never taken over.
+    Read-only, and run before anything is created or recorded. An object
+    carrying this replication's marker - or recorded in status as created - is
+    its own; any other object of that name is never taken over.
     """
     if (
         subscription is not None
@@ -911,7 +1146,6 @@ async def _refuse_foreign_objects(
             f"is {subscription.comment!r}); the operator will not take it over"
         )
     name = result.names.publication
-    state = await pub.get_publication(conn, name)
     if state is not None and state.comment != marker and not result.created.get("publication"):
         raise ConfigurationError(
             f"a publication named {name} already exists in {result.source.display} and was "
@@ -934,76 +1168,118 @@ async def _refuse_foreign_objects(
 
 
 async def _ensure_publication(
-    conn: AsyncConnection, spec: ReplicationSpec, result: ReplicationResult, *, marker: str
-) -> bool:
-    """Create the publication, or converge its options. True if it was created."""
+    conn: AsyncConnection,
+    spec: ReplicationSpec,
+    result: ReplicationResult,
+    state: pub.PublicationState | None,
+    *,
+    marker: str,
+    record: Callable[[], Awaitable[None]],
+) -> None:
+    """Create the publication, or converge its options."""
     name = result.names.publication
-    state = await pub.get_publication(conn, name)
+    # Recorded before it is created - or as soon as one carrying the marker is
+    # adopted - so that from here on teardown removes it.
     result.created["publication"] = True
+    await record()
     if state is None:
         await pub.create_publication(
             conn, name, operations=spec.publish, via_root=spec.publish_via_partition_root, comment=marker
         )
         result.changes.append(f"created publication {name}")
-        return True
+        return
     if state.operations != set(spec.publish) or state.via_root != spec.publish_via_partition_root:
         await pub.set_publication_options(
             conn, name, operations=spec.publish, via_root=spec.publish_via_partition_root
         )
         result.changes.append(f"set publish = {', '.join(spec.publish)}")
-    return False
 
 
 async def _record_created(ctx: ReconcileContext, obj: dict[str, Any], result: ReplicationResult) -> None:
-    """Write what now exists to status, before the rest of the pass can fail.
+    """Write what exists, or is about to, to status before the rest of the pass can fail.
 
     A failed pass publishes only its conditions. Without this, an object made
     early in it would be unknown to teardown - and would outlive a deletion
-    that came before the next successful pass.
+    that came before the next successful pass. Called *before* each object is
+    created, so a pass that stops between creating and recording cannot hide
+    it either; teardown passes over a recorded object that does not exist.
+
+    Patches only when the record changes, so a converged pass writes nothing,
+    and never writes an empty login or oid: under merge-patch semantics that
+    would erase what an earlier pass recorded.
     """
-    meta = obj.get("metadata") or {}
-    await patch_status(
-        ctx.k8s,
-        PLURAL_REPLICATION,
-        str(meta.get("name")),
+    source = {
+        **result.source.as_status(),
+        "publication": result.names.publication,
+        "slot": result.names.subscription,
+    }
+    if result.login:
+        source["login"] = result.login
+    target = {**result.target.as_status(), "subscription": result.names.subscription}
+    if result.subscription_oid is not None:
+        target["subscriptionOid"] = result.subscription_oid
+    if result.target_system_identifier:
+        target["systemIdentifier"] = result.target_system_identifier
+    patch = copy.deepcopy(
         {
-            "source": {
-                **result.source.as_status(),
-                "publication": result.names.publication,
-                "slot": result.names.subscription,
-                "login": result.login,
-            },
-            "target": {
-                **result.target.as_status(),
-                "subscription": result.names.subscription,
-                "subscriptionOid": result.subscription_oid,
-            },
+            "source": source,
+            "target": target,
             "credentialsSecret": result.credentials,
             "created": result.created,
             "grantedMemberships": sorted(set(result.granted)),
-        },
-        str(meta.get("namespace")),
+            # None removes the key once nothing is waiting to be removed.
+            "supersededLogins": result.superseded or None,
+        }
     )
+    merged = _merge_patch(result.recorded, patch)
+    if merged == result.recorded:
+        return
+    meta = obj.get("metadata") or {}
+    await patch_status(
+        ctx.k8s, PLURAL_REPLICATION, str(meta.get("name")), patch, str(meta.get("namespace"))
+    )
+    result.recorded = merged
+
+
+def _merge_patch(target: Any, patch: Any) -> Any:
+    """What ``target`` becomes under a JSON merge patch (RFC 7386), as the API server applies it."""
+    if not isinstance(patch, dict):
+        return patch
+    merged = dict(target) if isinstance(target, dict) else {}
+    for key, value in patch.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = _merge_patch(merged.get(key), value)
+    return merged
 
 
 async def _converge_tables(
     conn: AsyncConnection,
     verdicts: list[Verdict],
+    current: dict[str, pub.PublishedTable],
     existing: dict[str, Any],
     result: ReplicationResult,
 ) -> None:
-    """Make the publication carry exactly the publishable tables, as the spec shapes them."""
+    """Make the publication carry exactly the publishable tables, as the spec shapes them.
+
+    ``current`` is the membership as read at the start of the pass. It is read
+    back afterwards only if this changed something.
+    """
     name = result.names.publication
-    state = await pub.get_publication(conn, name)
-    current: dict[str, pub.PublishedTable] = dict(state.tables) if state is not None else {}
+    changed = False
 
     recorded = {entry["table"]: entry for entry in existing.get("rowFilters") or []}
     by_table = {verdict.candidate.qualified: verdict for verdict in verdicts}
 
     for table in sorted(current):
         verdict = by_table.get(table)
+        # keeps_membership is false for a table the subscription does not carry:
+        # left published, the refresh below would subscribe it afresh - failing
+        # on a relation the target lacks, or copying over the rows it holds.
         if verdict is None or not (verdict.publishable or verdict.keeps_membership):
             schema, relation = table.split(".", 1)
+            changed = True
             await pub.drop_table(conn, name, schema, relation)
             result.changes.append(f"removed {table} from the publication")
 
@@ -1018,6 +1294,8 @@ async def _converge_tables(
                      "removing it would not recall changes already sent)"}
                     for issue in verdict.issues
                 )
+                if verdict.refresh_blockers:
+                    result.refresh_blockers[table] = verdict.refresh_blockers
             else:
                 result.excluded.extend(issue.as_status(table) for issue in verdict.issues)
             continue
@@ -1029,6 +1307,7 @@ async def _converge_tables(
             continue
         else:
             action, verb = pub.replace_table, "updated"
+        changed = True
         try:
             await action(
                 conn, name, candidate.schema, candidate.name,
@@ -1045,8 +1324,11 @@ async def _converge_tables(
             continue
         result.changes.append(f"{verb} {table}")
 
-    final = await pub.get_publication(conn, name)
-    published = final.tables if final is not None else {}
+    if changed:
+        final = await pub.get_publication(conn, name)
+        published = final.tables if final is not None else {}
+    else:
+        published = current
     result.published = sorted(published)
     result.row_filters = [
         {
@@ -1129,9 +1411,16 @@ async def _converge_subscription(
         ssl_root_cert=connection.ssl_root_cert_path,
     )
     fingerprint = sub.conninfo_fingerprint(conninfo)
+    # Teardown tells this subscription's table-sync slots apart by it, from
+    # status: the target may be unreachable by then. Read for a new subscription.
+    recorded = (existing.get("target") or {}).get("systemIdentifier") if subscription is not None else None
+    result.target_system_identifier = recorded or await sub.get_system_identifier(dst)
 
     if subscription is None:
         await _ensure_slot(ctx, obj, src, source_instance, result)
+        # Recorded before it is created, like the slot.
+        result.created["subscription"] = True
+        await _record_created(ctx, obj, result)
         try:
             await sub.create_subscription(
                 dst,
@@ -1149,13 +1438,16 @@ async def _converge_subscription(
         subscription = await sub.get_subscription(dst, name)
         if subscription is None:  # pragma: no cover - it was created a statement ago
             raise ReconcileFailure(f"subscription {name} was created but cannot be found")
-        result.created["subscription"] = True
         result.subscription_oid = subscription.oid
         result.changes.append(f"created subscription {name}")
+        # Its oid names the table-sync slots teardown must find.
         await _record_created(ctx, obj, result)
     else:
         result.created["subscription"] = True
         result.subscription_oid = subscription.oid
+        # A no-op once recorded; otherwise it was adopted by its marker, or a
+        # login swap is about to reach it - recorded before either is acted on.
+        await _record_created(ctx, obj, result)
         if existing.get("connectionFingerprint") != fingerprint:
             await sub.set_connection(dst, name, conninfo)
             result.changes.append("updated the subscription's connection")
@@ -1174,7 +1466,25 @@ async def _converge_subscription(
 
     subscribed = await sub.subscribed_tables(dst, subscription.oid)
     # A disabled subscription cannot refresh; the tables catch up once it is enabled.
-    if spec.enabled and set(subscribed) != published:
+    if spec.enabled and set(subscribed) != published and result.refresh_blockers:
+        # REFRESH takes everything the publication lists, including a partition
+        # of a kept table that the target lacks (the statement fails, and with
+        # it the pass) or already holds rows in (they would be copied over).
+        # Unpublishing the table instead would stop its other partitions. So
+        # the refresh waits for the target, and says so.
+        result.warnings.extend(
+            {
+                "table": table,
+                "reason": REFRESH_HELD_BACK,
+                "message": (
+                    f"the target cannot yet receive {', '.join(relations)}, and refreshing the "
+                    "subscription would subscribe it too, so its table list is not refreshed "
+                    "until that is fixed there; tables published meanwhile wait with it"
+                ),
+            }
+            for table, relations in sorted(result.refresh_blockers.items())
+        )
+    elif spec.enabled and set(subscribed) != published:
         try:
             await sub.refresh(dst, name, copy_data=spec.copy_data)
         except ReconcileFailure as exc:
@@ -1195,6 +1505,16 @@ def _explain(exc: ReconcileFailure, result: ReplicationResult, host: str, port: 
         return ReplicationRefused(
             f"the source refused {result.login} a replication connection ({text}); on RDS the "
             "login needs rds_replication, on a stock server the REPLICATION attribute"
+        )
+    if "authentication method requirement" in text:
+        # libpq, on the target, declined to answer the server it reached.
+        return SourceUnreachableFromTarget(
+            f"the server {result.target.instance} reached at {host}:{port} did not ask "
+            f"{result.login} to authenticate with SCRAM-SHA-256 ({text}), and the replication "
+            "password is sent no other way; check that source.connection names the source "
+            "itself, that the source's pg_hba uses scram-sha-256 for this login, and that its "
+            "password is stored as a SCRAM verifier (password_encryption = scram-sha-256 when "
+            "it was last set)"
         )
     if "could not connect to the publisher" in text and ("SSL" in text or "certificate" in text):
         # The path works; the two ends disagree about TLS. Security groups are
@@ -1245,6 +1565,11 @@ async def _ensure_slot(
                 f"use (pid {found[0].active_pid}), but this replication has no subscription to "
                 "hold it; it is left alone"
             )
+    # Recorded before it is created: a slot teardown does not know of pins WAL
+    # on the source until its disk fills.
+    result.created["slot"] = True
+    await _record_created(ctx, obj, result)
+    if found:
         result.changes.append(f"adopted idle slot {name}")
     else:
         try:
@@ -1268,9 +1593,6 @@ async def _ensure_slot(
                 "look for long-running transactions in pg_stat_activity there"
             ) from exc
         result.changes.append(f"created slot {name}")
-    if not result.created.get("slot"):
-        result.created["slot"] = True
-        await _record_created(ctx, obj, result)
 
 
 async def _with_slot_privilege(
@@ -1334,45 +1656,62 @@ async def teardown_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> st
     created - not from the dbRefs, whose PostgresDBs may already be gone. The
     replicated data on the target is never touched.
 
-    Each server is handled on its own, because each may be gone or unreachable
-    independently; the finalizer is released only when both are done. The
-    target goes first, so nothing consumes the slot by the time it is dropped;
-    if the target cannot be reached, the source is cleared anyway - its slot is
-    the part that does damage when left behind.
+    Each server is handled on its own, because each may be gone, unreachable
+    or unusable independently; the finalizer is released only when both are
+    done. The target goes first, so nothing consumes the slot by the time it is
+    dropped; if the target cannot be cleared, the source is cleared anyway - its
+    slot is the part that does damage when left behind.
+
+    Only a PostgresInstance that no longer exists counts as done without being
+    cleared. One that exists but cannot be used - its spec no longer parses,
+    its credentials Secret is gone - may still have this replication's objects
+    on its server, so it holds the finalizer with a retried error naming why.
+    Its ``minServerVersion`` and ``allowedNamespaces``, conditions for creating
+    objects, do not apply to removing them.
     """
     status = obj.get("status") or {}
     created = status.get("created") or {}
     granted = list(status.get("grantedMemberships") or [])
     source = status.get("source") or {}
     target = status.get("target") or {}
-    if not (any(created.values()) or granted):
+    superseded = list(status.get("supersededLogins") or [])
+    if not (any(created.values()) or granted or superseded):
         return "nothing to remove; this replication created no objects"
 
     removed: list[str] = []
     unreachable: list[str] = []
+    failed: list[str] = []
 
     if created.get("subscription") and target.get("instance") and target.get("subscription"):
         try:
-            instance = await ctx.resolve_instance(str(target["instance"]))
+            instance = await ctx.resolve_instance(str(target["instance"]), version_floor=False)
             removed.extend(await _remove_subscription(ctx, instance, target))
         except InstanceNotFound as exc:
             log.warning("target instance gone; its subscription goes with the server: %s", exc)
         except ConnectionFailure as exc:
             unreachable.append(f"target {target['instance']} ({exc})")
+        except OperatorError as exc:
+            failed.append(f"target {target['instance']} ({exc})")
 
     source_cleared = False
     if source.get("instance"):
         try:
-            instance = await ctx.resolve_instance(str(source["instance"]))
+            instance = await ctx.resolve_instance(str(source["instance"]), version_floor=False)
             if created.get("subscription") or created.get("slot"):
                 removed.extend(await _remove_slots(ctx, instance, obj, source, target))
             removed.extend(await _remove_source_objects(ctx, instance, source, created, granted))
+            # Logins a swap replaced, by a pass that failed before removing them.
+            async with ctx.connect(instance) as conn:
+                for entry in superseded:
+                    removed.extend(await _remove_login_role(conn, instance, entry))
             source_cleared = True
         except InstanceNotFound as exc:
             log.warning("source instance gone; nothing left on it to remove: %s", exc)
             source_cleared = True
         except ConnectionFailure as exc:
             unreachable.append(f"source {source['instance']} ({exc})")
+        except OperatorError as exc:
+            failed.append(f"source {source['instance']} ({exc})")
 
     # The Secret is the login's credential: it goes only once the login has.
     credentials = status.get("credentialsSecret") or {}
@@ -1383,10 +1722,18 @@ async def teardown_replication(ctx: ReconcileContext, obj: dict[str, Any]) -> st
         and await delete_secret(ctx.k8s, str(credentials["namespace"]), str(credentials["name"]))
     ):
         removed.append(f"Secret {credentials['namespace']}/{credentials['name']}")
+    for entry in superseded if source_cleared else []:
+        removed.extend(await _remove_login_secret(ctx, entry))
 
-    if unreachable:
+    if unreachable or failed:
+        problems = [f"cannot reach {' and '.join(unreachable)}"] if unreachable else []
+        if failed:
+            problems.append(f"cannot clear {' and '.join(failed)}")
         done = f"; removed so far: {', '.join(removed)}" if removed else ""
-        raise ConnectionFailure(f"cannot reach {' and '.join(unreachable)}; will retry{done}")
+        # Retried: never a ConfigurationError, which a finalizer may take for
+        # "nothing can ever be cleaned up".
+        error = ReconcileFailure if failed else ConnectionFailure
+        raise error(f"{'; '.join(problems)}; will retry{done}")
     return "removed " + ", ".join(removed) if removed else "nothing left to remove"
 
 
@@ -1419,16 +1766,37 @@ async def _remove_slots(
     A plain DROP SUBSCRIPTION took them already; this catches what a detached
     one - or an unreachable target - left behind. A walsender still holding a
     slot belongs to a subscriber that is gone or detached, so it is ended.
+
+    A table-sync slot is this replication's only if it carries the target's
+    system identifier as well as the subscription's oid: another target server
+    can hold a subscription with the same oid. With no identifier recorded, a
+    slot of that oid can be told from neither, so it is not touched - and the
+    finalizer is held, naming it, until it is gone.
     """
     slot = str(source.get("slot") or "")
     if not slot:
         return []
     oid = target.get("subscriptionOid")
+    subscriber = target.get("systemIdentifier")
     login = str(source.get("login") or "")
+    database = str(source.get("database") or "")
+
+    async def mine(conn: AsyncConnection) -> tuple[list[sub.SlotState], list[str]]:
+        """This replication's slots, and those it cannot say are or are not its own."""
+        found = await sub.slots(
+            conn, slot, subscription_oid=int(oid) if oid else None, system_identifier=subscriber
+        )
+        # A table-sync worker connects with the subscription's own connection
+        # string, so its slot is in the source database. One in any other
+        # database is some other subscription's, whatever its name says - which
+        # matters where system identifiers are not unique between targets.
+        found = [s for s in found if s.name == slot or not database or s.database == database]
+        if not oid or subscriber:
+            return found, []
+        return [s for s in found if s.name == slot], [s.name for s in found if s.name != slot]
+
     async with ctx.connect(instance) as conn:
-        found = await sub.slots(conn, slot, subscription_oid=int(oid) if oid else None)
-        if not found:
-            return []
+        found, unproven = await mine(conn)
         if any(s.active for s in found) and login:
             # Signalling a backend takes membership of its role.
             with contextlib.suppress(ReconcileFailure):
@@ -1442,7 +1810,7 @@ async def _remove_slots(
             for s in busy:
                 await sub.terminate(conn, int(s.active_pid or 0))
             await asyncio.sleep(0.25)
-            found = await sub.slots(conn, slot, subscription_oid=int(oid) if oid else None)
+            found, unproven = await mine(conn)
         held = [s.name for s in found if s.active]
         if held:
             raise ReconcileFailure(
@@ -1462,14 +1830,22 @@ async def _remove_slots(
             await pgroles.set_password(conn, login, password)
         return password
 
-    await _with_slot_privilege(
-        ctx,
-        instance,
-        str(source.get("database") or instance.spec.maintenance_database),
-        login or None,
-        credential,
-        lambda conn: sub.drop_slots(conn, names),
-    )
+    if names:
+        await _with_slot_privilege(
+            ctx,
+            instance,
+            str(source.get("database") or instance.spec.maintenance_database),
+            login or None,
+            credential,
+            lambda conn: sub.drop_slots(conn, names),
+        )
+    if unproven:
+        raise ReconcileFailure(
+            f"slot(s) {', '.join(unproven)} on {instance.name} are named as this replication's "
+            "table-sync slots would be, but its status records no target system identifier to tell "
+            "them from those of another target server's subscription with the same oid, so they "
+            "are left alone; drop them by hand if they are this replication's"
+        )
     return [f"slot {name}" for name in names]
 
 
@@ -1585,11 +1961,13 @@ def build_status(
             **result.target.as_status(),
             "subscription": result.names.subscription,
             "subscriptionOid": result.subscription_oid,
+            "systemIdentifier": result.target_system_identifier,
         },
         "connectionFingerprint": result.connection_fingerprint,
         "credentialsSecret": result.credentials,
         "created": result.created,
         "grantedMemberships": sorted(set(result.granted)),
+        "supersededLogins": result.superseded or None,
         "publishedTables": result.published,
         "subscribedTables": [
             {"table": table, "state": state} for table, state in sorted(result.subscribed.items())
