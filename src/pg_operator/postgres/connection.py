@@ -23,7 +23,7 @@ from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from ..config import Settings, get_settings
-from ..errors import ConnectionFailure
+from ..errors import ConnectionFailure, PoolExhausted
 
 log = logging.getLogger(__name__)
 
@@ -164,20 +164,38 @@ class PoolRegistry:
                 raise
             detail = _terse(exc)
             if isinstance(exc, PoolTimeout):
+                # Read before the diagnosis, which gives connections time to return.
+                stats = pool.get_stats()
+                saturated = (
+                    stats.get("pool_size", 0) >= pool.max_size and not stats.get("pool_available")
+                )
                 # The pool retries in the background and, when it gives up,
                 # says only that it ran out of time. The libpq error that
                 # explains *why* - a bad password, a missing database, a
                 # rejected certificate - is logged by the pool at warning level
                 # and never reaches the caller. Ask the server once, directly,
                 # so the status condition names the actual cause.
-                detail = await self._diagnose(endpoint, target) or detail
+                answered, reason = await self._diagnose(endpoint, target)
+                if answered and saturated:
+                    # Nothing is wrong with the server, the network or the
+                    # credentials: every connection the pool may hold was
+                    # checked out, and stayed out for the whole wait.
+                    raise PoolExhausted(
+                        f"no connection to {endpoint.host}:{endpoint.port}/{target} came free "
+                        f"within {pool.timeout:g}s: all {pool.max_size} connection(s) the "
+                        "operator pools for it are in use, though the server itself accepts "
+                        "connections - passes on this database are most likely queued behind "
+                        "long-running ones. Raise PG_OPERATOR_POOL_MAX_SIZE "
+                        "(chart: postgres.poolMaxSize) if this persists"
+                    ) from exc
+                detail = reason or detail
             raise ConnectionFailure(
                 f"cannot connect to {endpoint.host}:{endpoint.port}/{target} "
                 f"as {endpoint.username}: {detail}"
             ) from exc
 
-    async def _diagnose(self, endpoint: Endpoint, dbname: str) -> str | None:
-        """One direct connection attempt, returning libpq's error text if it fails."""
+    async def _diagnose(self, endpoint: Endpoint, dbname: str) -> tuple[bool, str | None]:
+        """One direct connection attempt: whether it succeeded, and libpq's error text if not."""
         conninfo = endpoint.conninfo(
             dbname,
             statement_timeout_ms=self._settings.statement_timeout_ms,
@@ -186,12 +204,12 @@ class PoolRegistry:
         try:
             conn = await AsyncConnection.connect(conninfo)
         except psycopg.OperationalError as exc:
-            return _terse(exc)
+            return False, _terse(exc)
         except Exception:  # noqa: BLE001 - diagnostics must not mask the original error
-            return None
+            return False, None
         # The server answered after all: the pool was merely slow or saturated.
         await conn.close()
-        return None
+        return True, None
 
     async def close_database(self, instance: str, dbname: str) -> None:
         """Drop the pool for one database — required before DROP DATABASE."""

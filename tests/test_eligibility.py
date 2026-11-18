@@ -262,9 +262,9 @@ def test_extra_target_columns_are_fine() -> None:
 
 def test_a_target_that_cannot_identify_a_row_stops_the_whole_subscription() -> None:
     """PostgreSQL refuses the apply, and apply is sequential: one table stops all of them."""
-    verdict = judge(candidate(), source(), targets=[target(identity=None)])
+    verdict = judge(candidate(), source(), targets=[target(identity=None)], subscribed=CARRIED)
     assert reasons(verdict) == [el.TARGET_NO_REPLICA_IDENTITY]
-    # Target-sided, so a table already published stays published (design D6).
+    # Target-sided, so a table the subscription carries stays published (design D6).
     assert verdict.issues[0].side == "target" and verdict.keeps_membership
     assert "primary key" in verdict.issues[0].message
 
@@ -338,18 +338,73 @@ def test_a_table_claimed_by_an_older_replication_is_refused() -> None:
 # --- what happens to a table that is already published (design D6) -------------
 
 
-def test_target_side_problems_keep_a_published_table_published() -> None:
+#: The subscription carries the table: its changes are in the stream.
+CARRIED = frozenset({"public.orders"})
+
+
+def test_target_side_problems_keep_a_carried_table_published() -> None:
+    lacking = target(columns={"id": "integer"})
+    verdict = judge(candidate(), source(), targets=[lacking], subscribed=CARRIED)
+    assert reasons(verdict) == [el.TARGET_COLUMNS_MISSING]
+    assert verdict.keeps_membership and verdict.refresh_blockers == ()
+
+
+def test_a_published_table_the_subscription_does_not_carry_is_taken_out() -> None:
+    """Dropped on the target, the table left the subscription; nothing of it is in the stream.
+
+    Left published it would be subscribed afresh by the next refresh, which
+    fails outright on a relation the target lacks.
+    """
     verdict = judge(candidate(), source(), targets=[])
-    assert not verdict.publishable and verdict.keeps_membership
+    assert reasons(verdict) == [el.TARGET_TABLE_MISSING]
+    assert not verdict.carried and not verdict.keeps_membership
+
+
+def test_a_table_recreated_with_rows_on_the_target_is_taken_out_not_copied_over() -> None:
+    """Rewritten on the target - a new relation under the old name, holding the old rows."""
+    verdict = judge(candidate(), source(), copy_data=True, target_nonempty=frozenset({"public.orders"}))
+    assert reasons(verdict) == [el.TARGET_TABLE_NOT_EMPTY]
+    assert not verdict.keeps_membership
 
 
 def test_source_side_problems_take_a_published_table_out() -> None:
-    verdict = judge(candidate(), source(identity=None), targets=[])
+    verdict = judge(candidate(), source(identity=None), targets=[], subscribed=CARRIED)
     assert not verdict.keeps_membership
 
 
 def test_a_claimed_table_is_taken_out_even_though_the_claim_is_target_side() -> None:
-    assert not judge(candidate(), source(), claimed_by="team-a/older").keeps_membership
+    verdict = judge(candidate(), source(), claimed_by="team-a/older", subscribed=CARRIED)
+    assert not verdict.keeps_membership
+
+
+def test_a_partition_the_target_lacks_keeps_the_table_and_blocks_the_refresh() -> None:
+    """The other partitions are streaming, so the table stays - but must not be refreshed.
+
+    REFRESH PUBLICATION would subscribe the new partition too, and fails on a
+    relation the target does not have.
+    """
+    old, new = source("readings_2026", is_partition=True), source("readings_2027", is_partition=True)
+    root = source("readings", kind="p", leaves=(old, new))
+    verdict = judge(
+        candidate("readings"), root, targets=[target("readings_2026")],
+        subscribed=frozenset({"public.readings_2026"}),
+    )
+    assert reasons(verdict) == [el.TARGET_TABLE_MISSING]
+    assert verdict.carried and verdict.keeps_membership
+    assert verdict.refresh_blockers == ("public.readings_2027",)
+
+
+def test_a_carried_partition_with_a_problem_does_not_block_the_refresh() -> None:
+    """Only a relation the refresh would newly subscribe is a reason to hold it back."""
+    old, new = source("readings_2026", is_partition=True), source("readings_2027", is_partition=True)
+    root = source("readings", kind="p", leaves=(old, new))
+    verdict = judge(
+        candidate("readings"), root,
+        targets=[target("readings_2026", identity=None), target("readings_2027")],
+        subscribed=frozenset({"public.readings_2026"}),
+    )
+    assert reasons(verdict) == [el.TARGET_NO_REPLICA_IDENTITY]
+    assert verdict.keeps_membership and verdict.refresh_blockers == ()
 
 
 # --- partitioned tables ----------------------------------------------------------
@@ -496,7 +551,6 @@ def test_target_relations_follow_publish_via_root() -> None:
 def test_a_new_table_with_rows_on_the_target_waits() -> None:
     verdict = judge(candidate(), source(), copy_data=True, target_nonempty=frozenset({"public.orders"}))
     assert reasons(verdict) == [el.TARGET_TABLE_NOT_EMPTY]
-    assert verdict.keeps_membership
 
 
 def test_rows_on_the_target_are_fine_once_subscribed_or_without_a_copy() -> None:

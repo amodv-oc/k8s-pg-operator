@@ -145,8 +145,15 @@ async def run_teardown(
     body: kopf.Body,
     logger: Any,
     teardown: Callable[[], Awaitable[str]],
+    release_when_unresolvable: bool = True,
 ) -> str:
-    """Run a finalizer, mapping errors so a stuck delete is visible, not silent."""
+    """Run a finalizer, mapping errors so a stuck delete is visible, not silent.
+
+    ``release_when_unresolvable=False`` is for a kind whose teardown judges an
+    unusable instance itself (PostgresReplication: two servers, each handled
+    on its own). Anything it raises then holds the finalizer and is retried -
+    never a PermanentError, which kopf counts as finished and releases on too.
+    """
     meta = body.get("metadata") or {}
     name = str(meta.get("name"))
     namespace = meta.get("namespace")
@@ -154,6 +161,8 @@ async def run_teardown(
         async with context().locks.hold(kind, namespace, name):
             message = await teardown()
     except InstanceNotFound as exc:
+        if not release_when_unresolvable:
+            raise _hold_teardown(kind, logger, exc) from exc
         # The instance is gone: there is nothing left to act on. Release the
         # finalizer rather than wedging the delete on a resource that can never
         # be cleaned up.
@@ -167,6 +176,8 @@ async def run_teardown(
         logger.error("cleanup failed: %s", exc)
         raise as_kopf_error(exc) from exc
     except ConfigurationError as exc:
+        if not release_when_unresolvable:
+            raise _hold_teardown(kind, logger, exc) from exc
         # The spec cannot be parsed or the namespace is not permitted: no
         # retry can change that, so the delete must be allowed to complete.
         return _skip_teardown(kind, namespace, name, logger, exc)
@@ -179,6 +190,12 @@ async def run_teardown(
     _forget_resource_metrics(kind, namespace, name)
     logger.info(message)
     return message
+
+
+def _hold_teardown(kind: str, logger: Any, exc: BaseException) -> kopf.TemporaryError:
+    TEARDOWN_TOTAL.labels(kind=kind, outcome="failure").inc()
+    logger.error("cleanup failed: %s", exc)
+    return kopf.TemporaryError(str(exc), delay=get_settings().retry_backoff)
 
 
 def _skip_teardown(

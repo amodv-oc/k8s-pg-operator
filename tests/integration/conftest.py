@@ -326,7 +326,8 @@ async def world(
             await drop_database_hard(pools, each.target, each.target_db)
             await drop_roles_hard(pools, each.source, list(group_role_names(each.source_db).values()))
             await drop_roles_hard(pools, each.target, list(group_role_names(each.target_db).values()))
-            if login:
+            # Never the managing role itself, should a test have got it recorded as the login.
+            if login and login != each.source.username:
                 superuser_execute(f'DROP ROLE IF EXISTS "{login}"', target=each.reversed)
 
 

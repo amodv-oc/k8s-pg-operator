@@ -58,7 +58,8 @@ class SourceTable:
     columns: dict[str, str]
     generated: frozenset[str]
     readable_by_login: bool
-    #: Leaf partitions of a partitioned table; empty otherwise.
+    #: Leaf partitions of a partitioned table, from every level, in name order;
+    #: empty otherwise.
     leaves: tuple[SourceTable, ...] = ()
 
     @property
@@ -116,14 +117,22 @@ class PublicationState:
 # source catalog
 # ---------------------------------------------------------------------------
 
-_RELATIONS = """
-    SELECT c.oid, n.nspname, c.relname, c.relkind, c.relpersistence = 'p',
+#: What a :class:`SourceTable` is built from, for ``pg_class c``.
+_RELATION_COLUMNS = """
+           c.oid, n.nspname, c.relname, c.relkind, c.relpersistence = 'p',
            c.relispartition, pg_get_userbyid(c.relowner),
            pg_has_role(c.relowner, 'USAGE'), c.relrowsecurity, c.relreplident,
            has_table_privilege(%(login)s::text, c.oid, 'SELECT')
+"""
+
+_RELATIONS = (
+    "SELECT"
+    + _RELATION_COLUMNS
+    + """
       FROM pg_class c
       JOIN pg_namespace n ON n.oid = c.relnamespace
 """
+)
 
 _IN_SCHEMAS = sql.SQL(
     _RELATIONS
@@ -140,8 +149,6 @@ _BY_NAME = sql.SQL(
         ON w.schema = n.nspname AND w.name = c.relname
     """
 )
-
-_BY_OID = sql.SQL(_RELATIONS + " WHERE c.oid = ANY(%(oids)s::oid[])")
 
 #: ``supplied`` is true when the server can fill the column in by itself - it
 #: has a default, or is an identity or generated column - which is what decides
@@ -208,10 +215,36 @@ _TARGET_IDENTITY_COLUMNS = sql.SQL(
     """
 )
 
-_LEAVES = sql.SQL(
-    "SELECT relid::oid FROM pg_partition_tree(%s::oid::regclass) "
-    "WHERE isleaf AND relid <> %s::oid::regclass"
-)
+#: The leaf partitions of every partitioned table in ``roots``, at any depth, as
+#: ``root`` followed by the relation's facts - one statement however many
+#: partitioned tables there are. It returns what ``pg_partition_tree(root)
+#: WHERE isleaf`` does, but walks pg_inherits itself rather than calling that
+#: once per table, which scans the catalog and locks every partition each time.
+#: A leaf is a partition that is not partitioned itself, so the partitioned
+#: tables in between are passed through and never returned. Like
+#: pg_partition_tree, it leaves out a partition whose DETACH ... CONCURRENTLY
+#: has committed its first step (``inhdetachpending``), and all beneath it.
+_PARTITION_TREES = """
+    WITH RECURSIVE tree(root, relid) AS (
+        SELECT i.inhparent, i.inhrelid
+          FROM pg_inherits i
+         WHERE i.inhparent = ANY(%(roots)s::oid[]) AND NOT i.inhdetachpending
+        UNION ALL
+        SELECT tree.root, i.inhrelid
+          FROM tree
+          JOIN pg_inherits i ON i.inhparent = tree.relid
+         WHERE NOT i.inhdetachpending
+    )
+"""
+
+_LEAF_RELATIONS = """
+      FROM tree
+      JOIN pg_class c ON c.oid = tree.relid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind <> 'p'
+"""
+
+_LEAVES = sql.SQL(_PARTITION_TREES + "SELECT tree.root," + _RELATION_COLUMNS + _LEAF_RELATIONS)
 
 
 async def describe_source_tables(
@@ -242,26 +275,47 @@ async def describe_source_tables(
 async def _assemble(
     conn: AsyncConnection, rows: Sequence[tuple[Any, ...]], login: str
 ) -> list[SourceTable]:
+    """Describe ``rows``, each partitioned table with its leaves.
+
+    Runs a fixed number of statements, not some per partitioned table: the
+    leaves of all of them are read at once, then the columns and identities of
+    every relation, leaves included.
+    """
     by_oid = {int(row[0]): row for row in rows}
     if not by_oid:
         return []
-    columns = _columns_by_relation(await fetch_all(conn, _COLUMNS, (list(by_oid),)))
+    leaf_rows: dict[int, tuple[Any, ...]] = {}
+    leaves_of: dict[int, list[int]] = {}
+    roots = [oid for oid, row in by_oid.items() if row[3] == "p"]
+    if roots:
+        for root, *row in await fetch_all(conn, _LEAVES, {"login": login, "roots": roots}):
+            leaf_rows[int(row[0])] = tuple(row)
+            leaves_of.setdefault(int(root), []).append(int(row[0]))
+
+    oids = list(by_oid.keys() | leaf_rows.keys())
+    columns = _columns_by_relation(await fetch_all(conn, _COLUMNS, (oids,)))
     identity: dict[int, set[str]] = {}
-    for relid, name in await fetch_all(conn, _IDENTITY_COLUMNS, (list(by_oid),)):
+    for relid, name in await fetch_all(conn, _IDENTITY_COLUMNS, (oids,)):
         identity.setdefault(int(relid), set()).add(str(name))
 
-    assembled: list[SourceTable] = []
-    for oid, row in by_oid.items():
-        leaves: tuple[SourceTable, ...] = ()
-        if row[3] == "p":
-            leaf_oids = [
-                int(r[0]) for r in await fetch_all(conn, _LEAVES, (oid, oid))
-            ]
-            if leaf_oids:
-                leaf_rows = await fetch_all(conn, _BY_OID, {"login": login, "oids": leaf_oids})
-                leaves = tuple(await _assemble(conn, leaf_rows, login))
-        assembled.append(_source_table(row, columns.get(oid, []), identity.get(oid), leaves))
-    return assembled
+    def build(row: tuple[Any, ...], leaves: tuple[SourceTable, ...] = ()) -> SourceTable:
+        oid = int(row[0])
+        return _source_table(row, columns.get(oid, []), identity.get(oid), leaves)
+
+    leaf_tables = {oid: build(row) for oid, row in leaf_rows.items()}
+    return [
+        build(
+            row,
+            # In name order, so a message that lists them reads the same every pass.
+            tuple(
+                sorted(
+                    (leaf_tables[leaf] for leaf in leaves_of.get(oid, ())),
+                    key=lambda leaf: (leaf.schema, leaf.name),
+                )
+            ),
+        )
+        for oid, row in by_oid.items()
+    ]
 
 
 def _source_table(
@@ -456,14 +510,19 @@ def _options(operations: Sequence[str], via_root: bool) -> sql.Composed:
 async def create_publication(
     conn: AsyncConnection, name: str, *, operations: Sequence[str], via_root: bool, comment: str
 ) -> None:
-    """Create an empty publication; tables are added one at a time afterwards."""
-    await execute(
-        conn,
-        sql.SQL("CREATE PUBLICATION {} WITH ({})").format(ident(name), _options(operations, via_root)),
-    )
-    await execute(
-        conn, sql.SQL("COMMENT ON PUBLICATION {} IS {}").format(ident(name), literal(comment))
-    )
+    """Create an empty publication; tables are added one at a time afterwards.
+
+    Created and marked in one transaction, so it never exists without the
+    comment that makes it this replication's.
+    """
+    async with conn.transaction():
+        await execute(
+            conn,
+            sql.SQL("CREATE PUBLICATION {} WITH ({})").format(ident(name), _options(operations, via_root)),
+        )
+        await execute(
+            conn, sql.SQL("COMMENT ON PUBLICATION {} IS {}").format(ident(name), literal(comment))
+        )
     log.info("created publication %s", name)
 
 
@@ -552,12 +611,33 @@ async def published_relations(conn: AsyncConnection, publication: str) -> set[st
     return {str(row[0]) for row in await fetch_all(conn, _PUBLISHED_RELATIONS, (publication,))}
 
 
-async def nonempty_tables(conn: AsyncConnection, tables: Iterable[tuple[str, str]]) -> set[str]:
-    """Which of the named target tables already hold rows."""
+#: What a subscription can apply into, and so all the emptiness probe reads.
+_PROBED_KINDS = frozenset({"r", "p"})
+
+
+async def nonempty_tables(conn: AsyncConnection, tables: Iterable[TargetTable]) -> set[str]:
+    """Which of these target tables already hold rows.
+
+    This is the one statement the operator runs against a relation's *contents*
+    rather than the catalog, and a relation on the target belongs to whoever
+    may create one there. Reading it as the managing role would run their code
+    as the managing role: a view's functions run as whoever selects from it,
+    and so does the policy of a table with FORCE ROW LEVEL SECURITY. So only
+    tables are read, never a view or a foreign table that has taken a table's
+    name, and each is read as its own owner - a role the caller has already
+    established the managing role may SET ROLE to (``owner_settable``), and the
+    one whose code it is.
+    """
     found: set[str] = set()
-    for schema, table in sorted(set(tables)):
-        if await fetch_scalar(
-            conn, sql.SQL("SELECT EXISTS (SELECT 1 FROM {})").format(qualified(schema, table))
-        ):
-            found.add(f"{schema}.{table}")
+    for table in sorted(tables, key=lambda each: each.qualified):
+        if table.kind not in _PROBED_KINDS or not table.owner_settable:
+            continue
+        # SET LOCAL lasts for the transaction, however it ends.
+        async with conn.transaction():
+            await execute(conn, sql.SQL("SET LOCAL ROLE {}").format(ident(table.owner)))
+            if await fetch_scalar(
+                conn,
+                sql.SQL("SELECT EXISTS (SELECT 1 FROM {})").format(qualified(table.schema, table.name)),
+            ):
+                found.add(table.qualified)
     return found

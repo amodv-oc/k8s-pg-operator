@@ -11,10 +11,17 @@ import psycopg
 import pytest
 from psycopg import sql
 
-from pg_operator.errors import ConfigurationError, ReplicationRefused
+from pg_operator.errors import ConfigurationError, ReconcileFailure, ReplicationRefused
+from pg_operator.postgres import publication as pub
+from pg_operator.postgres import subscription as sub
 from pg_operator.postgres.connection import Endpoint
 from pg_operator.postgres.sql import fetch_scalar
-from pg_operator.reconcile.replication import ownership_marker, teardown_replication
+from pg_operator.reconcile import replication as rep
+from pg_operator.reconcile.replication import (
+    observe_from_status,
+    ownership_marker,
+    teardown_replication,
+)
 
 from ..conftest import requires_replication_harness, superuser_execute
 from .conftest import NS, OPERATOR_NS, World
@@ -386,12 +393,286 @@ async def test_objects_from_a_failed_pass_are_still_torn_down(world: World) -> N
         await world.run(emulate=False)
 
     recorded = world.replication["status"]
-    assert recorded["created"] == {"publication": True, "login": True, "secret": True}
+    # The slot is recorded before it is made, and making it is what failed.
+    assert recorded["created"] == {"publication": True, "login": True, "secret": True, "slot": True}
+    assert set(recorded["grantedMemberships"]) == {"rds_replication", world.groups["readOnly"]}
+    # A slot recorded but never made is not one that was lost.
+    assert await observe_from_status(world.ctx, world.replication) is None
     message = await teardown_replication(world.ctx, world.replication)
     world.replication.pop("status")
     assert recorded["source"]["publication"] in message
     assert recorded["source"]["login"] in message
     assert world.k8s.core.get(OPERATOR_NS, recorded["credentialsSecret"]["name"]) is None
+
+
+def _fail_on(module: object, statement: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make ``module``'s ``execute`` fail on one statement, as a dropped connection would."""
+    real = module.execute  # type: ignore[attr-defined]
+
+    async def failing(conn, query, params=None, *, describe=None):  # type: ignore[no-untyped-def]
+        if statement in query.as_string(conn):
+            raise ReconcileFailure("server closed the connection unexpectedly")
+        return await real(conn, query, params, describe=describe)
+
+    monkeypatch.setattr(module, "execute", failing)
+
+
+async def _exists(world: World, catalog: str, column: str, name: str, *, database: str | None = None) -> bool:
+    async with world.pools.connection(world.source, database) as conn:
+        return bool(
+            await fetch_scalar(
+                conn,
+                sql.SQL("SELECT EXISTS (SELECT 1 FROM {} WHERE {} = %s)").format(
+                    sql.Identifier(catalog), sql.Identifier(column)
+                ),
+                (name,),
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "statement"),
+    [("publication", "COMMENT ON PUBLICATION"), ("login", "COMMENT ON ROLE")],
+)
+async def test_an_object_never_exists_without_its_marker(
+    world: World, monkeypatch: pytest.MonkeyPatch, kind: str, statement: str
+) -> None:
+    """Created and marked in one transaction, or not at all.
+
+    An unmarked object of this replication's name is refused as someone
+    else's, so one left behind by a failure between the two statements would
+    fail every later pass - and never be torn down.
+    """
+    from pg_operator.naming import replication_names
+
+    names = replication_names(NS, world.replication["metadata"]["name"])
+    _fail_on(pub if kind == "publication" else rep, statement, monkeypatch)
+    with pytest.raises(ReconcileFailure, match="closed the connection"):
+        await world.run()
+    monkeypatch.undo()
+
+    if kind == "publication":
+        assert not await _exists(world, "pg_publication", "pubname", names.publication, database=world.source_db)
+    else:
+        assert not await _exists(world, "pg_roles", "rolname", names.login)
+    status = await world.run()
+    assert status["created"]["publication"] and status["created"]["login"]
+
+
+async def test_a_login_from_a_pass_that_failed_after_making_it_is_torn_down(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The login is recorded before it is made, not after everything else about it succeeded."""
+
+    async def failing_apply_secret(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ReconcileFailure("the API server is unavailable")
+
+    monkeypatch.setattr(rep, "apply_secret", failing_apply_secret)
+    with pytest.raises(ReconcileFailure, match="unavailable"):
+        await world.run()
+    monkeypatch.undo()
+
+    recorded = world.replication["status"]
+    login = recorded["source"]["login"]
+    assert recorded["created"]["login"] is True and login
+    assert await _exists(world, "pg_roles", "rolname", login)
+    await teardown_replication(world.ctx, world.replication)
+    world.replication.pop("status")
+    assert not await _exists(world, "pg_roles", "rolname", login)
+
+
+async def test_a_recreated_publication_does_not_blank_what_status_recorded(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recording one object must not erase another's record - teardown needs them all."""
+    await world.run()
+    login = world.status["source"]["login"]
+    oid = world.status["target"]["subscriptionOid"]
+    await world.on_source(f"DROP PUBLICATION {world.status['source']['publication']}")
+
+    async def failing_apply_secret(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ReconcileFailure("the API server is unavailable")
+
+    monkeypatch.setattr(rep, "apply_secret", failing_apply_secret)
+    with pytest.raises(ReconcileFailure, match="unavailable"):
+        await world.run()
+    monkeypatch.undo()
+    assert world.status["source"].get("login") == login
+    assert world.status["target"].get("subscriptionOid") == oid
+
+
+async def test_a_converged_pass_reads_the_publication_once(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It runs every minute for every replication: once, plus a read-back only after a change."""
+    await world.run()
+    reads = 0
+    real = pub.get_publication
+
+    async def counting(conn, name):  # type: ignore[no-untyped-def]
+        nonlocal reads
+        reads += 1
+        return await real(conn, name)
+
+    patches = 0
+    real_patch = rep.patch_status
+
+    async def counting_patches(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal patches
+        patches += 1
+        return await real_patch(*args, **kwargs)
+
+    monkeypatch.setattr(pub, "get_publication", counting)
+    monkeypatch.setattr(rep, "patch_status", counting_patches)
+    await world.run()
+    assert world.last_changes == []
+    assert reads == 1
+    # Recording is part of creating: a pass that creates nothing records nothing.
+    assert patches == 0
+
+    reads = 0
+    await world.on_target("CREATE TABLE public.only_source (id int PRIMARY KEY)", as_owner=True)
+    status = await world.run()
+    assert "added public.only_source" in world.last_changes
+    assert "public.only_source" in status["publishedTables"]
+    assert reads == 2
+
+
+# --- swapping one login for another ---------------------------------------------
+#
+# Adding, removing or repointing source.credentialsSecretRef swaps the login.
+# The new one is recorded as soon as it is in use; the one it replaces must
+# stay known to status until it is gone, whichever pass that is.
+
+
+def _byo_login(world: World, unique: str) -> str:
+    login, password = f"rs_byo_{unique}", f"byo-{unique}-password"
+    superuser_execute(f"CREATE ROLE \"{login}\" LOGIN REPLICATION PASSWORD '{password}'")
+    world.k8s.core.seed(NS, "byo-login", {"username": login, "password": password})
+    return login
+
+
+async def _fail_the_swap(world: World, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pass that records the new login, then fails before the old one is removed."""
+
+    async def failing(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ReconcileFailure("the target server is restarting")
+
+    monkeypatch.setattr(sub, "set_connection", failing)
+    with pytest.raises(ReconcileFailure, match="restarting"):
+        await world.run()
+    monkeypatch.undo()
+
+
+async def _is_member(world: World, login: str, group: str) -> bool:
+    async with world.pools.connection(world.source) as conn:
+        return bool(
+            await fetch_scalar(
+                conn,
+                sql.SQL(
+                    "SELECT EXISTS (SELECT 1 FROM pg_auth_members m JOIN pg_roles g ON g.oid = m.roleid "
+                    "JOIN pg_roles u ON u.oid = m.member WHERE u.rolname = %s AND g.rolname = %s)"
+                ),
+                (login, group),
+            )
+        )
+
+
+async def test_a_login_replaced_by_a_failed_pass_is_removed_by_the_next(
+    world: World, monkeypatch: pytest.MonkeyPatch, unique: str
+) -> None:
+    status = await world.run()
+    generated, secret = status["source"]["login"], status["credentialsSecret"]
+    byo = _byo_login(world, unique)
+    try:
+        world.replication["spec"]["source"]["credentialsSecretRef"] = {"name": "byo-login"}
+        await _fail_the_swap(world, monkeypatch)
+        assert world.status["source"]["login"] == byo
+
+        await world.run()
+        assert not await _exists(world, "pg_roles", "rolname", generated)
+        assert world.k8s.core.get(secret["namespace"], secret["name"]) is None
+        assert not world.status.get("supersededLogins")
+        await world.run()
+        assert world.last_changes == []
+        # While the provided login it now streams as still exists.
+        await teardown_replication(world.ctx, world.replication)
+        world.replication.pop("status")
+    finally:
+        superuser_execute(f'DROP ROLE IF EXISTS "{byo}"')
+
+
+async def test_teardown_removes_a_login_a_failed_pass_replaced(
+    world: World, monkeypatch: pytest.MonkeyPatch, unique: str
+) -> None:
+    status = await world.run()
+    generated, secret = status["source"]["login"], status["credentialsSecret"]
+    byo = _byo_login(world, unique)
+    try:
+        world.replication["spec"]["source"]["credentialsSecretRef"] = {"name": "byo-login"}
+        await _fail_the_swap(world, monkeypatch)
+
+        await teardown_replication(world.ctx, world.replication)
+        world.replication.pop("status")
+        assert not await _exists(world, "pg_roles", "rolname", generated)
+        assert world.k8s.core.get(secret["namespace"], secret["name"]) is None
+        # The provided login stays, without what the operator granted it.
+        assert await _exists(world, "pg_roles", "rolname", byo)
+        assert not await _is_member(world, byo, world.groups["readOnly"])
+        assert world.k8s.core.get(NS, "byo-login") is not None
+    finally:
+        superuser_execute(f'DROP ROLE IF EXISTS "{byo}"')
+
+
+async def test_a_provided_login_a_failed_pass_replaced_loses_only_the_operators_grants(
+    world: World, monkeypatch: pytest.MonkeyPatch, unique: str
+) -> None:
+    byo = _byo_login(world, unique)
+    own = f"rs_own_{unique}"
+    superuser_execute(f'CREATE ROLE "{own}"')
+    superuser_execute(f'GRANT "{own}" TO "{byo}"')
+    try:
+        world.replication["spec"]["source"]["credentialsSecretRef"] = {"name": "byo-login"}
+        await world.run()
+        assert await _is_member(world, byo, world.groups["readOnly"])
+
+        del world.replication["spec"]["source"]["credentialsSecretRef"]
+        await _fail_the_swap(world, monkeypatch)
+        await world.run()
+
+        assert await _exists(world, "pg_roles", "rolname", byo)
+        assert not await _is_member(world, byo, world.groups["readOnly"])
+        assert await _is_member(world, byo, own)
+        assert world.status["created"]["login"] is True
+        assert not world.status.get("supersededLogins")
+    finally:
+        superuser_execute(f'DROP ROLE IF EXISTS "{byo}"')
+        superuser_execute(f'DROP ROLE IF EXISTS "{own}"')
+
+
+async def test_a_login_swapped_back_after_a_failed_pass_is_kept(
+    world: World, monkeypatch: pytest.MonkeyPatch, unique: str
+) -> None:
+    status = await world.run()
+    generated, secret = status["source"]["login"], status["credentialsSecret"]
+    byo = _byo_login(world, unique)
+    try:
+        world.replication["spec"]["source"]["credentialsSecretRef"] = {"name": "byo-login"}
+        await _fail_the_swap(world, monkeypatch)
+
+        del world.replication["spec"]["source"]["credentialsSecretRef"]
+        status = await world.run()
+        assert status["source"]["login"] == generated
+        assert status["created"]["login"] is True and status["created"]["secret"] is True
+        assert await _exists(world, "pg_roles", "rolname", generated)
+        assert world.k8s.core.get(secret["namespace"], secret["name"]) is not None
+        # The provided login it briefly used is the one superseded now.
+        assert not await _is_member(world, byo, world.groups["readOnly"])
+        assert not status.get("supersededLogins")
+        await world.on_source("INSERT INTO audit.events VALUES (5, 'back')", as_owner=True)
+        await world.eventually("SELECT kind FROM audit.events WHERE id = 5", "back", "the insert")
+    finally:
+        superuser_execute(f'DROP ROLE IF EXISTS "{byo}"')
 
 
 async def test_a_pass_that_can_never_succeed_creates_nothing(world: World) -> None:

@@ -202,7 +202,11 @@ async def teardown(body: kopf.Body, logger: Any, **_: object) -> str:
     async def _do() -> str:
         return await teardown_replication(ctx, dict(body))
 
-    message = await run_teardown(kind=KIND_REPLICATION, body=body, logger=logger, teardown=_do)
+    # teardown_replication handles each server's instance on its own, and
+    # returns only once nothing it recorded can still be on a server.
+    message = await run_teardown(
+        kind=KIND_REPLICATION, body=body, logger=logger, teardown=_do, release_when_unresolvable=False
+    )
     meta = body.get("metadata") or {}
     forget_metrics(str(meta.get("namespace")), str(meta.get("name")))
     return message

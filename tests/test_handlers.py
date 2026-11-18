@@ -10,6 +10,7 @@ from pg_operator.errors import (
     ConfigurationError,
     ConnectionFailure,
     OperatorError,
+    PoolExhausted,
     ReconcileFailure,
     ReferenceNotFound,
 )
@@ -84,7 +85,7 @@ import logging  # noqa: E402
 from typing import Any  # noqa: E402
 
 from pg_operator.config import Settings  # noqa: E402
-from pg_operator.constants import PLURAL_DATABASE  # noqa: E402
+from pg_operator.constants import PLURAL_DATABASE, PLURAL_INSTANCE  # noqa: E402
 from pg_operator.errors import InstanceNotFound  # noqa: E402
 from pg_operator.handlers.common import (  # noqa: E402
     RESOURCE_READY,
@@ -176,6 +177,33 @@ async def test_a_non_connectivity_failure_keeps_reachable_intact(cluster: FakeK8
     assert stored["status"]["phase"] == "Failed"
 
 
+async def test_an_exhausted_pool_is_retried_without_marking_the_server_unreachable(
+    cluster: FakeK8sClient,
+) -> None:
+    """The server answered; the operator's own passes held every connection."""
+    body = _db(
+        conditions=[
+            {"type": "Reachable", "status": "True", "reason": "Connected", "message": "ok"},
+        ]
+    )
+    cluster.custom.add(body, PLURAL_DATABASE)
+
+    async def failing() -> tuple[str, dict[str, Any]]:
+        raise PoolExhausted("all 4 connection(s) the operator pools for it are in use")
+
+    with pytest.raises(kopf.TemporaryError):
+        await run_reconcile(
+            kind="PostgresDB", plural=PLURAL_DATABASE, body=body, logger=_log, reconcile=failing
+        )
+
+    stored = cluster.custom.get_stored(PLURAL_DATABASE, "team-a", "orders")
+    assert stored is not None
+    conditions = _conditions(stored)
+    assert conditions["Reachable"]["status"] == "True"
+    assert conditions["Ready"]["reason"] == "PoolExhausted"
+    assert stored["status"]["phase"] == "Failed"
+
+
 async def test_concurrent_passes_over_one_resource_are_serialised(cluster: FakeK8sClient) -> None:
     """The periodic timer and the change handler are independent kopf tasks."""
     body = _db()
@@ -227,6 +255,79 @@ async def test_teardown_releases_the_finalizer_on_a_bad_spec(cluster) -> None:
 
     message = await run_teardown(kind="PostgresDB", body=_db(), logger=_log, teardown=teardown)
     assert message.startswith("cleanup skipped")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [InstanceNotFound("PostgresInstance 'prod' not found"), ConfigurationError("invalid spec")],
+)
+async def test_a_teardown_may_opt_out_of_being_skipped(cluster, error: Exception) -> None:
+    """A kind that judges an unusable instance itself retries instead.
+
+    Not a PermanentError either: kopf treats a permanently failed delete
+    handler as finished, and releases the finalizer all the same.
+    """
+
+    async def teardown() -> str:
+        raise error
+
+    with pytest.raises(kopf.TemporaryError):
+        await run_teardown(
+            kind="PostgresReplication",
+            body=_db(),
+            logger=_log,
+            teardown=teardown,
+            release_when_unresolvable=False,
+        )
+
+
+def _replication_being_deleted() -> dict[str, Any]:
+    """A replication whose status records objects on two servers, prod and reporting."""
+    return {
+        "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
+        "kind": "PostgresReplication",
+        "metadata": {"name": "to-reporting", "namespace": "team-a", "generation": 1},
+        "spec": {"source": {"dbRef": {"name": "orders"}}, "target": {"dbRef": {"name": "orders-copy"}}},
+        "status": {
+            "source": {
+                "instance": "prod", "database": "orders", "publication": "pgop_x",
+                "slot": "pgop_x", "login": "pgop_repl_x",
+            },
+            "target": {
+                "instance": "reporting", "database": "orders_copy", "subscription": "pgop_x",
+                "subscriptionOid": 16400, "systemIdentifier": "7709052924873089057",
+            },
+            "credentialsSecret": {"namespace": "pg-operator", "name": "pgop-repl-x", "generated": True},
+            "created": {"publication": True, "login": True, "secret": True, "slot": True, "subscription": True},
+        },
+    }
+
+
+async def test_a_replication_is_released_once_both_its_instances_are_gone(cluster) -> None:
+    from pg_operator.handlers.replication import teardown
+
+    cluster.core.seed("pg-operator", "pgop-repl-x", {"username": "pgop_repl_x", "password": "x" * 32})
+    message = await teardown(body=_replication_being_deleted(), logger=_log)
+    assert not message.startswith("cleanup skipped")
+    assert cluster.core.get("pg-operator", "pgop-repl-x") is None
+
+
+async def test_an_instance_that_exists_but_cannot_be_read_holds_a_replication(cluster) -> None:
+    """Its server may still hold the subscription, and nothing else would ever remove it."""
+    from pg_operator.handlers.replication import teardown
+
+    cluster.custom.add(
+        {
+            "apiVersion": "postgres.ourcommunity.com.au/v1alpha1",
+            "kind": "PostgresInstance",
+            "metadata": {"name": "reporting", "generation": 1},
+            # verify-full without the CA bundle it requires
+            "spec": {"host": "reporting.rds", "sslMode": "verify-full", "credentialsSecretRef": {"name": "x"}},
+        },
+        PLURAL_INSTANCE,
+    )
+    with pytest.raises(kopf.TemporaryError, match="reporting"):
+        await teardown(body=_replication_being_deleted(), logger=_log)
 
 
 def _ready_gauge_labels() -> set[tuple[str, str, str]]:

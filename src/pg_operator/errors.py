@@ -82,3 +82,13 @@ class InsufficientCapacity(ReconcileFailure):
     Temporary: slots are freed by other subscriptions going away, or by raising
     max_replication_slots in the parameter group.
     """
+
+
+class PoolExhausted(ReconcileFailure):
+    """Every pooled connection to a database stayed in use for the whole wait.
+
+    Distinct from :class:`ConnectionFailure`: the server took a direct
+    connection, so neither it, the network nor the credentials are at fault -
+    the operator's own passes over that database hold the pool. It leaves
+    ``Reachable`` alone, and is retried like any temporary failure.
+    """

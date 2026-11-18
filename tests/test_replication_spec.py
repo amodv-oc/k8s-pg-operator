@@ -95,6 +95,21 @@ def test_verify_modes_need_a_ca_path_on_the_target_server() -> None:
     )
 
 
+def test_a_provided_login_is_read_from_the_replications_own_namespace() -> None:
+    """The operator reads Secrets cluster-wide; a tenant's reference must not reach as far.
+
+    With a namespace field, credentialsSecretRef could name the Secret holding
+    an instance's superuser credentials.
+    """
+    def with_ref(ref: dict[str, str]) -> dict[str, Any]:
+        return spec(source={"dbRef": {"name": "orders"}, "credentialsSecretRef": ref})
+
+    provided = parse_replication_spec(with_ref({"name": "byo"})).source.credentials_secret_ref
+    assert provided is not None and provided.name == "byo"
+    with pytest.raises(ValidationError, match="namespace"):
+        parse_replication_spec(with_ref({"name": "prod-rds-superuser", "namespace": "pg-operator"}))
+
+
 def test_unknown_fields_are_rejected_at_depth() -> None:
     with pytest.raises(ValidationError, match="where"):
         parse_replication_spec(spec(tables=[{"schema": "a", "name": "t", "where": "true"}]))
